@@ -1,0 +1,55 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# WinStageSandbox — .gitattributes
+#
+# 目的：让 checkout 的行尾与编码稳定，避免"同一文件在不同机器上 diff 满天飞"。
+#
+# 为什么单独需要它（不是多余配置）：
+#   本项目的测试与文档大量使用中文，且**已经踩过两次由编码/行尾引起的真实故障**：
+#     · 缺陷 12：用 shell 文本往返把源文件的 UTF-8 弄成 mojibake（255 处），
+#                追加写入时又因 PowerShell 默认编码把 LF 变成了 CRLF；
+#     · 缺陷 1 ：`.cmd` 被写成非 ASCII，cmd.exe 按 OEM 代码页解析后当成命令执行。
+#   因此这里**显式**声明文本文件的行尾与二进制文件的处理方式，
+#   并让 `.cmd` 保持其原生行尾（Windows 批处理对行尾敏感）。
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 默认：自动判定文本/二进制；文本入库统一 LF，checkout 时按平台还原
+* text=auto eol=lf
+
+# ── 明确为文本 ───────────────────────────────────────────────────────────────
+*.mjs   text eol=lf
+*.js    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+.gitignore    text eol=lf
+.gitattributes text eol=lf
+
+# ── Windows 批处理：保持 CRLF ────────────────────────────────────────────────
+# cmd.exe 对批处理行尾较敏感，统一用 CRLF 最稳。
+# 注意：`.cmd` 的内容**必须保持纯 ASCII**（见 README / 残余边界 R11）。
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+
+# ── PowerShell ───────────────────────────────────────────────────────────────
+*.ps1   text eol=crlf
+*.psm1  text eol=crlf
+
+# ── 二进制：禁止行尾转换，禁止文本 diff ──────────────────────────────────────
+*.exe   binary
+*.dll   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.ico   binary
+*.pdf   binary
+*.zip   binary
+*.vhd   binary
+*.vhdx  binary
+
+# ── 生成的产物：diff 里不显示（也不入库，见 .gitignore）──────────────────────
+.t/**            -diff linguist-generated
+test-report.json -diff linguist-generated
+*.log            -diff
