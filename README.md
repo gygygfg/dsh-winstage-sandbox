@@ -340,7 +340,7 @@ POST /run {}
 现在有 **6 组不依赖 Win32 的确定性测试**，一条命令即可全跑：
 
 ```powershell
-.\verify.cmd     # 6 组 198 项断言，RESULT: ALL PASS
+.\verify.cmd     # 11 套件 452 项断言，RESULT: ALL PASS（第一轮为 6 组 198 项；权威表见 §8）
 ```
 
 | 测试 | 项数 | 覆盖 |
@@ -354,6 +354,11 @@ POST /run {}
 | `tests/audit-parse.mjs` | 23 | 哨兵解析、**空输出必须判 fail**、单引号转义、**自定义哨兵** |
 | `tests/meta-runner.mjs` | 4 | 元测试：运行器能否检出失败 |
 | `tests/diag-bindings.mjs` | 14 | 绑定表契约 + 完整 init |
+
+> ⚠️ **上表是第一轮口径，已被 §8 的权威表取代**：`executor-stub` 72 → **84**、`audit-parse` 23 → **43**、
+> `appcontainer-layout` 27 → **34**、`e2e-flow` 16 → **21**、`command-selftest`（§7）22 → **24**，
+> 并新增 `paths-masks` **37** / `registry-guard` **125** / `workspace-regressions` **10**。
+> `verify.cmd` 现为 **11 套件 / 452 断言 / 0 失败**；`autotest --skip-audit` 为 **12 套件 / 474 ok / 0 bad**。
 
 详见 [docs/实测证据记录.md](docs/实测证据记录.md) §C.2。
 
@@ -371,25 +376,31 @@ POST /run {}
 | **Restricted Token**（WRITE_RESTRICTED） | ✅ **已实现并实测** | 复用 `AclSandbox` 构造的受限令牌 + 受限 SID 交集＝唯一可写根；在此基础上自行注入显式环境块与 Job 归属 | `[实测]` 写入面 7 项 + `tests/executor-stub.mjs` 72 项 |
 | **ACL**（DACL 授权 + deny `FILE_DELETE_CHILD` + Low IL 标签） | ✅ **已实现并实测** | 由 `@deepseek-ai/dsh-sandbox-windows-acl` 施加；越界写/删实测全部 `denied` | `[实测]` audit 写入面 |
 | **Job Object**（`KILL_ON_JOB_CLOSE`） | ✅ **已实现并实测** | 自建 Job，子进程挂入；会计自检（精确 48 字节）在 `init()` 内强制；超时即终止整树 | `[实测]` audit 生命周期段（总进程数增量 1） |
-| **AppContainer** | ⚠️ **结构与调用已实现，运行期未实测** | `src/appcontainer.mjs` 提供 `STARTUPINFOEX` / `SECURITY_CAPABILITIES` / 属性列表构造与 `CreateAppContainerProfile` 调用，**并含 27 项离线布局测试**（`tests/appcontainer-layout.mjs`）。但本机受限令牌下 `CreateAppContainerProfile` 返回 `hr=0x80070005`（E_ACCESSDENIED），**因此完整执行路径未经实测**；`probeAppContainer()` 会如实回报该结果 | `[官方]` 布局 + `[实测]` 探测失败；**运行期未实测** |
+| **AppContainer** | ✅ **运行期已实测生效（`proven=true`），但尚未接线到执行器 —— `selectTier()` 仍 fail-closed** | `src/appcontainer.mjs` + `src/appcontainer-runtime.mjs` 提供 `STARTUPINFOEX` / `SECURITY_CAPABILITIES` / 属性列表构造，并新增**权威判据**（`TokenIsAppContainer=29` / `TokenAppContainerSid=31` / `TokenIntegrityLevel=25`）与 `assessAppContainerIsolation()`（五项判据**缺一即 false**，无硬编码、无跨 profile 复用）。`[实测]` 真实子进程：`IsAppContainer=1`、包 SID 一致、**Low IL**、**区外写被拒**（宿主对照成功）、`caps=0` 时 `curl` **exit 7** ⇒ **`proven=true`**。离线布局测试 **34 项**（`tests/appcontainer-layout.mjs`） | `[实测]` 端到端隔离证据（`.t/sbx3/dev/raw-t0-isolation-proof.txt`）；**尚未接线**，见 §8 |
 | **WFP**（Windows Filtering Platform） | ❌ **未实现，仅文档化候选** | 网络档位（OFFLINE / CONTROLLED_ONLINE / OBSERVED_ONLINE）在手册第 9 章有规范，本项目**没有**实现任何网络强制阻断 | 无实测；见 `docs/Windows功能开启清单.md` 第 9 节 |
 
 **因此：**
 
-- **`T0` 档位目前只有"布局已就绪"，没有可运行的执行器。**
-  `selectTier()` 只在 `probeAppContainer()` 真实成功时才会选 `T0`；本机探测失败，
-  实际运行在 `T1`。即便在别的环境探测成功，也**不会**自动获得 AppContainer 隔离
-  —— 把 `appcontainer.mjs` 接进 `WindowsStageExecutor` 尚未完成。
-  这一点必须视为**未完成项**，不得读成"自动升级"。
-- **AppContainer 布局已用合成缓冲区离线钉死**（27 项），这是从缺陷 5（Job 结构体偏移错 4 字节）
+- **T0 的隔离已 `[实测]` 生效，但执行器尚未接线到 T0。**
+  `selectTier()` 的闸门是 `report.appContainerIsolation?.proven === true`（第二轮**未改动**）；
+  真机端到端已实测 `proven=true`，但 T0 **仍未接进 `WindowsStageExecutor`**
+  ⇒ **继续 fail-closed、实际运行在 `T1`**。这一点必须视为**未完成项**，
+  不得读成"自动升级"，也不得读成"沙箱已经用上隔离"。
+- **AppContainer 布局已用合成缓冲区离线钉死**（**34** 项），这是从缺陷 5（Job 结构体偏移错 4 字节）
   与缺陷 13（漏 `CREATE_UNICODE_ENVIRONMENT`）总结出的做法：**先把布局测对，再谈运行**。
 - **网络面完全未被强制**：沙箱内可开 socket。任何"已断网"的说法都不成立（R2）。
+  （补：T0 自己的网络阻断只是"**不声明能力**"的默认值——一旦声明 `internetClient` 网络即通，
+  所以能力集必须由策略层白名单化，不能由调用方随手传。）
+- **旧结论更正**：早先由本表读出的"AppContainer 探测 `E_ACCESSDENIED` ⇒ 隔离为零 / 进不了容器"
+  **已被推翻** —— 那是**判据错误**（拿 `TokenUser` 比包 SID，而 AppContainer 令牌的 `TokenUser`
+  **本来就是用户 SID**，包身份在 `TokenAppContainerSid(31)`，且包 SID **不在** `TokenGroups` 里）。
+  详见 §8 与 [.t/sbx3/dev/03-FIX-B报告.md](.t/sbx3/dev/03-FIX-B报告.md)。
 
 ### 5.2 档位表
 
 | 档位 | 机制 | 读取面 | 网络面 | 前置条件 | 本项目实现状态 |
 |---|---|---|---|---|---|
-| `T0` appcontainer | AppContainer 能力令牌 + Job + Low IL + ACL | ✅ 收敛 | ✅ 默认阻断 | 能创建 AppContainer profile | ⚠️ **仅档位选择，无执行器** |
+| `T0` appcontainer | AppContainer 能力令牌 + Job + Low IL + ACL | ✅ 收敛 | ✅ 默认阻断 | 能创建 AppContainer profile | ⚠️ **隔离已 `[实测]` 生效（`proven=true`），但仅档位选择、无执行器 ⇒ 仍 fail-closed**（见 §5.1 与 §8） |
 | `T1` restricted-token | WRITE_RESTRICTED + Job + Low IL + ACL | ❌ 不收敛 | ❌ 不收敛 | 令牌具备全部访问权 | ✅ **已实现并实测** |
 | `T2` acl-only | 仅 ACL 写边界 | ❌ | ❌ | 目录属主 | ✅ 已实现（降级路径） |
 | `T3` none | 无可用原语 | — | — | — | ✅ **拒绝执行**（fail-closed） |
@@ -409,3 +420,116 @@ POST /run {}
 - **R7 环境块需运行时注入**：依赖包的受限 spawn 固定传 `lpEnvironment=NULL`（继承父环境，
   违反手册 #8.3）；本实现替换绑定表注入显式环境块，并在结构不符时 **fail-closed 拒绝启动**，
   绝不静默退回继承父环境。
+
+---
+
+## 7. DSH 集成：暂存审批悬浮窗
+
+把本沙箱接进 DeepSeek Harness，使 **DSH 自己的 `write`/`edit` 工具也落暂存树**，
+并在输入框上方给出「待审文件 + 逐文件 diff + 批准/拒绝」的悬浮窗：
+
+- 装配与数据通路（为什么用 `review.json` + `/winstage` 命令而不是新的 Remote 命名空间）、
+  **实测证据**、**已知崩溃风险**（在线切换该 bundle 会让宿主进程退出，改配置后请重启）、
+  残余边界（shell 写入不经过暂存等）：见 [docs/DSH集成.md](docs/DSH集成.md)。
+- 三套可重复跑的离线自测：`.t/review-selftest.mjs`（26 项）、
+  `.t/staging-fs-selftest.mjs`（31 项）、`.t/command-selftest.mjs`（22 项）。
+- `/winstage [list|diff|approve|reject|refresh]` 是人工侧的批准入口；命令不产生模型消息。
+
+### 7.1 第二实例 + 真实浏览器实测（2026-09-28）
+
+在**独立的第二个 DSH 实例**（另一端口、独立 `DSH_HOME`）上装了本插件，用真实浏览器（CDP）
+把面板**看得见、点得动**逐条验过。结论摘要，证据见
+[需求与验收](docs/dsh2-需求与验收.md) / [基线报告](docs/dsh2-基线报告.md) /
+[修复报告](docs/dsh2-修复报告.md) / [发现台账](docs/dsh2-发现记录.md)：
+
+- **面板确实出现**（headless + 有头双证据，截图在 `.t/dsh2/browser/`）；
+  「批准所选」后 `review.json` 变化且文件**真的落盘**，「暂时收起」后消失。
+- **修掉 7 个缺陷**，其中两个是"看不见就永远查不出来"的：
+  ① loader 行名用子路径 specifier ⇒ **client 半永不下发**（面板永远不出现，刷新无效）；
+  ② 命令定义写成 `input: { placeholder }` 而校验器要 **`hint`** ⇒ 注册抛错 ⇒
+  `/winstage*` **一条都没注册** ⇒ 面板的批准/拒绝**静默失效**。
+- **两条硬规则**（改 composition 前必读）：**host 行必须用裸包名、fs 行必须保留子路径**；
+  且 **profile 覆盖层必须重述该行 config 的所有键**（`config` 是整体替换、不是深合并，
+  漏写的键**静默消失**）。
+- **环境事实**：本 Agent 沙箱内**起不了 Chromium**（Mojo 要命名管道），浏览器验收必须在
+  **沙箱外的终端**启动浏览器再用 CDP 操作 —— Runbook 见
+  [.t/dsh2/S5-浏览器Runbook.md](.t/dsh2/S5-浏览器Runbook.md)。
+
+> **改动尚未提交 git**（本环境 PATH 上没有 git）。落地文件：`dsh-plugin/` 下的
+> `cordis.patch.yml`、`host-plugin.mjs`、`client.js`、`staging-fs.mjs`、`fs-entry.mjs`。
+
+---
+
+## 8. 第二轮修复（FIX-A/B/C/D）
+
+第二个修复轮次按四个工作流并行推进，各修一处/一组缺陷，**每条结论都有原始输出存档**。
+完整叙述（含逐条原始字段）见 [.t/sbx3/最终报告.md](.t/sbx3/最终报告.md) §12。
+
+### 8.1 修了什么（一句话一条 + 证据路径）
+
+| 缺陷 | 结论 | 关键证据 |
+|---|---|---|
+| **D11** `cli exec` 管道死锁 | **已修（产品级）**：同一 300 KB 用例由「挂死到封装超时（`outBytes=0`、`durationMs=150153`、连 `--timeout 60000` 的 124 都没打印）」变为 **300395 B / `exitCode=0` / `4376 ms`**。改法：`src/executor.mjs` 新增 `waitForExitWithoutStarvingEventLoop`（**50 ms 有界等待切片** + `await setTimeout(0)` 让出事件循环），`collectChild` 改为**先发起两条排水、把退出等待延后一个宏任务**。判定力：把 `collectChild` 回退成同步等退出 ⇒ `tests/executor-stub.mjs` 由 **84 ok/0 bad → 84 ok/3 bad**，随后按字节还原（SHA256 `00E593D9…33A0`）。**残留**：`drainPipe` 固定 1 ms 轮询 ⇒ 吞吐 ~77 KB/s（**库侧，未修**） | `.t/sbx3/fixA/out/EVIDENCE-INDEX.md`、`out/fixA-d11-summary-*.json`、`out/D11-stub-{GREEN,RED}-*.txt`、`out/jobs/big.cli.out.txt` |
+| **S1** 沙箱内子进程静默死亡 | **精确表征（与 D11 不同因）**：同一 `cmd.exe /c ver` 只改创建标志 —— `0x0` → **exit 0 且有 `ver` 输出**；`CREATE_NO_WINDOW(0x08000000)` / `CREATE_NEW_CONSOLE(0x10)` → **`0xC0000142`**；`NEW_PROCESS_GROUP(0x200)` / `UNICODE_ENV(0x400)` → 0；`DETACHED(0x8)` → 1 ⇒ **受限令牌下「需要新建控制台」⇒ 子进程秒死**（`CreateProcessW` 仍返回成功）。**执行器主路径不受影响**（`spawnPipedProcess` 本就 `creationFlags=0`）；二级（PowerShell 侧**创建阶段**就 `Access is denied`）**未定论、不合并** | `.t/sbx3/fixA/out/s1-flag-diff.json`、`out/s1-stage1.json`、`out/node-spawn-probe.json` |
+| **T0 / AppContainer** | **"第 3 因"不存在，是判据错误**：AppContainer 令牌的 `TokenUser` **本来就是用户 SID**，包身份在 `TokenAppContainerSid(31)`，包 SID **不在** `TokenGroups` 里。四组实验（koffi / 显式 AC 令牌 + `DuplicateTokenEx` / 独立 PS P/Invoke / `caps=0` vs `1`）实测：`IsAppContainer=1`、包 SID 一致、**Low IL**、**区外写被拒**、**`caps=0` 时 `curl exit 7`**、**`caps=1(internetClient)` 时 `curl exit 0`**。顺带修掉两个真缺陷：`deriveCapabilitySidsFromName` **悬垂指针**（整进程 `0xC0000374` 堆损坏）、`bInheritHandles=TRUE` + 无自有控制台 ⇒ 子进程 `0xC0000142`（默认改 `false` + 危险组合 fail-closed）。`proven` 接到实测证据（五项判据缺一即 false），真机 `proven=true` —— **但 T0 仍未接线到执行器，`selectTier()` 继续 fail-closed** | `.t/sbx3/dev/03-FIX-B报告.md`、`raw-t0-{forensics,pinvoke,launch-matrix,isolation-proof}.txt`、`raw-fixb-{layout,runtime}-{green,plant}.txt` |
+| **S3** `dpapi-user` 漏掉 `Microsoft\Protect` 目录自身 | **已修**：`canonical()` 会**去掉结尾分隔符** ⇒ 旧模式（要求结尾 `\`）只能命中目录下的文件；改为 `(\\\|$)` 并新增**目录探针** | `.t/sbx3/fixC/out/s3-dpapi-dir.before-after.txt` |
+| **S5** 非 AppData 的浏览器凭据库不被命中却可读 | **已修**：新增两条规则 `browser-profile-auth-db` / `browser-profile-state`（各带**可命中**探针），覆盖 `Login Data` **129024 B**、`Login Data For Account` 51200 B、`Local State` **74863 B** 等 6 条路径；并修掉首版 `[^\\]*profile` 只匹配紧邻上一级的漏网 | `.t/sbx3/fixC/out/s5-browser-nonappdata.before-after.txt` |
+| **F8** 非十六进制 `data` 被静默解码 | **已修（实测比原描述更糟）**：原先**静默**解出**与写入值无关的垃圾**（`REG_SZ('hello')` → `0000`、`REG_DWORD` → 0、`REG_QWORD` 抛**无 code** 的 `SyntaxError`）⇒ 新增 `assertShape()` 抛 `code='REG_SNAPSHOT_INVALID'`，**12 条新断言** | `.t/sbx3/fixC/out/raw-registry-guard-{green,plant}.stdout.txt` |
+| **读取探针** | `src/audit.mjs::READ_PROBES` **10 → 42 条**（原 10 条 **id/顺序逐字保留**）+ **五态**判定（`readable` / `denied` / `read-metadata-only`（记 fail）/ `not-present`（**绝不记 denied**）/ `error`）。实测三态分布 `{read-metadata-only:5, readable:16, not-present:21}`；只记 `id/path/verdict/len/head4/errCode`，**秘密不进证据** | `.t/sbx3/fixC/out/read-probes-run.txt`、`.t/sbx3/fixC/REPORT.md` |
+| **D1** 面板只渲染净 diff，活候选不可见 | **已修**：`files[]` = 净 diff 行（可批准）**∪ 冻结存档行**（`frozenOnly:true`，只显示、**无勾选框**、带 `frozenReason`）；新增 `counts.{net,frozenOnly}` 与 `candidates[]`（含 `appliedPaths`）。**关键坑**：`cs_0005` 的两条是 `state:"deleted"` + `baseHash:"absent"` 的墓碑，删除类 `after.hash` 也是 `'absent'` ⇒ 用磁盘比对会误判成"已完成"，已改为 `appliedPaths` ∪ 非删除类磁盘比对。修前 FAIL：`s2-candidate-paths-visible`（`invisible=[cs_0005 .ssh\id_rsa, cs_0005 r3-a.txt]`，exit 5） | `.t/sbx3/browser/out/fixd-pre-s2-panel.txt`、`out/fixd-post-restart-loaded.json`、`.t/sbx3/browser/FIX-D-报告.md` |
+| **D2** `reject()` 连坐回收却只 discard 最新候选 | **已修**：`reject()` 重写 + `reconcileCandidates()` ⇒ **discard 范围 = 回收范围**，不再留"空壳 pending"；语义明确「拒绝全部 = 清空全部暂存 + 终结全部候选 ⇒ 面板卸载是**设计**」。修前 FAIL：`s4-no-shell-pending`（`openAfter` 留下 3 份空壳，exit 5）。跨工作区守卫（`sameRoot()`/选举/poller 自校验）**一字未改**，另有**独立控制组** | `.t/sbx3/browser/out/fixd-pre-s4-reject.txt`、`fixd_client_selftest.mjs`（E1/E2） |
+
+### 8.2 权威测试套件表（第二轮最终口径，`[实测]`）
+
+`verify.cmd`（离线确定性套件，任何会话可跑）：
+
+| 套件 | 断言数 | 本轮变化 |
+|---|---|---|
+| `tests/selftest.mjs` | 51 | — |
+| `tests/e2e-flow.mjs` | 21 | 16 → 21 |
+| `tests/struct-layout.mjs` | 24 | — |
+| `tests/appcontainer-layout.mjs` | **34** | 27 → 34（`--plant` 6 条红） |
+| `tests/paths-masks.mjs` | 37 | （第一轮后段新增） |
+| `tests/workspace-regressions.mjs` | 10 | （第一轮后段新增） |
+| `tests/registry-guard.mjs` | **125** | **本轮补进 `verify.cmd` 与 `OFFLINE_SUITES`**（此前两处都缺） |
+| `tests/resolve-exec.mjs` | 19 | — |
+| `tests/executor-stub.mjs` | **84** | 72 → 84（D11 红/绿双档） |
+| `tests/audit-parse.mjs` | **43** | 23 → 43（读探针表 + 秘密红线） |
+| `tests/meta-runner.mjs` | 4 | — |
+| **`verify.cmd` 合计** | **452** | `RESULT: ALL PASS`（`.t/sbx3/fixA/out/verify-final.txt`，11 套件 / 0 失败） |
+
+`autotest.cmd --skip-audit`（离线 11 套 + 沙箱套件）：
+
+| 项 | 数 | 备注 |
+|---|---|---|
+| 离线套件 | **452** | 同上 |
+| `tests/diag-bindings.mjs` | 22 | 需未受限会话；14 → 22 |
+| **合计** | **474 ok / 0 bad / 0 跳过（12 套件）** | `.t/sbx3/fixA/out/autotest-skip-audit.txt` |
+
+插件侧与辅助套件（离线，不依赖 Win32 沙箱）：
+
+| 套件 | 断言数 | 备注 |
+|---|---|---|
+| `.t/review-selftest.mjs` | 26 / 0 | 本轮复跑 |
+| `.t/staging-fs-selftest.mjs` | 31 / 0 | 本轮复跑 |
+| `.t/command-selftest.mjs` | **24** / 0 | 本轮复跑（§7 旧文写 22） |
+| `.t/sbx3/browser/fixd_selftest.mjs` | **48** / 0 | 新增（D1/D2 宿主半） |
+| `.t/sbx3/browser/fixd_client_selftest.mjs` | 25 / 0 | 新增（客户端半，含跨工作区守卫控制组） |
+| `.t/sbx3/browser/fixd_forecast.mjs` | 11 / 0 | 真实 fixture 不变式 + 预报 |
+| `.t/default-on-selftest.mjs` | **13** / 0（另 6 个变异体各自见红） | 新增：「默认开启沙箱」= 五层默认值 + 活动 profile 装配的回归门：五层默认值 + 活动 profile 装配 + 设置页生效值（见 docs/DSH集成.md §20） |
+| `tests/appcontainer-runtime.mjs` | **140** / 0（`--plant` 6 红） | ⚠️ **尚未接入 `verify.cmd` / `OFFLINE_SUITES`**（与 `registry-guard` 被补进清单前的处境相同，属**已知缺口**） |
+
+> 口径说明：FIX-C 当时报的 `verify.cmd` **11 套件 / 448 断言**是其**时点口径**
+> （那时 `appcontainer-layout` 还是 30 条）；最终一次全量回归（`verify-final.txt`，晚于全部代码改动）
+> 是 **11 套件 / 452 断言 / 0 失败**。两者不矛盾。
+
+### 8.3 第二轮仍未提供的保证（必须与任何"通过"一起读）
+
+- **T0 未接线到执行器**：`proven=true` 只证明"隔离能生效"，**不证明"沙箱已在用 T0"**；`selectTier()` 仍 fail-closed。
+- **T0 读面未收敛**：实测仍可读 `C:\Windows\win.ini`（**R1** 残余）。
+- **WFP 未装过滤器**、**注册表 ACL 未启用**（沙箱内 `reg add` 的 `Access is denied` 来自受限令牌/ACL 的既有约束，本轮未新增注册表策略）。
+- **R2 网络面未收敛**：沙箱内可开 socket。
+- **`drainPipe` 吞吐**：固定 1 ms 轮询 ⇒ ~77 KB/s（**库侧，未修**）。
+- **S1 二级未定论**：创建阶段 `Access is denied` 与用户态 `0xC0000142` **是否同因**，保持未定论。
+- **D1/D2 的浏览器侧回归 `[未实测]`**：3085 重启后 HTTP 未监听（`START-EXIT 1`、supervisor ~2 s 判死、`sbx3.out/err.log` **0 字节**），**与插件改动无关**（同一轮 `DUMP-CONFIG-PASS` 通过、插件成功发布了新格式快照）。离线替代证据：`fixd_selftest 48/48`、`fixd_client_selftest 25/25`、`fixd_forecast 11/11`、`s3_suite --dry-run 5/5`（目录 52 = 代码 52）。
+- **遮蔽规则仍是黑名单**：改名 / 换扩展名 / 换目录形状即绕过；非 AppData 的 Mozilla `key4.db` / `logins.json` **未覆盖**；**遮蔽 ≠ 拒绝**。

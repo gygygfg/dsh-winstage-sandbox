@@ -13,11 +13,23 @@
  *     manifest.json          暂存清单（当前逻辑工作区）
  *     blobs/<aa>/<sha256>    内容寻址：base / staged / candidate 三层共用，自动去重
  *     staged/<rel>           物化暂存树（保留真实 basename 与扩展名，供语言识别与命令执行）
+ *     staged-ext/<aa>/<hash>/<name>   工作区**外**条目的物化暂存对象（见下）
  *     candidates/<id>.json   候选元数据（不可变）
  *     queue.json             待审队列与丢弃状态
  *     real/<rel>             工作区只读映射（junction），受限进程可读不可写
  *     private/               会话私有 temp（01777 语义 → Windows ACL 授予独立 SID）
  *     cache/                 能力探测缓存（键=环境指纹）
+ *
+ * ── 清单键模型（S3a：工作区外条目）────────────────────────────────────────────
+ * 工作区**内**条目的键 = 工作区相对路径（`a\b.txt`，从不以分隔符/盘符开头）。
+ * 工作区**外**条目的键 = 该目标的**规范化绝对路径**（`C:\out\a.txt`），并在条目上带
+ * `external: true` 标记。两者键空间天然不相交（相对路径不可能带盘符/前导分隔符），
+ * 因此无需前缀，`entryOf()` 对两种键是同一个查找。
+ *
+ * 为什么 `stagedPath()` 对键做哈希分桶：相对键直接拼进 `staged/` 会保留目录语义；
+ * 而绝对键不能直接拼（`C:\out\a.txt` 里的冒号在 Windows 上是非法文件名字符），
+ * 所以外部条目的物化对象落在 `staged-ext/<hash 分桶>/<hash16>/<原 basename>` ——
+ * **保留 basename 与扩展名**（#3.9 语言识别依赖它），目录语义由清单的键承担。
  */
 
 import { createHash, randomUUID } from 'node:crypto'
@@ -35,7 +47,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
-import { dirname, join, normalize, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, normalize, sep } from 'node:path'
 
 export const MANIFEST_VERSION = 1
 export const CANDIDATE_VERSION = 1
@@ -67,6 +79,28 @@ export function hashFile(path) {
 
 export function hashAbsent() {
   return 'absent'
+}
+
+/**
+ * 清单键是不是"工作区外条目"的键（= 规范化绝对路径）。
+ * 相对键永远不以盘符/前导分隔符开头，所以这是**无歧义**的判别式。
+ */
+export function isExternalKey(key) {
+  return typeof key === 'string' && key.length > 0 && isAbsolute(key)
+}
+
+/** 外部条目物化对象的安全叶名：保留 basename/扩展名，剔除 Windows 非法字符 */
+function externalLeaf(key) {
+  const raw = basename(normalize(key))
+  const cleaned = String(raw)
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_')
+    .replace(/[. ]+$/, '')
+  return cleaned.length === 0 ? 'entry' : cleaned.slice(0, 120)
+}
+
+/** 外部条目的内容戳：不区分大小写（NTFS 默认），保证同一目标永远同一分桶 */
+export function externalKeyDigest(key) {
+  return sha256Buffer(Buffer.from(normalize(key).toLowerCase(), 'utf8'))
 }
 
 /** 原子写：先写临时文件再 rename，避免半写状态被后续读取到 */
@@ -141,11 +175,21 @@ export class Store {
   /** @param {string} workspaceRoot 真实工作区根（绝对路径，已 canonical） */
   constructor(workspaceRoot, options = {}) {
     this.workspaceRoot = workspaceRoot
-    this.dir = join(workspaceRoot, STORE_DIR)
+    /**
+     * 存储根：默认 `<workspaceRoot>/.dshstage`。
+     *
+     * `options.storeDir` 用于**按会话隔离**：`getReviewService({ sessionId })` 把它指到
+     * `<workspaceRoot>/.dshstage/sessions/<key>`，于是每个会话各有一份
+     * manifest/queue/blobs/staged/candidates —— 审批内容天然隔离。
+     * 不传该选项时逐字保持升级前的布局（离线自测 / agentless 调用）。
+     */
+    this.dir = options.storeDir ? String(options.storeDir) : join(workspaceRoot, STORE_DIR)
     this.manifestPath = join(this.dir, 'manifest.json')
     this.queuePath = join(this.dir, 'queue.json')
     this.blobDir = join(this.dir, 'blobs')
     this.stagedDir = join(this.dir, 'staged')
+    /** 工作区**外**条目的物化暂存对象（哈希分桶，不参与 staged/ 的目录语义遍历） */
+    this.stagedExtDir = join(this.dir, 'staged-ext')
     this.candidateDir = join(this.dir, 'candidates')
     this.realDir = join(this.dir, 'real')
     this.privateDir = join(this.dir, 'private')
@@ -154,7 +198,7 @@ export class Store {
   }
 
   ensureLayout() {
-    for (const dir of [this.dir, this.blobDir, this.stagedDir, this.candidateDir, this.realDir, this.privateDir, this.cacheDir]) {
+    for (const dir of [this.dir, this.blobDir, this.stagedDir, this.stagedExtDir, this.candidateDir, this.realDir, this.privateDir, this.cacheDir]) {
       mkdirSync(dir, { recursive: true })
     }
     return this
@@ -264,15 +308,32 @@ export class Store {
     return manifest
   }
 
-  stagedPath(relativePath) {
-    return join(this.stagedDir, normalize(relativePath))
+  /**
+   * 清单键 → 物化暂存对象的绝对路径。
+   *
+   * 相对键（工作区内）：沿用 `staged/<rel>`（保留完整目录语义，命令执行的 cwd 就是它）。
+   * 绝对键（工作区外）：`staged-ext/<aa>/<hash16>/<basename>` —— 绝对路径不能直接拼进
+   * `staged/`（`C:` 的冒号是 Windows 非法文件名字符），故按稳定哈希分桶，只保留叶名。
+   */
+  stagedPath(key) {
+    if (isExternalKey(key)) {
+      const digest = externalKeyDigest(key)
+      return join(this.stagedExtDir, digest.slice(0, 2), digest.slice(0, 16), externalLeaf(key))
+    }
+    return join(this.stagedDir, normalize(key))
   }
 
-  /** 真实路径 → 工作区相对路径（带边界校验，越界 fail-closed） */
-  realPath(relativePath) {
-    const clean = normalize(relativePath)
+  /**
+   * 清单键 → **真实目标**绝对路径（带边界校验，越界 fail-closed）。
+   *
+   * 绝对键 = 工作区外目标：键本身就是它的真实路径，直接返回（键在建立时已 canonical）。
+   * 相对键 = 工作区内：仍然做 `..` 逃逸校验，行为与改动前逐字一致。
+   */
+  realPath(key) {
+    if (isExternalKey(key)) return normalize(key)
+    const clean = normalize(key)
     if (clean.startsWith('..') || clean.includes(`..${sep}`)) {
-      const error = new Error(`unsafe relative path: ${relativePath}`)
+      const error = new Error(`unsafe relative path: ${key}`)
       error.code = 'UNSAFE_RELATIVE_PATH'
       throw error
     }

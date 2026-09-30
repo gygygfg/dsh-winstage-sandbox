@@ -33,6 +33,7 @@ import {
   Store,
   hashAbsent,
   hashFile,
+  isExternalKey,
   newCandidateId,
   sha256Buffer,
   writeFileAtomic,
@@ -47,6 +48,72 @@ export class SandboxError extends Error {
     this.code = code
     this.detail = detail
   }
+}
+
+/**
+ * 是不是一个**重解析点**（symlink / junction / mount point），即"名字代理"结点。
+ *
+ * 为什么必须单独判：Windows 上 `statSync().isDirectory()` 对 junction 返回 **true**，
+ * 而 `readFileSync(junction)` 会**跟随解析**到目标；目标若是目录就得到
+ * `EISDIR: illegal operation on a directory, read`。
+ * 于是"暂存树里有一个 junction"会让整条 `cli exec` 在命令执行**之前**就崩在
+ * `snapshotStagedTree()` 上（原始证据 `.t\sbx3\t-fs\out\13-cli-exec-junction-crash.err`）。
+ *
+ * 判据用 `FILE_ATTRIBUTE_REPARSE_POINT`(0x400) 而不是只看 `isSymbolicLink()`：
+ * junction / mount point 的 `isSymbolicLink()` 为 false，但属性位同样置位。
+ * 这样"跳过重解析点"是一个**覆盖全类**的守卫，而不是只堵住已见过的那一种。
+ */
+function isReparsePoint(info) {
+  if (!info) return false
+  if (typeof info.isSymbolicLink === 'function' && info.isSymbolicLink()) return true
+  return (Number(info.mode ?? 0) & 0x400) !== 0
+}
+
+/**
+ * 暂存树内容戳：一次遍历，返回
+ *   `{ hashes: Map<rel, sha256>, realPaths: Map<rel, relOnDisk>, seen: Set<abs>, skippedReparsePoints: string[] }`
+ *
+ * 键是 `relative()` 的原样相对路径（**不做大小写归一**）。
+ *
+ * 为什么不用 `compareKey()` 当键（这是修复 D9 时被真实数据抓到的一处隐患）：
+ * Windows 不区分大小写，`Src\App.js` 与 `src\app.js` 是同一个文件；若键被小写化后
+ * 再拿去 `writeFile()`，清单里就会出现**第二个键**（原大小写的旧条目 + 小写的新条目），
+ * 快照与捕获因此永远对不上。保留原样相对路径，并额外给出 `realPaths` 供"要落盘/要暂存"
+ * 的调用方使用，比较语义由调用方显式决定。
+ *
+ * 为什么抽成一个模块级函数：`snapshotStagedTree()`（执行前）与 `captureAfterExecution()`
+ * （执行后）必须**用同一个口径**看待暂存树，否则"执行前跳过了 junction、执行后又去 hash 它"
+ * 会让命令执行完仍在同一个地方崩掉。两处共用一份 walker 是唯一能保证不再漂移的写法。
+ *
+ * 跳过重解析点的取舍见 `snapshotStagedTree()` 的注释（缺陷 D8）。
+ */
+function walkStagedForHashes(stagedDir) {
+  const hashes = new Map()
+  const realPaths = new Map()
+  const seen = new Set()
+  const skippedReparsePoints = []
+  const walk = (dir) => {
+    for (const name of readdirSync(dir)) {
+      const item = join(dir, name)
+      const info = lstatSync(item)
+      if (isReparsePoint(info)) {
+        // junction/symlink 的 isDirectory() 可能为 true：绝不能递归，也绝不能 hash
+        seen.add(item)
+        skippedReparsePoints.push(item)
+        continue
+      }
+      if (info.isDirectory()) {
+        walk(item)
+        continue
+      }
+      seen.add(item)
+      const rel = relative(stagedDir, item)
+      hashes.set(rel, hashFile(item))
+      realPaths.set(rel, rel)
+    }
+  }
+  if (existsSync(stagedDir)) walk(stagedDir)
+  return { hashes, realPaths, seen, skippedReparsePoints }
 }
 
 /** 依据实际类型决定逻辑状态（#3.1） */
@@ -96,11 +163,30 @@ export class Workspace {
   /**
    * 校验投影完整性：记录声明文件存在而存储对象缺失 → 损坏，禁止发布（3.1）。
    * 绝不把"暂存副本意外丢失"解释为用户删除。
+   *
+   * ── 目录条目不得走 blob 分支（缺陷 D10）──────────────────────────────────────
+   * 目录条目（含 `synthesizeParents()` 合成的父目录，以及 `createDirectory()` 建的目录）
+   * 天生 `stagedHash === hashAbsent()`：目录**不是**内容对象，没有 blob 是**正确状态**。
+   * 初版第一分支缺少 `entry.kind !== 'dir'` 守卫，于是健康工作区被报成
+   * "损坏项 N 个（禁止发布）"，例如 `corruption:[{path:"seed",reason:"staged blob missing"}]`
+   * （原始证据 `.t\sbx3\t-fs\out\cli-init-healthy.json`）。
+   * 第二分支本来就有同类守卫（见下），两处必须同口径：
+   *   - 文件：blob 缺失 = 损坏；blob 在但暂存树物化缺失 = 损坏
+   *   - 目录：不查 blob，只查"是否有东西被声称物化了却没有"（合成目录允许不存在）
    */
   verifyProjection() {
     const corrupt = []
     for (const [rel, entry] of Object.entries(this.manifest.entries)) {
       if (entry.state === STATE.DELETED) continue
+      if (entry.kind === 'dir') {
+        // 目录没有内容对象；只有"非合成且既无 blob 又无物化目录"才可疑。
+        // 合成目录（synthetic:true）在真实磁盘上**本就不存在**，那不是损坏。
+        if (entry.synthetic === true) continue
+        if (entry.stagedHash !== hashAbsent() && !this.store.hasBlob(entry.stagedHash)) {
+          corrupt.push({ path: rel, reason: 'staged blob missing', state: STATE.CORRUPT })
+        }
+        continue
+      }
       const okBlob = entry.stagedHash === hashAbsent() ? false : this.store.hasBlob(entry.stagedHash)
       const materialized = existsSync(this.store.stagedPath(rel))
       if (!okBlob && entry.state === STATE.FILE) {
@@ -171,6 +257,27 @@ export class Workspace {
     return rel
   }
 
+  /**
+   * 逻辑路径 → **清单键**（S3a：工作区外条目底座）。
+   *
+   *   - 词法在工作区内 → `{ key: <相对路径>, external: false }`（与 `relative()` 同一口径）
+   *   - 词法在工作区外 → `{ key: <规范化绝对路径>, external: true }`
+   *
+   * 为什么键用**规范化绝对路径**而不是 `..\..` 相对路径：相对路径在暂存树里会产生
+   * 语义歧义（`..` 既可能是"用户写的相对路径"也可能是"越界逃逸"），而绝对路径与
+   * 工作区内相对路径的键空间天然不相交 —— `entryOf()` 因此对两种条目是同一个查找。
+   *
+   * 与 `relative()` 的关系：`relative()` **保持原样**（工作区外仍抛
+   * PATH_OUTSIDE_WORKSPACE），因为它是"这个路径必须工作区内"的断言式入口，
+   * 已被读取工具与既有测试依赖；`keyOf()` 是新增的双键空间入口，两者不互相改变语义。
+   */
+  keyOf(target) {
+    const rel = lexicalInside(this.root, target)
+    if (rel !== undefined) return { key: rel, external: false, abs: rel === '' ? this.root : this.store.realPath(rel) }
+    const abs = canonical(target)
+    return { key: abs, external: true, abs }
+  }
+
   /** 相对路径 → 真实绝对路径 */
   absolute(rel) {
     return this.store.realPath(rel)
@@ -183,6 +290,50 @@ export class Workspace {
 
   entryOf(rel) {
     return this.manifest.entries[rel]
+  }
+
+  /**
+   * **以真实文件为基线重新暂存**（`/winstage rebase` 的落地动作）。
+   *
+   * 暂存条目是"相对某个基线的 diff"。基线一旦被外部改动（shell / 另一个进程 /
+   * 编辑器），`applyOneChange()` 会以 `STALE_BASELINE` 拒绝落盘（手册 #12.1，
+   * 不能静默覆盖），而面板上的 diff 还停在旧基线 ⇒ "视图与现实不一致、批准必然失败"。
+   * 本方法把 `baseHash/baseKind` 换成磁盘当前值，**不改 `stagedHash`、不改 `state`**
+   * —— 这是重述基线，不是强制覆盖：
+   *   - 真实内容 ≠ 暂存内容 ⇒ 变成一条**可批准的**新 diff（before 现在是真实内容）；
+   *   - 真实内容 == 暂存内容 ⇒ 无净变化，条目自动退出视图（连批准都不需要）。
+   * @returns {boolean} 是否找到并更新了条目
+   */
+  rebaseEntry(rel) {
+    const entry = this.entryOf(rel)
+    if (!entry) return false
+    const abs = this.absolute(rel)
+    const info = statKind(abs)
+    const baseHash = info && info.kind === 'file' ? hashFile(abs) : hashAbsent()
+    if (baseHash !== hashAbsent()) this.store.putBlob(readFileSync(abs))
+    entry.baseHash = baseHash
+    entry.baseKind = info?.kind
+    entry.baseRevision = this.manifest.revision
+    entry.changed = entry.state === STATE.DELETED ? true : entry.stagedHash !== entry.baseHash
+    entry.updatedAt = new Date().toISOString()
+    return true
+  }
+
+  /**
+   * 该条目的真实基线是否已经偏离**清单记录**（外部改动）。
+   *
+   * 判据与 `applyOneChange()` 的 `STALE_BASELINE` 检查**同源**：只比 hash
+   * （`before.hash` 对 absent 的条目同样用 `hashAbsent()`），因此"面板说没 stale"
+   * 与"批准会成功"不会互相矛盾。
+   * @returns {{stale: boolean, expected: string, found: string}}
+   */
+  baselineDrift(rel) {
+    const entry = this.entryOf(rel)
+    if (!entry) return { stale: false, expected: hashAbsent(), found: hashAbsent() }
+    const info = statKind(this.absolute(rel))
+    const found = info && info.kind === 'file' ? hashFile(this.absolute(rel)) : hashAbsent()
+    const expected = entry.baseHash ?? hashAbsent()
+    return { stale: found !== expected, expected, found }
   }
 
   // ==================== 读取面 ====================
@@ -198,8 +349,29 @@ export class Workspace {
   exists(target, opts = {}) {
     const lexicalRel = lexicalInside(this.root, target)
     if (lexicalRel === undefined) {
-      // 词法上就在工作区外：按遮蔽表判定，命中即不可见
-      return { exists: false, source: this.maskOf(target) ? 'masked' : 'outside' }
+      // S3a：工作区外**也可以有暂存条目**（键 = 规范化绝对路径）。命中即按投影回答，
+      // 未命中才回落到既有的"外部不可见/遮蔽"语义（真实磁盘由调用方按 baseline 读）。
+      const key = canonical(target)
+      const entry = this.entryOf(key)
+      if (entry) {
+        if (entry.state === STATE.DELETED) return { exists: false, kind: entry.kind, source: 'deleted', external: true }
+        if (entry.state === STATE.CORRUPT) {
+          throw new SandboxError('WORKSPACE_CORRUPT', `staged object for ${key} is missing; refusing to fall back to the real disk`, {
+            path: key,
+          })
+        }
+        return { exists: true, kind: entry.kind === 'dir' ? 'dir' : 'file', source: 'staged', external: true }
+      }
+      if (this.hasStagedDescendant(key)) return { exists: true, kind: 'dir', source: 'synthetic', external: true }
+      // 未命中暂存 → **统一视图**回落到真实磁盘（"命中暂存走投影，其余走真实磁盘"）。
+      // 顺序与工作区内分支一致：先遮蔽判定（遮蔽即不可见），再 statKind。
+      if (!opts.skipMaskCheck) {
+        const mask = this.maskOf(target)
+        if (mask) return { exists: false, kind: undefined, source: 'masked', maskId: mask.id, external: true }
+      }
+      const outsideInfo = statKind(key)
+      if (!outsideInfo) return { exists: false, source: 'outside', external: true }
+      return { exists: true, kind: outsideInfo.kind === 'dir' ? 'dir' : 'file', source: 'baseline', external: true }
     }
     const rel = lexicalRel
     if (rel === '') return { exists: true, kind: 'dir', source: 'baseline' }
@@ -229,16 +401,30 @@ export class Workspace {
     return { exists: true, kind: info.kind === 'dir' ? 'dir' : 'file', source: 'baseline' }
   }
 
+  /**
+   * 暂存树里是否有该键的**后代**。
+   *
+   * S3a 追加两条约束：
+   *   1. 键空间不混：相对键只看工作区内条目，绝对键只看外部条目。否则
+   *      `C:\out` 会被当成工作区根的"后代"而污染根枚举（这正是必须防的错）。
+   *   2. `rel === ''`（工作区根）不再走 `compareKey('')` —— 那个调用会抛 TypeError
+   *      （`lexical()` 拒绝空串）。根的语义就是"是否有任何工作区内条目"。
+   */
   hasStagedDescendant(rel) {
+    const external = isExternalKey(rel)
+    if (rel === '') {
+      return Object.values(this.manifest.entries).some((entry) => entry.external !== true)
+    }
     const prefix = compareKey(rel) + sep.toLowerCase()
-    for (const key of Object.keys(this.manifest.entries)) {
+    for (const [key, entry] of Object.entries(this.manifest.entries)) {
+      if ((entry.external === true) !== external) continue
       if (compareKey(key).startsWith(prefix)) return true
     }
     return false
   }
 
   readFile(target) {
-    const rel = this.relative(target)
+    const { key: rel } = this.keyOf(target)
     const entry = this.entryOf(rel)
     if (entry) {
       if (entry.state === STATE.DELETED) {
@@ -266,7 +452,7 @@ export class Workspace {
   }
 
   stat(target) {
-    const rel = this.relative(target)
+    const { key: rel } = this.keyOf(target)
     const state = this.exists(target)
     if (!state.exists) return undefined
     if (state.source === 'staged' && this.entryOf(rel)) {
@@ -286,7 +472,7 @@ export class Workspace {
    * 返回的 path 一律是**逻辑路径**；目录项不带暂存路径（#3.2 / #3.3）。
    */
   listDir(target, opts = {}) {
-    const rel = this.relative(target)
+    const { key: rel, external } = this.keyOf(target)
     const state = this.exists(target)
     if (!state.exists) throw new SandboxError('ENOENT', `directory ${target} does not exist`, { path: rel })
     if (state.kind !== 'dir') throw new SandboxError('ENOTDIR', `${target} is not a directory`, { path: rel })
@@ -313,8 +499,12 @@ export class Workspace {
     }
 
     // 2) 暂存项覆盖 / 新增
+    //    键空间隔离（S3a）：列的若是工作区内目录，只能合并工作区内条目；
+    //    列的若是外部目录（绝对键），只能合并外部条目。否则 `C:\out` 会被当成
+    //    工作区根的直接子项（`c:`）混进根枚举。
     const prefix = rel === '' ? '' : compareKey(rel) + sep.toLowerCase()
     for (const [key, entry] of Object.entries(this.manifest.entries)) {
+      if ((entry.external === true) !== external) continue
       const ckey = compareKey(key)
       if (rel === '') {
         if (!ckey.includes(sep.toLowerCase())) {
@@ -335,6 +525,7 @@ export class Workspace {
     // 3) 删除标记移除（删除对所有工具表现为不存在）
     for (const [key, entry] of Object.entries(this.manifest.entries)) {
       if (entry.state !== STATE.DELETED) continue
+      if ((entry.external === true) !== external) continue
       const ckey = compareKey(key)
       if (rel === '') {
         if (!ckey.includes(sep.toLowerCase())) merged.delete(ckey)
@@ -438,10 +629,33 @@ export class Workspace {
   ensureEntry(rel, opts = {}) {
     const existing = this.entryOf(rel)
     if (existing && existing.state !== STATE.DELETED) {
-      // 幂等：已暂存路径不重复暂存（#3.10）
+      // 幂等：已暂存路径不重复暂存（#3.10 —— 只要求"不新增条目"，不要求"不更新基线"）
       if (opts.kind && existing.kind !== opts.kind && existing.kind !== 'dir') {
         // 类型替换：记录并允许
         existing.kind = opts.kind
+      }
+      // ── P0-3：幂等早退**必须**把基线重述为真实磁盘当前值 ─────────────────────
+      // 旧行为在此直接 `return existing`，`baseHash` 从此停在**首次暂存那一刻**的真实
+      // 内容上。于是"暂存 v1 → 外部改了真实文件 → 再暂存 v2 同一路径"之后：
+      //   · diff 的 before 仍是 v0（视图与现实不一致）；
+      //   · `applyOneChange()` 拿 v0 与真实值比 ⇒ **STALE_BASELINE 永久拒绝**（"批不掉"）。
+      // 现在每次（重新）暂存都以真实磁盘为基线 —— 与 `rebaseEntry()` 同一语义、同一判据
+      // （只比 hash），因此"面板说没 stale"与"批准会成功"不会再互相矛盾。
+      // #12.1 的硬闸门**不受影响**：它拦的是"最后一次暂存之后真实文件又被外部改动"
+      // （那条路径不经过本方法），`tests/selftest.mjs` 的 #12.1/#12.2 逐字不动。
+      if (opts.refreshBaseline !== false) {
+        const absNow = this.absolute(rel)
+        const infoNow = statKind(absNow)
+        const baseNow = infoNow && infoNow.kind === 'file' ? hashFile(absNow) : hashAbsent()
+        if (baseNow !== existing.baseHash) {
+          if (baseNow !== hashAbsent()) this.store.putBlob(readFileSync(absNow))
+          existing.baseHash = baseNow
+          existing.baseKind = infoNow?.kind
+          existing.baseRevision = this.manifest.revision
+          // 新增键（只加不改）：记录"该条因外部漂移在重新暂存时被重述过"
+          existing.baselineRefreshedAt = new Date().toISOString()
+        }
+        existing.changed = existing.stagedHash !== existing.baseHash
       }
       return existing
     }
@@ -463,14 +677,23 @@ export class Workspace {
       updatedAt: new Date().toISOString(),
       changed: false,
       origin: opts.origin || 'tool',
+      // 工作区**外**条目的显式标记（键就是规范化绝对路径，见 keyOf 的说明）。
+      // 工作区内条目**不写这个字段**：保持既有清单形态逐字不变（可回归对照）。
+      ...(isExternalKey(rel) ? { external: true, absPath: abs } : {}),
     }
     this.manifest.entries[rel] = entry
     return entry
   }
 
-  /** 写文件：新建或复制都先建受控父目录（#3.5） */
+  /**
+   * 写文件：新建或复制都先建受控父目录（#3.5）。
+   *
+   * S3a：`target` 在工作区**外**时同样进暂存 —— 键 = 规范化绝对路径，
+   * 物化对象落在 `.dshstage/staged-ext/<分桶>/<basename>`，**真实磁盘一位不改**
+   * （落盘只能经 applyCandidate，见 :applyOneChange）。
+   */
   writeFile(target, content, opts = {}) {
-    const rel = this.relative(target)
+    const { key: rel, external } = this.keyOf(target)
     if (rel === '') throw new SandboxError('EISDIR', 'cannot write the workspace root')
     const entry = this.ensureEntry(rel, { kind: 'file', origin: opts.origin })
 
@@ -486,7 +709,9 @@ export class Workspace {
     entry.size = buffer.length
     entry.updatedAt = new Date().toISOString()
     entry.changed = hash !== entry.baseHash
-    this.synthesizeParents(rel)
+    // 外部条目**不做**父目录合成：它的父目录是真实 NTFS 目录，且键不是相对路径，
+    // 合成会产生 `C:` 这类畸形键（那也是 listDir 根枚举污染的来源）。
+    if (!external) this.synthesizeParents(rel)
     this.store.touch(this.manifest)
     return { path: rel, hash, bytes: buffer.length, changed: entry.changed }
   }
@@ -499,9 +724,9 @@ export class Workspace {
     return { ...result, previousHash: before === undefined ? hashAbsent() : sha256Buffer(Buffer.from(before, 'utf8')) }
   }
 
-  /** 删除：持久化删除标记，而不是"尽力而为"（#3.7 / 第 7 章） */
+  /** 删除：持久化删除标记，而不是"尽力而为"（#3.7 / 第 7 章）——工作区外同样只留墓碑 */
   remove(target, opts = {}) {
-    const rel = this.relative(target)
+    const { key: rel, external } = this.keyOf(target)
     if (rel === '') throw new SandboxError('EPERM', 'refusing to delete the workspace root')
     const state = this.exists(target)
     if (!state.exists && !opts.missingOk) {
@@ -528,13 +753,13 @@ export class Workspace {
         entry.cleanupFailure = { code: error.code, message: error.message, repaired: repair.repaired }
       }
     }
-    this.synthesizeParents(rel)
+    if (!external) this.synthesizeParents(rel)
     this.store.touch(this.manifest)
     return { path: rel, deleted: true, wasKind: state.kind }
   }
 
   createDirectory(target, opts = {}) {
-    const rel = this.relative(target)
+    const { key: rel, external } = this.keyOf(target)
     if (rel === '') return { path: rel, created: false, reason: 'root' }
     const state = this.exists(target)
     if (state.exists) {
@@ -547,14 +772,14 @@ export class Workspace {
     entry.stagedHash = hashAbsent()
     entry.changed = entry.baseKind !== 'dir'
     mkdirSync(this.staged(rel), { recursive: true })
-    this.synthesizeParents(rel)
+    if (!external) this.synthesizeParents(rel)
     this.store.touch(this.manifest)
     return { path: rel, created: true }
   }
 
   rename(from, to, opts = {}) {
-    const fromRel = this.relative(from)
-    const toRel = this.relative(to)
+    const { key: fromRel } = this.keyOf(from)
+    const { key: toRel } = this.keyOf(to)
     const state = this.exists(from)
     if (!state.exists) throw new SandboxError('ENOENT', `${from} does not exist`, { path: fromRel })
     if (state.kind === 'file') {
@@ -575,14 +800,16 @@ export class Workspace {
       }
       this.remove(from, { missingOk: true, origin: opts.origin })
     }
-    // 目标父目录必须先在逻辑上存在（#3.5）
-    this.synthesizeParents(toRel)
+    // 目标父目录必须先在逻辑上存在（#3.5）—— 仅工作区内键需要（外部键的父目录是真实目录）
+    if (!isExternalKey(toRel)) this.synthesizeParents(toRel)
     this.store.touch(this.manifest)
     return { from: fromRel, to: toRel }
   }
 
   /** 递归补齐各级父目录，使目录树在逻辑视图里自洽（#3.11） */
   synthesizeParents(rel) {
+    // 外部键（绝对路径）不合成：父目录是真实 NTFS 目录，按相对语义切分会得到 `C:` 这类畸形键
+    if (isExternalKey(rel)) return
     const parts = segments(rel)
     parts.pop()
     let cursor = ''
@@ -612,11 +839,16 @@ export class Workspace {
 
   /**
    * 净变化清单。无净变化返回空数组 → 调用方不得入队（#12.1）。
+   *
+   * S3a：工作区**外**条目的 `path` 就是它的**规范化绝对路径**（键即路径），
+   * 并额外带 `external: true`；工作区内条目**不多写任何字段**（保持既有候选 JSON 逐字不变）。
+   * 判级（三档）由第二阶段按 `change.path` + `change.external` 做，本层不改分级语义。
    */
   diffEntries() {
     const changes = []
     for (const rel of stableSort(Object.keys(this.manifest.entries))) {
       const entry = this.manifest.entries[rel]
+      const external = entry.external === true ? { external: true } : {}
       if (entry.state === STATE.DELETED) {
         if (entry.baseHash === hashAbsent() && entry.baseKind === undefined) continue // 删除一个从未存在的东西不算变化
         changes.push({
@@ -625,12 +857,13 @@ export class Workspace {
           kind: entry.baseKind === 'dir' ? 'dir' : 'file',
           before: { hash: entry.baseHash, kind: entry.baseKind },
           after: { hash: hashAbsent() },
+          ...external,
         })
         continue
       }
       if (entry.kind === 'dir') {
         if (entry.baseKind !== 'dir' && !entry.synthetic) {
-          changes.push({ path: rel, op: 'mkdir', kind: 'dir', before: { hash: hashAbsent() }, after: { hash: hashAbsent() } })
+          changes.push({ path: rel, op: 'mkdir', kind: 'dir', before: { hash: hashAbsent() }, after: { hash: hashAbsent() }, ...external })
         }
         continue
       }
@@ -641,6 +874,7 @@ export class Workspace {
         kind: 'file',
         before: { hash: entry.baseHash, kind: entry.baseKind },
         after: { hash: entry.stagedHash, bytes: entry.size },
+        ...external,
       })
     }
     return changes
@@ -781,15 +1015,52 @@ export class Workspace {
 
     const applied = []
     const failed = []
+    /** 命中敏感策略、**等待二次确认**的条目（不是硬拒：确认后即可落盘） */
     const blockedByMask = []
+    /** 允许落盘、但属敏感档的条目（第二阶段据此标 sensitive/danger，第三阶段据此做二次确认） */
+    const maskWarnings = []
+    /** 二次确认集合：`true` = 本次全部遮蔽项都已确认；数组 = 逐路径确认 */
+    const confirmedMasks = opts.confirmedMasks
+    const confirmedSet =
+      confirmedMasks === true || confirmedMasks === undefined
+        ? null
+        : new Set([...confirmedMasks].map(compareKey))
 
     for (const change of chosen) {
       const abs = this.absolute(change.path)
       const mask = this.maskOf(abs)
       if (mask) {
-        blockedByMask.push({ path: change.path, maskId: mask.id, reason: mask.reason })
-        failed.push({ path: change.path, op: change.op, code: 'SANDBOX_PATH_MASKED', message: mask.reason })
-        continue
+        const info = {
+          path: change.path,
+          maskId: mask.id,
+          reason: mask.reason,
+          hard: mask.hard === true,
+          external: change.external === true,
+        }
+        // ── 命中敏感策略**不再死拦**（用户契约：弹窗说清后果 + 二次确认即可）。
+        // 工作区**内**的遮蔽（首要是 `.dshstage` 自身存储）从"硬失败"改成**需二次确认**：
+        // 未确认只回 `SANDBOX_PATH_MASKED_CONFIRM`（含后果说明），确认后正常落盘。
+        // 工作区**外**的遮蔽维持原语义（落盘 + 警告）—— 它本来就没有拦。
+        // `maskOf()` 对工作区内**非** `.dshstage` 的路径本就不判遮蔽（#16.8 的豁免），
+        // 所以这一半管的就是 `.dshstage`/extraMasks 这一类。
+        if (isInside(this.root, abs)) {
+          const confirmed = confirmedMasks === true || (confirmedSet !== null && confirmedSet.has(compareKey(change.path)))
+          if (!confirmed) {
+            blockedByMask.push(info)
+            failed.push({
+              path: change.path,
+              op: change.op,
+              code: 'SANDBOX_PATH_MASKED_CONFIRM',
+              message: `${mask.reason}（批准会把暂存内容写入真实磁盘且不可撤销；需要二次确认）`,
+              maskId: mask.id,
+              hard: mask.hard === true,
+            })
+            continue
+          }
+          maskWarnings.push({ ...info, confirmed: true })
+        } else {
+          maskWarnings.push(info)
+        }
       }
       try {
         this.applyOneChange(change, opts)
@@ -815,7 +1086,7 @@ export class Workspace {
     candidate.status = status
     candidate.appliedAt = new Date().toISOString()
     candidate.appliedPaths = [...(candidate.appliedPaths || []), ...applied.map((a) => a.path)]
-    candidate.lastApply = { applied, failed, blockedByMask }
+    candidate.lastApply = { applied, failed, blockedByMask, maskWarnings }
     this.store.saveCandidate(candidate)
     this.queue.candidates[candidate.id] = {
       ...this.queue.candidates[candidate.id],
@@ -847,6 +1118,7 @@ export class Workspace {
       applied,
       failed,
       blockedByMask,
+      maskWarnings,
       remaining: remaining.map((c) => c.path),
       totalChanged: allChanged.size,
       // 未选部分重新入队为可追踪修订（#12.2）
@@ -919,55 +1191,134 @@ export class Workspace {
   /**
    * 执行后提取：相对输入版本的新增变化（#3.2）。
    * 只提取相对 staging 快照的净变化，不重复暂存已暂存路径（#3.10 幂等）。
+   *
+   * 重解析点（D8）：与 `snapshotStagedTree()` 共用 `walkStagedForHashes()`，
+   * 因此 junction/symlink 既不会被 hash（否则 EISDIR 直接崩），也不会被误判成"被命令删除"
+   * ——`seen` 里包含它们，下面的删除检测据此跳过。
    */
   captureAfterExecution(beforeSnapshot) {
     const changes = []
-    const seen = new Set()
-    const walk = (dir) => {
-      for (const name of readdirSync(dir)) {
-        const item = join(dir, name)
-        const info = lstatSync(item)
-        if (info.isSymbolicLink()) {
-          seen.add(item)
-          continue
-        }
-        if (info.isDirectory()) {
-          walk(item)
-          continue
-        }
-        seen.add(item)
-        const rel = relative(this.store.stagedDir, item)
-        const before = beforeSnapshot.get(compareKey(rel))
-        const now = hashFile(item)
-        if (before === now) continue
-        changes.push({ path: rel, hash: now, previous: before })
-      }
+    const { hashes, realPaths, seen } = walkStagedForHashes(this.store.stagedDir)
+    for (const [key, now] of hashes) {
+      const before = beforeSnapshot.get(key)
+      if (before === now) continue
+      const change = { path: realPaths.get(key) ?? key, hash: now, previous: before }
+      if (before === undefined) change.created = true
+      changes.push(change)
     }
-    if (existsSync(this.store.stagedDir)) walk(this.store.stagedDir)
     // 被命令删除的文件：快照里有、现在没有
-    for (const [rel, previousHash] of beforeSnapshot) {
-      if (seen.has(this.store.stagedPath(rel))) continue
-      changes.push({ path: rel, hash: hashAbsent(), previous: previousHash, deleted: true })
+    for (const [key, previousHash] of beforeSnapshot) {
+      if (hashes.has(key)) continue
+      // 仍以重解析点形态存在 → 不是删除（walker 的 seen 里含它）
+      if (seen.has(this.store.stagedPath(key))) continue
+      changes.push({ path: realPaths.get(key) ?? key, hash: hashAbsent(), previous: previousHash, deleted: true })
     }
     return changes
   }
 
+  /**
+   * 执行前对暂存树做**内容戳快照**（#3.2 / A16）。
+   *
+   * ── 重解析点必须跳过（缺陷 D8）──────────────────────────────────────────────
+   * `lstatSync(junction).isDirectory()` 在 Windows 上返回 **true**，而
+   * `hashFile(junction)` 会跟随解析目标；目标若是目录就抛
+   * `EISDIR: illegal operation on a directory, read`，
+   * 于是一条 `cli exec` 会在**命令还没跑**的时候崩掉（exit=1）。
+   * 同一个文件里的 `captureAfterExecution()` 本来就有 `isSymbolicLink()` 守卫，
+   * 这里补齐**同一口径、且覆盖 junction/mount point** 的守卫。
+   *
+   * 跳过而不是"按目标内容记戳"的理由：重解析点在暂存树里不是一个内容对象，
+   * 跟随解析会①越过暂存边界读取（可能是宿主任意目录，甚至形成环），
+   * ②让"文件在暂存树里"这个前提失真。它在暂存树里表现为**不透明结点**，
+   * 因此既不入快照，也不被当成"被命令删除了"。代价（如实记录）：
+   * 暂存树内 junction 指向的目标内容变化**不会**被 `captureAfterExecution` 捕获。
+   *
+   * 返回值仍是 `Map`（调用方按 `Map` 用），另外挂一个
+   * `skippedReparsePoints` 数组属性作为**可观测证据**（不是静默跳过）。
+   */
   snapshotStagedTree() {
-    const snapshot = new Map()
-    if (!existsSync(this.store.stagedDir)) return snapshot
-    const walk = (dir) => {
-      for (const name of readdirSync(dir)) {
-        const item = join(dir, name)
-        const info = lstatSync(item)
-        if (info.isDirectory()) {
-          walk(item)
-          continue
+    const { hashes, skippedReparsePoints } = walkStagedForHashes(this.store.stagedDir)
+    hashes.skippedReparsePoints = skippedReparsePoints
+    return hashes
+  }
+
+  /**
+   * 把"沙箱内捕获到的变化"并入逻辑工作区（#3.2）。
+   *
+   * 为什么必须由 Workspace 承担（缺陷 D9）：`cli exec` 原先只打印 `capturedChanges` 的**条数**，
+   * 从不把捕获结果写回清单，于是暂存树里明明有命令产出的文件，
+   * `diffEntries()` 却一个变化都看不到 → `review` 永远是空队列 →
+   * 文档承诺的 `exec → review → apply` 链路**根本跑不通**
+   * （原始证据 `.t\sbx3\t-fs\out\07-cli-exec-clean-smoke.out` / `09-cli-status-clean-exec.out` /
+   *  `10-cli-review-clean-exec.out`：执行成功、`capturedChanges=1`，但 `pendingCandidates=0`）。
+   * 这段逻辑原先只存在于 `tests\e2e-flow.mjs` 里（测试自己在 CLI 之外手工补了这两步），
+   * 属于"测试替被测代码干活"——所以这里把它搬进正主，测试改为调用本方法。
+   *
+   * 幂等（#3.10）：`captured` 是**相对执行前快照**的净变化，已暂存路径不会被重复暂存；
+   * 内容相同的重复 exec 捕获为空数组，什么都不做。
+   *
+   * @param {Array<{path: string, hash: string, previous?: string, deleted?: boolean}>} captured
+   * @returns {{ingested: number, deletions: number, skipped: Array<{path: string, reason: string}>}}
+   */
+  ingestCapturedChanges(captured = []) {
+    const result = { ingested: 0, deletions: 0, skipped: [] }
+    for (const change of captured) {
+      // 一律经 absolute() 映射（而不是裸 join(root, path)）：
+      // 万一 captured 里出现绝对路径（外部条目键就是绝对路径），
+      // `join('C:\\ws', 'C:\\out\\a.txt')` 会得到 `C:\ws\C:\out\a.txt` 这种畸形路径。
+      const abs = this.absolute(change.path)
+      if (change.deleted) {
+        try {
+          this.remove(abs, { missingOk: true, origin: 'exec' })
+          result.deletions += 1
+        } catch (error) {
+          result.skipped.push({ path: change.path, reason: error.message })
         }
-        snapshot.set(compareKey(relative(this.store.stagedDir, item)), hashFile(item))
+        continue
       }
+      // ── 取内容的口径必须与捕获口径一致：以**暂存树当前内容**为准 ──────────────
+      // 曾经写成"优先复用条目里的 stagedHash"，那是**执行前**的内容戳，
+      // 会直接把沙箱内进程刚写下的内容覆盖回去（实测：x=3 被还原成 x=2，
+      // 于是 apply 落盘的是旧内容，e2e 阶段 9 红）。
+      // 正确顺序：先按捕获到的 hash 找 blob（内容寻址，天然幂等），找不到再读暂存树物化对象。
+      const hash = change.hash && change.hash !== hashAbsent() ? change.hash : undefined
+      if (hash && this.store.hasBlob(hash)) {
+        this.writeFile(abs, this.store.readBlob(hash), { origin: 'exec' })
+        result.ingested += 1
+        continue
+      }
+      const stagedPath = this.store.stagedPath(change.path)
+      if (!existsSync(stagedPath)) {
+        result.skipped.push({ path: change.path, reason: 'staged object missing; not ingesting' })
+        continue
+      }
+      this.writeFile(abs, readFileSync(stagedPath), { origin: 'exec' })
+      result.ingested += 1
     }
-    walk(this.store.stagedDir)
-    return snapshot
+    return result
+  }
+
+  /**
+   * 幂等冻结候选（缺陷 D9 的后半段）。
+   *
+   * `freezeCandidate()` 无条件新建候选并取代同路径旧待审；如果每次 `exec` 都调它，
+   * 队列会被无意义地刷屏（同一个变更反复产生候选）。因此这里先看
+   * 最新待审候选是否**恰好**覆盖当前净变化（按路径 + 操作 + 两侧 hash），
+   * 是则复用，否则才冻结。判据与 `dsh-plugin\review-service.mjs::represents()` 同一口径。
+   *
+   * @returns {{frozen: boolean, candidate?: object, reason?: string, changes: number}}
+   */
+  freezeIfNeeded(opts = {}) {
+    const changes = this.diffEntries()
+    if (changes.length === 0) return { frozen: false, reason: 'no-net-change', changes: 0 }
+    const pending = this.listReviews()
+    const latest = pending[pending.length - 1]
+    if (latest && candidateRepresents(latest.changes, changes)) {
+      return { frozen: false, reason: 'already-represented', candidate: latest, changes: changes.length }
+    }
+    const frozen = this.freezeCandidate(opts)
+    if (frozen.enqueued !== true) return { frozen: false, reason: frozen.reason || 'not-enqueued', changes: changes.length }
+    return { frozen: true, candidate: frozen.candidate, changes: changes.length }
   }
 
   recordHostOperation(operation) {
@@ -989,6 +1340,25 @@ export class Workspace {
 function change_isDelete(candidate, path) {
   const change = candidate.changes.find((c) => compareKey(c.path) === compareKey(path))
   return change ? change.op === 'delete' : false
+}
+
+/**
+ * 两份变更清单是否**恰好**描述同一件事（按路径 + 操作 + 两侧 hash）。
+ *
+ * 与 `dsh-plugin\review-service.mjs::represents()` 同一判据：只比较"做了什么"，
+ * 不比较时间戳/候选 id，因此"同一批净变化重复冻结"会被识别为重复。
+ */
+function candidateRepresents(candidateChanges, changes) {
+  if (!Array.isArray(candidateChanges) || candidateChanges.length !== changes.length) return false
+  const index = new Map(candidateChanges.map((c) => [compareKey(c.path), c]))
+  for (const change of changes) {
+    const other = index.get(compareKey(change.path))
+    if (!other) return false
+    if (other.op !== change.op) return false
+    if ((other.before?.hash ?? hashAbsent()) !== (change.before?.hash ?? hashAbsent())) return false
+    if ((other.after?.hash ?? hashAbsent()) !== (change.after?.hash ?? hashAbsent())) return false
+  }
+  return true
 }
 
 function summarize(changes, hostOperations) {

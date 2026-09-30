@@ -30,12 +30,39 @@
  */
 
 import { createRequire } from 'node:module'
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, normalize, sep } from 'node:path'
 import { tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
+// ── T0（AppContainer）执行路径的判据与布局**只从这两个模块来** ──────────────────
+// 本文件不重写 `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` / `STARTUPINFOEXW.cb` /
+// cbSize 之类的常量：那正是"探测与执行漂移"（手册 #5.1）的入口。
+import { CREATE_NEW_CONSOLE } from './appcontainer-runtime.mjs'
+// ── 弹框抑制必须落在**真正创建子进程的那个进程**里 ────────────────────────────────
+// `SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOOPENFILEERRORBOX)` 由子进程**继承**，
+// 所以只要在"要 spawn 的那个进程"里、在 CreateProcess 之前设置一次，
+// 子进程在用户态初始化阶段失败（最典型 `0xC0000142`）时就**不再弹** csrss 的模态
+// 「应用程序无法正常启动」框，而是如实变成退出码。
+//
+// 缺陷背景（2026-09-30 实测）：`src/spawn-window.mjs` 早就存在，但只有
+// `capability.mjs`（宿主 import 侧）与两个离线自测入口调用它；**本文件 —— 生产
+// 唯一真正 spawn 的地方 —— 没有接**。于是 DSH 宿主进程始终停留在默认错误模式，
+// 沙箱探针/受约束子进程一旦以 0xC0000142 死掉，用户桌面上就弹出一个
+// 「<exe> - Application Error」模态框（实测抓到连续 14 个：cmd/hostname/whoami/
+// curl/ping/reg/sc/net/tasklist/findstr/where/attrib/certutil/tar）。
+// 本模块被所有生产入口 import（host-plugin / shell-executor / staging-fs /
+// provider / selfcheck / cli），因此在这里落地是覆盖面最大的单点。
+import { suppressWindowsCriticalErrorDialogs } from './spawn-window.mjs'
 
 const require_ = createRequire(import.meta.url)
+
+/**
+ * 本进程（= DSH 宿主 / CLI）是否成功压掉了关键错误弹框。
+ *
+ * 如实暴露：koffi 解析不到时 `suppressWindowsCriticalErrorDialogs()` 返回 `false`，
+ * 这里**不谎报** success。`true` = 之后的受约束 spawn 失败只会给退出码，不会弹框。
+ */
+export const DIALOG_SUPPRESSION_APPLIED = suppressWindowsCriticalErrorDialogs()
 
 export const ACL_PACKAGE = '@deepseek-ai/dsh-sandbox-windows-acl'
 export const WIN32_PACKAGE = '@deepseek-ai/dsh-win32-process'
@@ -304,14 +331,540 @@ export function parseBasicAccounting(buffer) {
   }
 }
 
+// ─────────────────────── T0：AppContainer 执行路径（本轮接线）───────────────────────
+//
+// ── 为什么 T0 不能复用 T1 的 `spawnPipedProcess`（`[实测]` 读依赖源码）──────────────
+// `@deepseek-ai/dsh-win32-process` 的 `spawnPipedProcess()` 在内部硬编码
+// `cb: 104`（= `sizeof(STARTUPINFOW)`）且 `creationFlags = 0`。
+// 对 T1 这是**正确**的；对 AppContainer 是**致命**的：
+//   ① `cb` 必须是 112（`sizeof(STARTUPINFOEXW)`），填 104 会让 `CreateProcess`
+//      **静默忽略 `lpAttributeList`** —— 进程照常起来、返回值照常成功、**根本不在 AppContainer 里**；
+//   ② 少了 `EXTENDED_STARTUPINFO_PRESENT`，就算 cb 对了也白搭。
+// 这正是本项目最怕的"看起来成功、实际边界没生效"，因此 T0 **必须**有一条自己的启动路径。
+//
+// ── stdio 怎么办（T0 的额外难点）──────────────────────────────────────────────
+// `inheritHandles=false`（FIX-B 实测唯一稳的组合之一）之下**拿不到子进程输出**；
+// 而 `inheritHandles=true` 又不许配"附着在父控制台"（子进程 `0xC0000142`）。
+// 本实现的组合是三者同时满足：
+//   `inheritHandles=TRUE` + `CREATE_NEW_CONSOLE` + `STARTF_USESTDHANDLES` 指向**暂存根内的文件**。
+// 为什么用文件而不是匿名管道：`CreateProcessW` 的管道方式要求父进程持有可继承的写端句柄并
+// 在 `drainPipe` 里异步轮询；而 T0 的 `CreateProcessW` 调用发生在原生代码里（同步），
+// 把"排水"这一步交给文件系统可以完全绕开"父进程不读 ⇒ 子进程写满管道缓冲 ⇒ 互等"
+// 那个 D11 死锁形态。代价是输出不是流式的（T0 档位下可接受，且**如实记录在报告里**）。
+
+/** `[官方]` `STARTF_USESTDHANDLES` = 0x100：用了 `hStdInput/Output/Error` 就必须置位 */
+export const STARTF_USESTDHANDLES = 0x00000100
+/** `[官方]` `CreateFileW` 的 `dwDesiredAccess` / `dwCreationDisposition` */
+const GENERIC_READ = 0x80000000
+const GENERIC_WRITE = 0x40000000
+const OPEN_EXISTING = 3
+const CREATE_ALWAYS = 2
+
+/**
+ * 把 `argv` 拼成 `CreateProcessW` 要的命令行（含引号规则）。
+ *
+ * `[官方]` 规则（CommandLineToArgvW 的约定）：
+ *   - 反斜杠**只在后面紧跟引号时**才有特殊含义；
+ *   - 因此"恰好位于结尾引号之前"的连续反斜杠必须**翻倍**。
+ * 写错的症状不是报错，而是**参数被静默拆错**（例如 `a\"b` 变成 `a"b`），
+ * 属于本项目"看起来成功"那一类，所以这里逐字符处理并配单元测试。
+ */
+export function quoteWindowsArgument(value) {
+  const text = String(value)
+  if (text.length > 0 && !/[\s"]/.test(text)) return text
+  let out = '"'
+  let backslashes = 0
+  for (const ch of text) {
+    if (ch === '\\') {
+      backslashes += 1
+      continue
+    }
+    if (ch === '"') {
+      out += '\\'.repeat(backslashes * 2 + 1) + '"'
+      backslashes = 0
+      continue
+    }
+    out += '\\'.repeat(backslashes) + ch
+    backslashes = 0
+  }
+  out += '\\'.repeat(backslashes * 2) + '"'
+  return out
+}
+
+export function buildWindowsCommandLine(applicationName, args = []) {
+  return [quoteWindowsArgument(applicationName), ...args.map(quoteWindowsArgument)].join(' ')
+}
+
+/**
+ * T0 启动器：把 `AppContainerRuntime`（profile/能力/属性列表）+ Job 归属 + 文件式捕获
+ * 收成一个 `launch()`，与 `RestrictedLauncher.launch()` 同签名、同返回语义。
+ *
+ * **fail-closed**：任一步失败都抛结构化错误，绝不"降级为普通进程"继续跑。
+ * 这一点是本文件最重要的契约 —— 阶段 B 的教训是"属性列表写法错也会静默退化成普通进程"，
+ * 那种失败**不会**在 `CreateProcessW` 的返回值里体现。
+ */
+export class AppContainerLauncher {
+  /**
+   * @param {object} koffi 已加载的 koffi
+   * @param {object} api 低层绑定表（`createJobObjectW` / `assignProcessToJobObject` / `closeHandle`…）
+   * @param {{profileName?:string, capabilities?:string[], tempDir?:string, grantPaths?:string[], job?:unknown}} options
+   */
+  constructor(koffi, api, options = {}) {
+    if (!koffi || typeof koffi.load !== 'function') throw fail('T0_UNAVAILABLE', 'koffi is required for the AppContainer launch path')
+    this.koffi = koffi
+    this.api = api
+    this.options = options
+    this.profileName = options.profileName || `dsh.stage.t0.${Date.now().toString(36)}${randomUUID().slice(0, 4)}`
+    this.capabilities = options.capabilities ?? []
+    this.kernel32 = koffi.load('kernel32.dll')
+    this.ResumeThread = this.kernel32.func('uint32 ResumeThread(void *thread)')
+    this.TerminateProcess = this.kernel32.func('bool TerminateProcess(void *process, uint32 code)')
+    this.WaitForSingleObject = this.kernel32.func('uint32 WaitForSingleObject(void *handle, uint32 ms)')
+    this.GetExitCodeProcess = this.kernel32.func('bool GetExitCodeProcess(void *process, _Out_ uint32 *code)')
+    this.CloseHandleRaw = this.kernel32.func('bool CloseHandle(void *handle)')
+    this.CreateFileW = this.kernel32.func(
+      'void *CreateFileW(const char16_t *name, uint32 access, uint32 share, void *sa, uint32 disposition, uint32 flags, void *template)',
+    )
+    // `[官方]` BOOL CreatePipe(PHANDLE hReadPipe, PHANDLE hWritePipe, LPSECURITY_ATTRIBUTES sa, DWORD size)
+    this.CreatePipe = this.kernel32.func('bool CreatePipe(_Out_ void **readPipe, _Out_ void **writePipe, void *sa, uint32 size)')
+    // `[官方]` BOOL PeekNamedPipe(HANDLE, LPVOID buf, DWORD bufSize, LPDWORD read, LPDWORD avail, LPDWORD leftThisMessage)
+    this.PeekNamedPipe = this.kernel32.func(
+      'bool PeekNamedPipe(void *pipe, void *buffer, uint32 bufferSize, void *bytesRead, _Out_ uint32 *totalAvailable, void *bytesLeftThisMessage)',
+    )
+    this.ReadFile = this.kernel32.func(
+      'bool ReadFile(void *file, _Out_ uint8 *buffer, uint32 toRead, _Out_ uint32 *read, void *overlapped)',
+    )
+    this.GetCurrentProcess = this.kernel32.func('void *GetCurrentProcess()')
+    this.GetStdHandle = this.kernel32.func('void *GetStdHandle(int which)')
+    this.runtime = undefined
+    this.sidString = undefined
+    this.granted = []
+    this.lastLaunch = undefined
+  }
+
+  /** 由 `createAppContainerLauncher()`（异步工厂）注入 runtime 并立即做 ACL 授权 */
+  attachRuntime(runtime, sidString) {
+    this.runtime = runtime
+    this.sidString = sidString
+    const grants = []
+    for (const target of this.options.grantPaths ?? []) {
+      if (typeof target !== 'string' || target.length === 0) continue
+      grants.push({ target, ...grantPathToAppContainerSid(target, sidString) })
+    }
+    this.granted = grants
+    const failed = grants.filter((grant) => !grant.ok)
+    if (failed.length > 0) {
+      throw fail(
+        'T0_UNAVAILABLE',
+        `icacls could not grant the package SID access to: ${failed.map((g) => `${g.target} (${g.detail})`).join('; ')}. ` +
+          'Without that grant the AppContainer child cannot even write inside the staged root, so the staged root would be ' +
+          'unusable — refusing to start a T0 run (fail-closed).',
+      )
+    }
+    return { profileName: this.profileName, sid: sidString, grants }
+  }
+
+  /** 撤销 `attachRuntime()` 建立的全部 ACL 授权（dispose 调用；失败如实返回） */
+  revokeGrants() {
+    const failures = []
+    for (const grant of this.granted) {
+      const result = icaclsRun([grant.target, '/remove:g', `*${this.sidString}`])
+      if (!result.ok) failures.push(`${grant.target}: ${result.detail}`)
+    }
+    this.granted = []
+    return failures
+  }
+
+  /**
+   * 启动一个 T0 子进程并**等到它退出**，输出从可继承的匿名管道读回。
+   *
+   * 顺序（与 `planCombinationOrder()` 一致）：建属性列表 → `CREATE_SUSPENDED` →
+   * `AssignProcessToJobObject` → `ResumeThread` → **边等边排空管道** → 取退出码。
+   */
+  launch({ command, args = [], cwd, job, timeoutMs = 120000, env = null }) {
+    if (!this.runtime) throw fail('T0_UNAVAILABLE', 'launcher was not attached to an AppContainerRuntime (fail-closed)')
+    const commandLine = buildWindowsCommandLine(command, args)
+    const environmentBlock = env === null || env === undefined ? null : encodeEnvironmentBlock(env)
+    // stdin=NUL + stdout/stderr = 可继承匿名管道（见 openT0StdioPipes 的实测注释）
+    const stdio = openT0StdioPipes(this.CreatePipe, this.CreateFileW)
+    const startupInfoStdio = buildT0StdioHandles(this.koffi, stdio)
+    let child
+    try {
+      child = this.runtime.spawn({
+        commandLine,
+        applicationName: command,
+        cwd,
+        // `[实测-阶段FIX-B]` 继承句柄 + 自有控制台：见文件顶部说明。
+        inheritHandles: true,
+        extraCreationFlags: CREATE_NEW_CONSOLE,
+        startupInfoStdio,
+        // 环境块（手册 #8.3：从允许清单**重建**，绝不继承父环境）。
+        // 必须与 `CREATE_UNICODE_ENVIRONMENT` 成对（`buildCreationFlags` 会加那一位）——
+        // 漏掉它 `CreateProcess` 返回 Win32 87，子进程根本创建不出来（缺陷 13）。
+        environmentBlock: environmentBlock ?? null,
+      })
+    } finally {
+      // 父进程必须**立刻**关掉自己那一份写端：否则子进程退出后管道也不会 EOF
+      // （父进程永远读不到结尾 ⇒ 表现为"挂住"，而不是报错）。
+      try {
+        this.CloseHandleRaw(stdio.write)
+      } catch {
+        /* 忽略 */
+      }
+    }
+    try {
+      return this._runChild({ child, job, timeoutMs, stdio })
+    } finally {
+      closeT0Stdio({ stdin: stdio.stdin, read: stdio.read }, this.CloseHandleRaw)
+    }
+  }
+
+  _runChild({ child, job, timeoutMs, stdio }) {
+    try {
+      if (job) {
+        if (this.api.assignProcessToJobObject(job, child.process) === 0) {
+          throw win32Error(this.api, 'AssignProcessToJobObject', `pid=${child.pid} (T0 path)`)
+        }
+      }
+      this.runtime.resume(child)
+      const drained = this._waitAndDrain(child.process, timeoutMs, stdio)
+      const codeSlot = [0]
+      const got = this.GetExitCodeProcess(child.process, codeSlot)
+      const exitCode = got === true || got === 1 ? codeSlot[0] : null
+      if (drained.timedOut) safeTerminate(this.TerminateProcess, child.process)
+      this.lastLaunch = {
+        pid: child.pid,
+        jobAssigned: job !== undefined && job !== null,
+        waited: drained.lastWait,
+        timedOut: drained.timedOut,
+        capturedBytes: drained.captured.length,
+        stdioKind: 'single-inheritable-pipe (stdout+stderr merged)',
+        inheritance: 'inherit-handles+create-new-console+pipe-stdio',
+        streamsSeparable: false,
+      }
+      // `[实测]` T0 下两条流**共用同一个写端**（见 `openT0StdioPipes` 的三条结论），
+      // 因此捕获到的内容一律计入 `stdout`、`stderr` 留空。**不**假装能区分：
+      // 把合并内容复制到两个字段里，会让"命令写没写 stderr"这种判断出现假证据。
+      return { pid: child.pid, exitCode, timedOut: drained.timedOut, stdout: drained.captured, stderr: Buffer.alloc(0) }
+    } catch (error) {
+      safeTerminate(this.TerminateProcess, child.process)
+      throw error
+    } finally {
+      // 无论成败都必须归还这两个句柄（"忘了关"在进程退出前不报任何错）
+      try {
+        this.CloseHandleRaw(child.thread)
+      } catch {
+        /* 句柄已失效即视为已释放 */
+      }
+      try {
+        this.CloseHandleRaw(child.process)
+      } catch {
+        /* 同上 */
+      }
+    }
+  }
+
+  /**
+   * 有界等待 + **持续排空管道**。
+   *
+   * ── 为什么不能"先等退出再读"（这是 D11 的同一类死锁）──────────────────────────
+   * 匿名管道缓冲区写满后，子进程会阻塞在 `WriteFile` 上等待有人读；而父进程若先
+   * `WaitForSingleObject(INFINITE)`，就再也没有人去读 ⇒ 双方互等，直到外层超时。
+   * 实测表征与小输出无关：**只有输出超过管道缓冲才会触发**（本仓库 D11 的教训）。
+   * 因此这里每睡 `T0_WAIT_SLICE_MS` 就排空一次两条管道，直到进程退出或超时。
+   *
+   * 排空用 `PeekNamedPipe` 先问"有多少可读"，再按这个长度 `ReadFile`：
+   * 直接用阻塞 `ReadFile` 会在"子进程还活着但暂时没输出"时把我们自己挂住。
+   */
+  _waitAndDrain(processHandle, timeoutMs, stdio) {
+    const deadline = Date.now() + timeoutMs
+    const captured = []
+    let lastWait = null
+    let timedOut = false
+    for (;;) {
+      lastWait = this.WaitForSingleObject(processHandle, T0_WAIT_SLICE_MS)
+      drainPipeAvailable(this.PeekNamedPipe, this.ReadFile, stdio.read, captured)
+      if (lastWait === 0) break // WAIT_OBJECT_0：已退出，读走剩余数据
+      if (Date.now() >= deadline) {
+        timedOut = true
+        break
+      }
+    }
+    // 收尾再排一次：进程已退出时管道里可能还有最后一块（此时读端能读到 EOF）
+    drainPipeAvailable(this.PeekNamedPipe, this.ReadFile, stdio.read, captured)
+    return { captured: Buffer.concat(captured), timedOut, lastWait }
+  }
+
+  dispose() {
+    const failures = []
+    if (this.runtime) {
+      try {
+        const result = this.runtime.dispose()
+        for (const item of result?.failures ?? []) failures.push(`runtime: ${item}`)
+      } catch (error) {
+        failures.push(`runtime.dispose threw: ${error.message}`)
+      }
+    }
+    failures.push(...this.revokeGrants())
+    this.runtime = undefined
+    return failures
+  }
+}
+
+function safeTerminate(TerminateProcess, process) {
+  try {
+    TerminateProcess(process, 1)
+  } catch {
+    /* 已在收尾路径 */
+  }
+}
+
+function safeUnlink(path) {
+  try {
+    if (existsSync(path)) {
+      unlinkSync(path)
+      return true
+    }
+    return false
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 打开 T0 子进程的 stdio 管道。
+ *
+ * ── `[实测]` 三条硬结论（原始证据在 `.t\sbx3\wire\`）────────────────────────────
+ * 1. **句柄必须可继承**。`CreateFileW()`（不可继承）或 `CreatePipe(..., sa=NULL)`
+ *    （不可继承）的句柄填进 `STARTF_USESTDHANDLES` ⇒ AppContainer 子进程**一律**
+ *    以 `0xC0000142`（STATUS_DLL_INIT_FAILED）死掉（`node.exe` 与 `cmd.exe` 都是）。
+ *    见 `t0-stdio-matrix.out.txt`（C/G 行）与 `t0-pipe-stdio.out.txt`（P4 行）。
+ *    `bInheritHandles=TRUE` 会把这批"不可继承"的句柄**过滤掉**，子进程启动时
+ *    标准句柄指向无效值 ⇒ 用户态初始化失败。这也是为什么"继承句柄 + 文件 stdio"
+ *    在本机根本走不通，只能走管道。
+ *
+ * 2. **两条管道分别承载 stdout/stderr 时，本机会把子进程的输出与错误接反**
+ *    （`t0-stream-routing.out.txt` 的 `two-pipes` 行：`cmd /c echo CMD-OUT` 出现在
+ *    **stderr** 管道里，stdout 管道 0 字节）。这不是我们的接线错误：同一份缓冲区里
+ *    `hStdOutput`/`hStdError` 的值与父进程打开的写端**逐位一致**（探针把这两个字段
+ *    原样打印出来了）。因此"分成两条流"在本机不可靠。
+ *
+ * 3. **两条流共用同一个写端时路由稳定**：`same-pipe` 行里 `cmd /c echo CMD-OUT`
+ *    确实出现在 stdout 管道里。所以 T0 采用**单管道**：`stdout` 与 `stderr` 写同一个
+ *    管道，父进程把读到的内容计入 `stdout`、`stderr` 留空。
+ *
+ * ── 诚实声明（必须随报告一起给出）────────────────────────────────────────────
+ * T0 档位下**无法区分 stdout 与 stderr**（合并成一条流）。这是本机实测的限制，
+ * 不是"没实现"。要区分必须先把上面第 2 条的成因查清（已超出本轮范围）。
+ * 判据层面不受影响：退出码、区外写被拒、网络被阻断都由**独立**观测给出。
+ *
+ * ── 为什么 stdin 用 NUL ────────────────────────────────────────────────────
+ * 子进程不应从我们的控制台读（读走父进程 stdin 会变成说不清的挂起）。
+ *
+ * @returns {{read:unknown, write:unknown, stdin:unknown, merged:boolean}}
+ */
+function openT0StdioPipes(CreatePipe, CreateFileW) {
+  const securityAttributes = makeInheritableSecurityAttributes()
+  const readSlot = [null]
+  const writeSlot = [null]
+  const ok = CreatePipe(readSlot, writeSlot, securityAttributes, 0)
+  if (!win32Succeeded(ok) || !readSlot[0] || !writeSlot[0]) {
+    throw fail('T0_UNAVAILABLE', 'CreatePipe failed; without an inheritable pipe the AppContainer child has no usable stdout/stderr')
+  }
+  // stdin = NUL（同一个可继承 SECURITY_ATTRIBUTES）
+  const stdin = CreateFileW('NUL', GENERIC_READ, 0x00000001 | 0x00000002, securityAttributes, OPEN_EXISTING, 0, null)
+  if (!stdin) throw fail('T0_UNAVAILABLE', 'CreateFileW(NUL) failed for the T0 child stdin')
+  return { read: readSlot[0], write: writeSlot[0], stdin, merged: true }
+}
+
+/**
+ * `[官方]` `SECURITY_ATTRIBUTES { DWORD nLength; LPVOID lpSecurityDescriptor; BOOL bInheritHandle; }`
+ * x64：4 + 4(pad) + 8 + 4 + 4(pad) = 24 字节。
+ *
+ * `bInheritHandle=TRUE` 是**必须**的：`[实测]` 不可继承的管道写端会让 AppContainer 子进程
+ * 以 `0xC0000142` 死掉（见 `openT0StdioPipes` 的注释）。
+ */
+export function makeInheritableSecurityAttributes() {
+  const buffer = Buffer.alloc(24)
+  buffer.writeUInt32LE(24, 0)
+  buffer.writeBigUInt64LE(0n, 8)
+  buffer.writeUInt32LE(1, 16)
+  return buffer
+}
+
+/** 关闭 T0 stdio 的全部句柄（父进程这一侧两端都要关，否则管道永远不会 EOF） */
+function closeT0Stdio(stdio, closeHandle) {
+  for (const handle of [stdio?.stdin, stdio?.read, stdio?.write]) {
+    if (!handle) continue
+    try {
+      closeHandle(handle)
+    } catch {
+      /* 关闭失败只影响句柄泄漏，不影响判定 */
+    }
+  }
+}
+
+/** 把打开的句柄地址交给 `STARTUPINFOEXW`（`koffi.address` 对 koffi 句柄返回 bigint） */
+function buildT0StdioHandles(koffi, stdio) {
+  const address = koffi.address(stdio.write)
+  if (typeof address !== 'bigint') throw fail('T0_UNAVAILABLE', 'koffi.address(handle) did not return a bigint')
+  return {
+    stdInput: ((value) => {
+      const input = koffi.address(value)
+      if (typeof input !== 'bigint') throw fail('T0_UNAVAILABLE', 'koffi.address(stdin) did not return a bigint')
+      return input
+    })(stdio.stdin),
+    // 两条流共用同一个写端：见 openT0StdioPipes 的第 3 条结论
+    stdOutput: address,
+    stdError: address,
+  }
+}
+
+/**
+ * 读走一条管道里**当前所有可读**的数据（非阻塞）。
+ *
+ * 先 `PeekNamedPipe` 问"有多少可读"：这一句是必需的，因为 `ReadFile` 在"子进程活着但
+ * 暂时没输出"时会**阻塞**——那会把父进程挂住，重现"父进程不排水"的同类死锁。
+ */
+function drainPipeAvailable(PeekNamedPipe, ReadFile, pipe, sink) {
+  if (!pipe) return
+  const available = [0]
+  const peeked = PeekNamedPipe(pipe, null, 0, null, available, null)
+  if (!win32Succeeded(peeked)) return
+  let remaining = available[0] >>> 0
+  if (remaining === 0) return
+  const buffer = Buffer.alloc(Math.min(remaining, 65536))
+  const readSlot = [0]
+  while (remaining > 0) {
+    const ok = ReadFile(pipe, buffer, buffer.length, readSlot, null)
+    if (!win32Succeeded(ok) || (readSlot[0] >>> 0) === 0) break
+    const count = readSlot[0] >>> 0
+    sink.push(Buffer.from(buffer.subarray(0, count)))
+    remaining -= count
+  }
+}
+
+/** `[实测]` 单个 exe 的 T0 等待切片：够短以便及时排空管道，又不至于空转烧 CPU */
+export const T0_WAIT_SLICE_MS = 20
+
+/** 与 `src/appcontainer-runtime.mjs::win32BoolSucceeded` 同语义（真实 koffi 的 `bool` 是 JS boolean） */
+function win32Succeeded(value) {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return value !== 0
+  return false
+}
+
+/** 撤销一项 ACL 授权（`icacls <dir> /remove:g *<sid>`） */
+function grantPathToAppContainerSid(target, sidString) {
+  const result = icaclsRun([target, '/grant', `*${sidString}:(OI)(CI)M`])
+  return { ok: result.ok, detail: result.detail }
+}
+
+/** `[实测]` 用 `icacls` 而不是自己拼 ACL：包 SID 的字符串形式必须带 `*` 前缀（否则被当账户名解析） */
+function icaclsRun(args) {
+  try {
+    const { execFileSync } = require_('node:child_process')
+    const text = String(execFileSync('icacls', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }))
+      .replace(/\r?\n/g, ' | ')
+      .trim()
+    return { ok: true, detail: text }
+  } catch (error) {
+    return { ok: false, detail: `${error.code ?? ''} ${String(error.message).slice(0, 200)}`.trim() }
+  }
+}
+
+/**
+ * 构造一个**已就绪**的 T0 启动器（异步工厂）。
+ *
+ * 为什么必须是异步：`appcontainer-runtime.mjs` 是 ESM，`createRequire` 解析不了 `.mjs`，
+ * 因此 `import()` 是唯一能在"已经跑起来的代码路径"里拿到它的方式。把 `.mjs` 的加载失败
+ * **在装配期**暴露成清晰的 `T0_UNAVAILABLE`，而不是等到 `CreateProcess` 时才以一个
+ * 说不清的错误冒出来。
+ *
+ * 任何一步失败都抛 `T0_UNAVAILABLE`（fail-closed），由调用方决定"退回 T1"还是"拒绝执行"；
+ * 本函数**绝不**返回一个"看起来能用"的降级对象。
+ */
+export async function createAppContainerLauncher(options = {}) {
+  const api = options.api
+  if (!api || typeof api.assignProcessToJobObject !== 'function') {
+    throw fail('T0_UNAVAILABLE', 'the merged binding table has no assignProcessToJobObject; T0 cannot enforce job ownership')
+  }
+  let runtimeModule
+  try {
+    runtimeModule = await import('./appcontainer-runtime.mjs')
+  } catch (error) {
+    throw fail('T0_UNAVAILABLE', `cannot load src/appcontainer-runtime.mjs: ${error.message}`)
+  }
+  const koffi = loadKoffiModule()
+  if (!koffi) {
+    throw fail(
+      'T0_UNAVAILABLE',
+      'koffi FFI is not resolvable from either the DSH install tree or $DSH_PROFILE_DIR\\node_modules; ' +
+        'the AppContainer path needs it for CreateProcessW with a STARTUPINFOEXW',
+    )
+  }
+  const bindings = runtimeModule.createKoffiAppContainerBindings(koffi)
+  const launcher = new AppContainerLauncher(koffi, api, {
+    profileName: options.profileName,
+    capabilities: options.capabilities ?? [],
+    grantPaths: options.grantPaths ?? [],
+  })
+  const runtime = new runtimeModule.AppContainerRuntime(bindings, {
+    profileName: launcher.profileName,
+    capabilities: launcher.capabilities,
+    jobAvailable: true,
+  })
+  const initReport = runtime.init()
+  // `[实测]` 陷阱：`AppContainerRuntime.init()` 返回的 `sid` 是**原生 SID 指针**（不是字符串）。
+  // 把它当字符串交给 `icacls` 时，错误信息是 `*2928003896448: The security ID structure is invalid.`
+  // —— 一个看似"ACL 失败"、实则"类型搞错"的故障（本仓库"替身/真对象形状不一致"那一类）。
+  // 因此这里必须显式过一遍 `ConvertSidToStringSidW`，拿不到字符串就 fail-closed。
+  const sidString = typeof bindings.sidToString === 'function' ? bindings.sidToString(initReport.sid) : null
+  if (typeof sidString !== 'string' || sidString.length === 0) {
+    throw fail(
+      'T0_UNAVAILABLE',
+      'ConvertSidToStringSidW could not turn the package SID into a string; without it the staged root cannot be ' +
+        'granted to the AppContainer (and comparing TokenAppContainerSid would be impossible)',
+    )
+  }
+  const grantReport = launcher.attachRuntime(runtime, sidString)
+  return {
+    launcher,
+    runtime,
+    bindings,
+    profileName: initReport.profileName,
+    sid: sidString,
+    createdProfile: initReport.createdHere,
+    grants: grantReport.grants,
+    attributeListSize: initReport.attributeListSize,
+  }
+}
+
+/**
+ * 解析 koffi（T0 用的 FFI）。
+ *
+ * 候选顺序与 `src/capability.mjs::loadFfi()` 保持一致（**同一份实现只能有一个来源**，
+ * 否则"探测说能跑、执行说不能跑"就是必然的）。这里只做解析，不做任何 Win32 调用。
+ */
+export function loadKoffiModule() {
+  const candidates = [...resolveDshModuleRoot().map((root) => join(root, 'koffi'))]
+  if (typeof process.env.DSH_PROFILE_DIR === 'string' && process.env.DSH_PROFILE_DIR.length > 0) {
+    candidates.push(join(process.env.DSH_PROFILE_DIR, 'node_modules', 'koffi'))
+  }
+  candidates.push('koffi')
+  for (const spec of candidates) {
+    try {
+      const loaded = require_(spec)
+      if (loaded && typeof loaded.load === 'function') return loaded
+    } catch {
+      /* 下一个候选 */
+    }
+  }
+  return undefined
+}
+
 /** 受限令牌启动器：绑定表 + 令牌 + Job 的组合 */
 export class RestrictedLauncher {
-  /**
-   * @param {object} api 低层绑定表（含 createProcessAsUserW / createPipe / Job 原语）
-   * @param {object} token 受限令牌
-   * @param {(api: object, options: object) => object} spawnPipedProcess 模块级 spawn 函数
-   * @param {object} [options]
-   */
   constructor(api, token, spawnPipedProcess, options = {}) {
     this.api = api
     this.token = token
@@ -570,6 +1123,73 @@ export async function initAclSandboxWithTokenCapture(AclSandbox, options) {
 
 // ─────────────────────────── 执行器 ───────────────────────────
 
+/**
+ * 取子进程退出码，且**不饿死事件循环**（缺陷 D11 的修复核心）。
+ *
+ * ── 为什么不能直接用 `waitForProcessExit(api, process)` ─────────────────────
+ * 该库函数的实现是 `WaitForSingleObject(process, INFINITE)` —— 一次**同步阻塞**
+ * 的 FFI 调用（实测该包 lib/index.js:528）。在 Node 里这意味着：从进入该调用到
+ * 子进程退出为止，**整个事件循环停摆**，所有定时器（包括 `run()` 的超时定时器）
+ * 与微任务/宏任务都无法推进。而 `drainPipe` 是**异步轮询**实现
+ * （`PeekNamedPipe` + `await setTimeout(1)`，同文件 :494-518）。
+ * 两者一旦按"先 await 一次排水、再同步等退出"的顺序组合，就构成真实死锁（缺陷 D11）：
+ *
+ *   1. 父进程在 `drainPipe` 上 `await` 一次后让出执行权（管道里此时可能只有一小块）；
+ *   2. 同步阻塞的 `waitForProcessExit` 抢到事件循环 → 定时器再也跑不起来；
+ *   3. `drainPipe` 的轮询定时器永不触发 ⇒ 管道再也没人读；
+ *   4. 匿名管道缓冲区写满后，子进程阻塞在 `WriteFile` 上，**永不退出**；
+ *   5. 父进程在 `WaitForSingleObject(INFINITE)` 上永远等下去 ⇒ 一路挂到外层超时。
+ *
+ * 实测表征：300KB 输出的探针卡在 `BEGIN-WRITE`（**永远等不到 `AFTER-WRITE`**），
+ * 小输出（约 1.6KB）则正常完成。即"输出量超过管道缓冲"才是触发条件。
+ *
+ * ── 修法 ─────────────────────────────────────────────────────────────────
+ * 用**有界等待轮询**替代一次无限等待：每次只 `WaitForSingleObject(process, 50ms)`，
+ * `WAIT_TIMEOUT(258)` 就 `await` 让出一次事件循环，于是 `drainPipe` 的轮询定时器
+ * 能在两次等待之间持续把管道抽干，子进程得以写完并退出。
+ * 子进程运行**期间**排水由此真正持续进行，而不是"等它退出后再读"。
+ *
+ * 语义不回退：退出码仍取自 `GetExitCodeProcess`；进程句柄仍由
+ * `waitForProcessExit` 关闭（保留"退出码唯一来源"这一保证）。
+ * `WAIT_FAILED` 等极端情形退回库的阻塞实现，保证"如实报错"而不是"空转"。
+ *
+ * 对照实现：`tests\executor-stub.mjs` 的"大输出不死锁"断言（`DSH_STUB_LEGACY_COLLECT=1`
+ * 可复现修复前行为），以及 `.t\sbx3\fixA\` 下的真实 cli exec 复现与修复后对照。
+ */
+export const EXIT_WAIT_SLICE_MS = 50
+
+export async function waitForExitWithoutStarvingEventLoop(api, process, waitForProcessExit) {
+  let exitCode
+  for (;;) {
+    const waited = api.waitForSingleObject(process, EXIT_WAIT_SLICE_MS)
+    if (waited === 0) {
+      const slot = typeof api.allocUint32 === 'function' ? api.allocUint32() : undefined
+      try {
+        // 退出码的唯一来源仍与库一致：GetExitCodeProcess
+        const readInto = slot ?? Buffer.alloc(4)
+        if (api.getExitCodeProcess(process, readInto) === 0) break // 读不到 ⇒ 交给库的版本报错
+        exitCode = slot !== undefined ? api.decodeUint32(slot) : readInto.readUInt32LE(0)
+      } finally {
+        if (slot !== undefined && typeof api.freeNative === 'function') api.freeNative(slot)
+      }
+      break
+    }
+    if (waited === 258) {
+      // WAIT_TIMEOUT：让出事件循环，drainPipe 才有机会继续抽管道（这正是修复点）
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      continue
+    }
+    break // WAIT_FAILED(0xFFFFFFFF) 或未知返回值：交给库的阻塞实现如实报错
+  }
+  // 拿到退出码 → 此时进程确已退出，库调用立即返回，只负责关闭进程句柄（不重复关句柄）。
+  // 没拿到 → 由库调用阻塞等待并抛错，保持"出错要大声"的语义。
+  if (exitCode !== undefined) {
+    waitForProcessExit(api, process)
+    return exitCode
+  }
+  return waitForProcessExit(api, process)
+}
+
 export class WindowsStageExecutor {
   constructor(options = {}) {
     this.options = options
@@ -584,6 +1204,9 @@ export class WindowsStageExecutor {
     this.tempDir = undefined
     this.initReport = undefined
     this.job = undefined
+    /** T0 专用（只有显式 tier=T0 且装配成功时才非空；见 init()） */
+    this.appContainer = undefined
+    this.appContainerInfo = undefined
   }
 
   /**
@@ -763,6 +1386,42 @@ export class WindowsStageExecutor {
     }
 
     this.initReport = await this.selfTest()
+    // ── T0（AppContainer）执行路径的接线（本轮）──────────────────────────────
+    // 只在**显式要求 T0** 时装配。任何一步失败都 fail-closed（抛 SANDBOX_UNAVAILABLE），
+    // **绝不**降级成 T1 继续跑 —— 那会让调用方以为自己在 T0 里，而实际只是一个普通进程
+    // （这正是阶段 B 抓到的"看起来成功、实际边界没生效"）。
+    let appContainer = null
+    if (String(this.tier).toUpperCase() === 'T0') {
+      try {
+        appContainer = await createAppContainerLauncher({
+          api: this.api,
+          grantPaths: [this.stagingRoot, this.tempDir].filter(Boolean),
+          capabilities: this.options.capabilities ?? [],
+          profileName: this.options.profileName,
+        })
+        this.appContainer = appContainer.launcher
+        this.appContainerInfo = {
+          profileName: appContainer.profileName,
+          sid: appContainer.sid,
+          createdProfile: appContainer.createdProfile,
+          grants: appContainer.grants,
+          attributeListSize: appContainer.attributeListSize,
+        }
+      } catch (error) {
+        try {
+          this.launcher?.dispose()
+        } catch {
+          /* 清理失败不掩盖原因 */
+        }
+        safeClose(this.api, this.job)
+        safeDispose(this.sandbox)
+        throw fail(
+          'SANDBOX_UNAVAILABLE',
+          `tier=T0 was requested but the AppContainer launch path could not be established (${error.code ?? ''} ${error.message}). ` +
+            'Refusing to fall back to T1: the report would then claim T0 while the child is an ordinary process.',
+        )
+      }
+    }
     Object.assign(this.initReport, {
       initMs: Date.now() - started,
       mode: this.mode,
@@ -773,6 +1432,8 @@ export class WindowsStageExecutor {
       jobFlags: `0x${jobInfo.flags.toString(16)}`,
       jobConfig: jobInfo.config,
       jobAccounting,
+      tier: this.tier,
+      appContainer: this.appContainerInfo,
     })
     return this.initReport
   }
@@ -904,10 +1565,33 @@ export class WindowsStageExecutor {
       )
     }
     const api = this.api
+    // ★ 缺陷 D11 修复（本函数是修复点，配合 waitForExitWithoutStarvingEventLoop）：
+    //   三条任务必须**并发**跑，且"等退出"必须**让出事件循环而不是同步阻塞**。
+    //
+    //   1) drainPipe × 2 先发起：让子进程一开始就有人在读它的 stdout/stderr。
+    //      注意 drainPipe 是异步轮询（await setTimeout），所以它必然先让出一次执行权；
+    //      若此时紧接着同步阻塞等退出，轮询定时器就再也跑不起来（这曾导致 300KB 死锁）。
+    //   2) 退出等待用 queueMicrotask 延后一个微任务：确保两条管道都已进入
+    //      "已发起读取"状态，不会有任何一次"父进程停下、管道没人读"的窗口。
+    //   3) waitForExitWithoutStarvingEventLoop 用 50ms 有界等待轮询代替
+    //      WaitForSingleObject(INFINITE)，每次 WAIT_TIMEOUT 都让出事件循环，
+    //      排水轮询因此能在子进程运行**期间**持续推进，缓冲区不会写满。
+    const exitWait = new Promise((resolve, reject) => {
+      queueMicrotask(() => {
+        // 让出一次事件循环，给排水轮询一个先手（这才是"并发排水"的实质）
+        setTimeout(() => {
+          try {
+            resolve(waitForExitWithoutStarvingEventLoop(api, child.process, waitForProcessExit))
+          } catch (error) {
+            reject(error)
+          }
+        }, 0)
+      })
+    })
     const [stdout, stderr, exitCode] = await Promise.all([
       drainPipe(api, child.stdoutRead),
       drainPipe(api, child.stderrRead),
-      Promise.resolve().then(() => waitForProcessExit(api, child.process)),
+      exitWait,
     ])
     return {
       stdout: Buffer.isBuffer(stdout) ? stdout : Buffer.from(String(stdout ?? '')),
@@ -945,14 +1629,30 @@ export class WindowsStageExecutor {
     // （这是替身测试抓到的真实缺陷 8。）
     let child
     let launchFailure
+    // ── T0 与 T1 的唯一分叉点 ───────────────────────────────────────────────
+    // T0 走 AppContainerLauncher（`STARTUPINFOEXW` + SECURITY_CAPABILITIES + 文件式 stdio，
+    // 且它**自己**同步等到退出），因此不需要 `collectChild()`（那条路要求 `spawnPipedProcess`
+    // 的管道句柄，而 T0 拿不到）。两条路都返回同一形状的结果，调用方无需知道区别。
+    const t0 = this.appContainer !== undefined && this.appContainer !== null && String(this.tier).toUpperCase() === 'T0'
     try {
-      child = this.launcher.launch({
-        command: resolvedCommand,
-        args: options.args || [],
-        cwd,
-        env,
-        job: this.job,
-      })
+      if (t0) {
+        child = this.appContainer.launch({
+          command: resolvedCommand,
+          args: options.args || [],
+          cwd,
+          job: this.job,
+          timeoutMs,
+          env,
+        })
+      } else {
+        child = this.launcher.launch({
+          command: resolvedCommand,
+          args: options.args || [],
+          cwd,
+          env,
+          job: this.job,
+        })
+      }
     } catch (error) {
       launchFailure = error
     }
@@ -972,6 +1672,14 @@ export class WindowsStageExecutor {
         stdout: Buffer.alloc(0),
         stderr: Buffer.from(`dsh-stage: sandbox launch failed: ${launchFailure.message}`),
         exitCode: 127,
+      }
+    } else if (t0) {
+      // T0 的 launch() 已经等到退出并读回输出（含超时判定），因此不再走 `collectChild`。
+      timedOut = child.timedOut === true
+      settled = {
+        stdout: Buffer.isBuffer(child.stdout) ? child.stdout : Buffer.from(String(child.stdout ?? '')),
+        stderr: Buffer.isBuffer(child.stderr) ? child.stderr : Buffer.from(String(child.stderr ?? '')),
+        exitCode: child.exitCode,
       }
     } else {
       try {
@@ -1021,6 +1729,16 @@ export class WindowsStageExecutor {
 
   dispose() {
     const failures = []
+    // T0 先回收：撤销暂存根/temp 的包 SID 授权、删除本次创建的 profile。
+    // 顺序放在 Job/令牌之前，因为属性列表与 profile 的生命周期只属于 T0 那一次运行。
+    if (this.appContainer) {
+      try {
+        failures.push(...this.appContainer.dispose())
+      } catch (error) {
+        failures.push(`appcontainer dispose: ${error.message}`)
+      }
+      this.appContainer = undefined
+    }
     if (this.launcher) failures.push(...this.launcher.dispose())
     if (this.sandbox) {
       try {

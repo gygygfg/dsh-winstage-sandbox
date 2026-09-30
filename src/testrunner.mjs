@@ -16,6 +16,9 @@ import { spawnSync } from 'node:child_process'
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { WINDOWS_HIDE, suppressWindowsCriticalErrorDialogs } from './spawn-window.mjs'
+
+suppressWindowsCriticalErrorDialogs()
 
 export const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -28,8 +31,26 @@ export const OFFLINE_SUITES = [
   { id: 'resolve-exec', script: 'tests/resolve-exec.mjs', title: '可执行文件解析（PATHEXT/相对与绝对路径/失败显式化）' },
   { id: 'executor-stub', script: 'tests/executor-stub.mjs', title: '执行器编排（装配/spawn 契约/0x400/Job 配额/结果收集/fail-closed）' },
   { id: 'audit-parse', script: 'tests/audit-parse.mjs', title: '审计解析（哨兵/空输出必须判 fail/单引号转义）' },
+  { id: 'paths-masks', script: 'tests/paths-masks.mjs', title: '敏感清单与探针映射（N1–N10/类别与理由/单调收紧）' },
+  // FIX-C 追加：`registry-guard` 的 125 条断言此前**只被单独跑过**，从未进 verify/autotest 的套件清单
+  // ——"改坏了没人知道"的那类漏洞。它与 verify.cmd 的清单必须逐字一致（两处都改了）。
+  { id: 'registry-guard', script: 'tests/registry-guard.mjs', title: '注册表快照/差异/回滚计划（含 F8：非十六进制 data 必须抛错）' },
+  { id: 'workspace-regressions', script: 'tests/workspace-regressions.mjs', title: '工作区回归（D8 重解析点不可崩 / D10 合成目录不得误报损坏）' },
   // 元测试：反证"运行器真的能检出失败"。永远报绿的运行器比没有运行器更糟。
   { id: 'meta-runner', script: 'tests/meta-runner.mjs', title: '元测试（运行器能否检出失败）' },
+  // FIX-F 追加（接线与收尾）：下面两个套件此前**只被单独跑过**，从未进 verify/autotest
+  // —— 与 FIX-C 给 registry-guard 记下的问题完全同族："改坏了没人知道"。
+  // 与 verify.cmd 的清单必须逐字一致（两处同时改）。
+  { id: 'appcontainer-runtime', script: 'tests/appcontainer-runtime.mjs', title: 'AppContainer 运行期（属性列表/启动原语/令牌证据/隔离判定 fail-closed）' },
+  // ⚠ 计数口径（如实声明，不要读成"这个套件没有断言"）：
+  //   `countChecks()` 只统计输出里的 `✓`/`✗`。本套件**刻意**用 ASCII 标记
+  //   `[OK  ]`/`[FAIL]`（原因见其文件头：cmd/PowerShell 5.1 控制台按 OEM 代码页解码，
+  //   非 ASCII 标记会变乱码，从而让"红还是绿"看起来一样 —— 缺陷 11 的形态）。
+  //   因此它的 `checksOk` 会显示为 0，而**判定仍严格来自退出码**（失败即 FAIL，不因计数为 0 而变绿）。
+  //   它真实的自报断言数由套件自己打印在输出末行（形如 `断言 23 项，失败 0 项`），可在
+  //   `.t\run-probe-selfkill-guard.txt` 复核。这里不改 `countChecks` 的全局语义：
+  //   那个投影同时服务所有套件，顺手放宽会悄悄改掉既有 11 个套件的计数基准。
+  { id: 'probe-selfkill-guard', script: 'tests/probe-selfkill-guard.mjs', title: 'FIX-E 回归（probeWin32Abi 自杀死：子进程指派 + 回读 accounting，不得自指派）' },
 ]
 
 /** 需要未受限会话的套件 */
@@ -55,7 +76,9 @@ export function runCaptured(command, argv, options = {}) {
       cwd: options.cwd ?? REPO,
       timeout: options.timeout ?? 600000,
       stdio: ['ignore', fd, fd],
-      windowsHide: true,
+      // 见 src/spawn-window.mjs：不碰 CREATE_NO_WINDOW/CREATE_NEW_CONSOLE 这一组
+      // （原生 CreateProcess 实测会 0xC0000142）；弹框由该模块的 SetErrorMode 抑制。
+      windowsHide: WINDOWS_HIDE,
       env: options.env,
     })
   } finally {

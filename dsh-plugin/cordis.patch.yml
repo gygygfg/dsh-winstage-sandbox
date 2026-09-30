@@ -1,0 +1,122 @@
+# WinStageSandbox 主机插件 bundle
+#
+# ── 开关语义（本轮修复的核心）────────────────────────────────────────────────────
+# 设置页那个开关 = **这一个 bundle 的总闸**：
+#   开 → 暂存面接管 `ctx.fs`（变更落暂存树、读取走投影、面板审批），/winstage 命令生效；
+#   关 → 暂存面整体退回**平台原来的沙箱/审批模式**，面板与轮询卸载，命令面如实拒绝执行。
+# 关闭**不需要卸载或重挂任何 loader 行**：`winstage-fs` 行的基类就是平台的
+# `@deepseek-ai/dsh-fs-sandbox` 的 `SandboxedFileSystem`，而 `staging-fs.mjs` 的每个
+# 覆盖层都先查 `stagingEnabled()`（现读 host 行 `config.enabled`），为假就直接 `super.*`。
+# 于是"关"= 原样退回平台面（围栏 / FS_SANDBOX_DENIED / 同回合升权提示 / sandboxMode 全一致）。
+#
+# ── 为什么不做"行级热切换"────────────────────────────────────────────────────────
+# 看起来更直观的做法是：关掉开关就把下面的 `winstage-fs` 行 disable、把 `fs-sandbox`
+# 行 enable。**不能这么做**：`fs` 这个服务名同时只能有一个提供方，而
+# `EntryGroup.update()` 对同一层的 id **并发** `create()`；被关掉那行的
+# `fiber.dispose()`（内部异步）不 await，新打开那行的 `provide('fs')` 可能先执行
+# ⇒ `service "fs" has been registered at <...>` 硬失败。本 profile 在线切换 bundle 时
+# **实测崩过宿主进程**（docs/DSH集成.md §4）。所以：一个提供方、两种面；开关只切面。
+#
+# ── 装配（按依赖顺序）────────────────────────────────────────────────────────────
+#   1. `winstage-sandbox`（host-plugin.mjs）：设置开关、审阅快照、/winstage 命令面。
+#      用**裸包名** `@local/dsh-winstage-sandbox`：`package.json` 的 `exports["."]` =
+#      `./host-plugin.mjs`，与子路径 `.../host-plugin` 是**同一个模块 URL**（不会二次 apply）。
+#      理由（实测源码，行号取自 dsh-client-modules/lib/index.js）：
+#        `:82-88 exactPackageSpecifier()` 对 `@scope/name/sub` 三段 specifier 返回 undefined
+#        → `:747 locatePkgJson()` 直接 `return undefined`
+#        → `:836 processOne()` 收不到 source（`:858 resolveSource` 返回 undefined）
+#        → **client 半永远不下发，审阅悬浮窗永远不会出现**（与"页面没刷新"无关）。
+#   2. 关掉平台自带的 `fs-sandbox`（它是 `ctx.fs` 的默认提供方）：同一服务名**不能**
+#      重复注册（cordis 硬失败），所以"替换"必须写成"禁用 + 插入"。
+#   3. 插入 `winstage-fs`（fs-entry.mjs → staging-fs.mjs）：本 bundle 的 `ctx.fs` 提供方。
+#      开关**开**时，工作区**之外**的写入同样进暂存（S3a：硬拒与 `FS_SANDBOX_DENIED`
+#      已从暂存面删除；外部条目的键 = 规范化绝对路径），批准后才按原始绝对路径落盘；
+#      只有显式 `WINSTAGE_STAGE_OUTSIDE=direct` 才直通真实磁盘（逃生口，默认关闭）。
+#
+# 注意：`name` 在非 insert 补丁里是**断言**，不匹配时**整条补丁（连 config）一起被跳过**
+# （cordis-plugin-include/lib/index.js:95-98 `warn(...); continue;`；且 :99-102 的 overrides
+# 里 name 被排除 —— 非 insert 的 name 只能断言、永远不能重命名），所以这里逐字写全。
+# 推论：下面 `winstage-sandbox` 行若是改名，任何**同 id 的 profile 覆盖层**若仍断言旧行名，
+# 会被静默丢弃（含它携带的 config）。3081 的
+# `.t\dsh2\home\profiles\dsh2\cordis.patch.yml` 就是这个形态，必须与本文件同步改名。
+#
+# ── C-8：两个"根"结构性同源 ─────────────────────────────────────────────────────
+# host 行用 `config.workspaceRoot`、fs 行用 `config.cwd` 表达同一个暂存根。两者一旦漂移，
+# `getReviewService()`（review-service.mjs，按 canonical 根做**进程内单例**）会产生两个
+# 单例 ⇒「暂存写到 A、快照发布在 B」，面板永远看不到改动。因此这里用 YAML 锚点把两者
+# 绑成**同一个字面值**：改一处即两处同改。fs 行额外带一个 `workspaceRoot`，供
+# `staging-fs.mjs` 的 fail-closed 自校验使用（两键都给了且不一致 → 直接 throw）。
+
+- id: fs-sandbox
+  name: '@deepseek-ai/dsh-fs-sandbox'
+  disabled: true
+
+# ── shell 执行面：**按开关择一装载**（本轮的装配层修复）──────────────────────────
+# 目标：**恰好一个** shell 提供方启用，且跟随设置页那个开关 ——
+#   开关**开** ⇒ 平台 `pwsh-sandbox` 让位、`winstage-shell` 接管（命令在沙箱内跑、产出进暂存）；
+#   开关**关** ⇒ Windows shell 让位、平台 `pwsh-sandbox` 接管（完全恢复原生 shell 行为）。
+#
+# 为什么需要这条（实测出来的结构性缺口）：
+#   `ctx.shell` 是**单例服务名**，两个提供方不能共存；而被禁用的那一行**根本不提供**服务。
+#   历史做法只用一个**环境变量** `WINSTAGE_SHELL` 做门控，一旦某个 profile 用**字面量**
+#   `disabled` 覆盖这两行（3080 的 web profile 正是如此），门控就被**静默绕过** ⇒
+#   WinStage 永远占着 `ctx.shell`，哪怕开关是关的。后果实测：档位为 `danger-full-access`
+#   时**每一条 pwsh 都被拒**（"关了沙箱 shell 全废"）。
+#
+# 为什么能读到开关：开关的值落在 profile 覆盖层
+#   `<DSH_HOME>/profiles/<DSH_PROFILE>/cordis.patch.yml` 的 `id: winstage-sandbox`
+#   行 `config.enabled` 上（实测该文件逐字写着 `enabled: false`）。
+#   `!!js` 的求值器是同步的 `new Function('ctx','expr','with (ctx) { return eval(expr) }')`
+#   （`cordis-plugin-loader/src/config/utils.ts:5-9`），其中**`require` 不可用**
+#   （实测 `typeof require === 'undefined'`），唯一可用读文件通道是
+#   `process.getBuiltinModule('node:fs')` —— 下面两个表达式就用它。
+#
+# **fail-safe（刻意）**：判不出（文件不存在 / 正则不匹配 / 抛错）时返回 `true`
+#   ⇒ 视为"开关开启"⇒ **保持历史行为**（WinStage 接管）。
+#   把"读不懂"解释成"关闭"会让用户**静默失去沙箱**，比保守更危险。
+#
+# ★ 与 `dsh-plugin/assembly-toggle.mjs` 的 `winStageEnabledInProfileText()` **逻辑必须一致**：
+#   那边是 host 侧（直接 import），这边是装配侧（只能内联）。改一处必须同步另一处。
+#
+# 注意：`name` 在非 insert 补丁里是**断言**，不匹配时**整条补丁（连 config）一起被跳过**
+# （cordis-plugin-include/lib/index.js:95-98 `warn(...); continue;`；且 :99-102 的 overrides
+# 里 name 被排除 —— 非 insert 的 name 只能断言、永远不能重命名），所以这里逐字写全。
+# 推论：下面 `winstage-sandbox` 行若是改名，任何**同 id 的 profile 覆盖层**若仍断言旧行名，
+# 会被静默丢弃（含它携带的 config）。3081 的
+# `.t\dsh2\home\profiles\dsh2\cordis.patch.yml` 就是这个形态，必须与本文件同步改名。
+- id: pwsh-sandbox
+  name: '@deepseek-ai/dsh-pwsh-sandbox'
+  # 平台 shell 让位 = 显式要求 WinStage 接管（`WINSTAGE_SHELL=1`）**且** profile 开关未关
+  disabled: !!js (process.env.WINSTAGE_SHELL === '1') && (() => { try { const p = process.env.DSH_HOME + '/profiles/' + process.env.DSH_PROFILE + '/cordis.patch.yml'; const fs = process.getBuiltinModule('node:fs'); if (!fs.existsSync(p)) return true; const m = /id:\s*winstage-sandbox\b([\s\S]*?)(?=\s*-\s*id:|\s*$)/.exec(fs.readFileSync(p, 'utf8')); if (!m) return true; const e = /enabled:\s*(true|false)\b/.exec(m[1]); return !e || e[1] !== 'false'; } catch { return true } })()
+
+- insert:
+    - id: winstage-sandbox
+      # 裸包名（**不要**改回子路径 specifier —— 见文件头的源码依据）。
+      name: '@local/dsh-winstage-sandbox'
+      config:
+        enabled: true
+        workspaceRoot: &winstageRoot C:\Users\Administrator\Desktop\WinStageSandbox
+        probeOnStart: true
+
+    - id: winstage-fs
+      # **必须**保持子路径 specifier（不要改成裸包名）：
+      #   a) 裸名解析到 `exports["."]` = host-plugin.mjs，会把 host-plugin **apply 两次**
+      #      （命令 definitionId 冲突）；
+      #   b) 改名会让 profile 覆盖层（断言 `.../fs`）整条被跳过，丢掉 `cwd` 隔离配置。
+      name: '@local/dsh-winstage-sandbox/fs'
+      config:
+        # `cwd` 同时是暂存工作区根：`ctx.fs` 的解析基准与暂存树的根必须是同一个目录。
+        # 与 host 行的 `workspaceRoot` 共用同一个锚点（C-8：结构性同源）。
+        cwd: *winstageRoot
+        # fail-closed 自校验用：与 `cwd` 不一致时 staging-fs.mjs 直接 throw。
+        workspaceRoot: *winstageRoot
+
+    - id: winstage-shell
+      # 子路径 specifier（与 fs 行同理：裸名会把 host-plugin 装第二遍）。
+      name: '@local/dsh-winstage-sandbox/shell'
+      # 不激活 = 未显式要求接管（`WINSTAGE_SHELL !== '1'`）**或** profile 开关已关。
+      # 与上面 `pwsh-sandbox` 行**共用同一对条件**，保证"恰好一个启用"。
+      disabled: !!js process.env.WINSTAGE_SHELL !== '1' || !(() => { try { const p = process.env.DSH_HOME + '/profiles/' + process.env.DSH_PROFILE + '/cordis.patch.yml'; const fs = process.getBuiltinModule('node:fs'); if (!fs.existsSync(p)) return true; const m = /id:\s*winstage-sandbox\b([\s\S]*?)(?=\s*-\s*id:|\s*$)/.exec(fs.readFileSync(p, 'utf8')); if (!m) return true; const e = /enabled:\s*(true|false)\b/.exec(m[1]); return !e || e[1] !== 'false'; } catch { return true } })()
+      config:
+        # 与 fs/host 两行共用同一个暂存根锚点（C-8：结构性同源）。
+        workspaceRoot: *winstageRoot

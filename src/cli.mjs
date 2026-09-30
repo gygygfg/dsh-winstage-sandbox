@@ -209,6 +209,12 @@ async function main() {
         })
         // 执行后只提取相对该输入版本的新增变化（#3.2）
         const captured = workspace.captureAfterExecution(before)
+        // ── D9 修复：捕获结果必须**并入清单并冻结候选**，否则 exec → review → apply 断链 ──
+        // 原先这里只有 `captured.length` 一个统计数字：暂存树里有命令产出的文件，
+        // 但 `diffEntries()` 看不到任何变化 → `review` 恒为空 → `apply` 无候选可应用。
+        // 这一段原本被 tests\e2e-flow.mjs 在 CLI 之外手工补上（测试替被测代码干活）。
+        const ingested = workspace.ingestCapturedChanges(captured)
+        const frozen = workspace.freezeIfNeeded({ source: 'exec' })
         const payload = {
           execution: {
             argv: execution.argv,
@@ -225,6 +231,16 @@ async function main() {
           sandboxInit: report,
           materialized: materialize,
           capturedChanges: captured.length,
+          /** 新增：并入清单的条数 / 删除条数 / 跳过原因（可观测，不静默） */
+          ingested,
+          /** 新增：候选冻结结果（frozen=false 且 reason=already-represented 表示幂等复用） */
+          candidate: {
+            frozen: frozen.frozen === true,
+            reason: frozen.reason,
+            id: frozen.candidate?.id,
+            files: frozen.candidate?.changes?.length,
+            pendingAfter: workspace.listReviews().length,
+          },
         }
         if (flags.json) out(payload, flags)
         else {
@@ -233,7 +249,10 @@ async function main() {
           if (execution.stderr) process.stderr.write(execution.stderr)
           process.stdout.write(`\n退出码=${execution.exitCode} 分类=${execution.classification.kind} 用时=${execution.durationMs}ms\n`)
           if (execution.completedWithoutOutput) process.stdout.write('（执行完成，无输出）\n')
-          process.stdout.write(`沙箱内提取到 ${captured.length} 项变化\n`)
+          process.stdout.write(`沙箱内提取到 ${captured.length} 项变化，并入清单 ${ingested.ingested} 项，删除 ${ingested.deletions} 项\n`)
+          if (frozen.frozen) process.stdout.write(`已冻结候选 ${frozen.candidate.id}（${frozen.candidate.changes.length} 个变更单元）→ 可用 review/apply 处理\n`)
+          else process.stdout.write(`未新建候选：${frozen.reason}\n`)
+          for (const skip of ingested.skipped) process.stdout.write(`  ⚠ 跳过 ${skip.path}: ${skip.reason}\n`)
         }
         process.exit(execution.exitCode === 0 ? EXIT.OK : EXIT.FAIL)
       } finally {

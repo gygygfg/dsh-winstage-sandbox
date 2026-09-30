@@ -1,0 +1,29 @@
+{
+  "name": "@local/dsh-winstage-sandbox",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "WinStageSandbox host plugin for DeepSeek Harness: staging–candidate–selective-commit sandbox with a Settings toggle, /winstage commands, a staged ctx.fs provider, and a composer review panel",
+  "exports": {
+    ".": "./host-plugin.mjs",
+    "./host-plugin": "./host-plugin.mjs",
+    "./fs": "./fs-entry.mjs",
+    "./shell": "./shell-entry.mjs",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-ui-settings"]
+    }
+  },
+  "meta": {
+    "title": "WinStage 沙箱",
+    "description": "暂存—候选—选择性提交沙箱（Windows 受限令牌 + ACL + Job Object）。在设置中可开关。"
+  }
+}

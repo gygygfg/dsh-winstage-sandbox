@@ -3,10 +3,22 @@
  *
  * ── 现状声明（务必先读）────────────────────────────────────────────────────────
  * 本模块提供 AppContainer 的**结构与调用构造**，并配有无需 Win32 的确定性布局测试。
- * 但它在**本机无法实测**：当前会话是 WRITE_RESTRICTED 受限令牌，
- * `CreateAppContainerProfile` 返回 `hr=0x80070005`（E_ACCESSDENIED），
- * 因此**运行期行为未经实测**。按手册第 0 章证据分层，本模块结论只能标 `[官方]`/`[推断]`，
- * **不得**标 `[实测]`。
+ *
+ * `[实测-阶段B]` 未受限宿主（High IL 管理员令牌，`admin=YES`）下：
+ * `CreateAppContainerProfile` **返回 `hr=0x0`**，包 SID 形如 `S-1-15-2-…`，用完即删成功
+ * （阶段 A 的 `0x80070005 (E_ACCESSDENIED)` 只出现在**受限令牌**会话里）。
+ *
+ * `[实测-FIX-B]` **T0 的隔离是真的能生效的**，权威证据（`.t/sbx3/dev/raw-t0-forensics.txt`、
+ * `raw-t0-behaviour.txt`）：`CREATE_SUSPENDED` 状态下直查子进程令牌
+ * `TokenIsAppContainer(29) = 1`、`TokenAppContainerSid = 期望包 SID`、
+ * `TokenIntegrityLevel = S-1-16-4096`（Low）；行为面：子进程真在跑（`exit /b 42` → 42）、
+ * 区外写被拒、未声明 `internetClient` 时网络被阻断（`curl` → 7），声明后立即连通。
+ *
+ * ⚠ 两个**必须**遵守的前置（否则隔离会静默失效或子进程根本不跑）：
+ *   1. `SECURITY_CAPABILITIES` 的 `cbSize` 必须是 **24**（见 `SECURITY_CAPABILITIES_SIZE`）；
+ *   2. AppContainer 子进程**不能**在没有自有控制台的情况下继承父进程句柄 ——
+ *      否则子进程会以 `0xC0000142 (STATUS_DLL_INIT_FAILED)` 静默死亡，见
+ *      `src/appcontainer-runtime.mjs` 的 `CREATE_NEW_CONSOLE` 注释。
  *
  * 工程处理：
  *   1. `isAvailable()` 真实探测；拿不到 AppContainer 就**拒绝**，绝不静默退回继承环境；
@@ -15,6 +27,10 @@
  *      `tests/appcontainer-layout.mjs` 用合成缓冲区确定性校验 —— 这正是
  *      Job 结构体（缺陷 5）与 `CREATE_UNICODE_ENVIRONMENT`（缺陷 13）两次踩坑后总结出的做法：
  *      **先把布局测对，再谈运行**。
+ *   4. **"隔离已生效"只能由实测证据判定**：`src/appcontainer-runtime.mjs` 的
+ *      `readProcessTokenFacts()` + `assessAppContainerIsolation()` 是唯一入口，
+ *      `selectTier()` 至今仍要求 `report.appContainerIsolation.proven === true`。
+ *      本模块**不**提供任何硬编码 `true` 的捷径。
  *
  * ── 为什么 AppContainer 值得做（对应手册条款）────────────────────────────────
  *   残余边界 R1：WRITE_RESTRICTED 只交叉写类访问、Low IL 只做 no-write-up，
@@ -54,11 +70,59 @@ export const OFF_ATTRIBUTE_LIST = 104
 /** `EXTENDED_STARTUPINFO_PRESENT`：创建进程时必须置位，否则 lpAttributeList 被忽略 */
 export const EXTENDED_STARTUPINFO_PRESENT = 0x00080000
 
-/** `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` 的属性号 */
+/** `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` 的属性号
+ *
+ * ── 依据（不凭记忆，三处独立来源 + 一次实测）───────────────────────────────────
+ * 1. `[文档]` winnt.h 的宏：`PROC_THREAD_ATTRIBUTE_x = ProcThreadAttributeValue(Number, Thread, Input, Additive)`
+ *    `= Number | (Thread?0x10000:0) | (Input?0x20000:0) | (Additive?0x40000:0)`（Number 掩码 `0xFFFF`）。
+ *    真实的头文件镜像（Mozilla `security/sandbox/chromium-shim/base/win/sdkdecls.h`）里写着：
+ *      `#define ProcThreadAttributeSecurityCapabilities 9`
+ *      `#define PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES \`
+ *          `ProcThreadAttributeValue (ProcThreadAttributeSecurityCapabilities, FALSE, TRUE, FALSE)`
+ *    ⇒ `9 | 0x00020000 = 0x00020009`。
+ * 2. `[文档]` windows-sys（由官方 Win32 元数据生成）：
+ *    `pub const PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES: u32 = 131081`，而 `131081 = 0x00020009`。
+ * 3. `[文档]` `UpdateProcThreadAttribute` 官方页对该属性的语义原文：
+ *    "The lpValue parameter is a pointer to a SECURITY_CAPABILITIES structure that defines the security
+ *     capabilities of an app container. **If this attribute is set the new process will be created as an
+ *     AppContainer process.**"
+ * 4. `[实测]` 把不同属性号喂给同一个 `UpdateProcThreadAttribute`（值都是 24 字节 `SECURITY_CAPABILITIES`）：
+ *    `0x00020009` → `true`（属性列表确实被写入）；`0x0002000A` / `0x00020017` → `false` + `ERROR_BAD_LENGTH(24)`。
+ *    （`0x00020017`（Number=23）是阶段 B 报告 §7 提过的候选，**实测否定**。）
+ *    原始输出：`.t/sbx3/dev/raw-t0-forensics.txt` §1 与 `raw-t0-pinvoke.txt` §3（独立 P/Invoke 通道同样结论）。
+ */
 export const PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES = 0x00020009
 
-/** `SECURITY_CAPABILITIES` 布局：{ PSID AppContainerSid; PSID_AND_ATTRIBUTES Capabilities; DWORD CapabilityCount; DWORD Reserved; } */
-export const SECURITY_CAPABILITIES_SIZE = 32
+/**
+ * `SECURITY_CAPABILITIES` 布局：`{ PSID AppContainerSid; PSID_AND_ATTRIBUTES Capabilities; DWORD CapabilityCount; DWORD Reserved; }`
+ *
+ * `[官方]` x64 大小 = **24**：PSID(8) + PSID_AND_ATTRIBUTES(8) + DWORD(4) + DWORD(4)。
+ * 结构体按 8 对齐，24 已是 8 的倍数 → **没有尾部填充**。
+ *
+ * ── 缺陷 D5 留档（32 是怎么来的，以及它为什么危险）────────────────────────────
+ * 本常量曾取 **32**，理由是"再补 8 字节 padding"。那 8 字节在官方定义里**不存在**：
+ * 初版用"先加 padding 再把缓冲区量回 32"的写法把错误固化成了测试断言（循环论证），
+ * 于是测试全绿、而真实调用 `UpdateProcThreadAttribute` 因 cbSize 错误
+ * 返回 false + `ERROR_INVALID_PARAMETER(87)`（阶段 B `[实测]`，
+ * 见 `.t\sbx3\dev\02-阶段B报告.md` §4/§11 与 `.t/sbx3/dev/raw-probe-ac-token.txt`）。
+ * 教训：布局常量必须来自**独立的官方算术**，不能用"实现量出来的数"反过来证明实现正确。
+ *
+ * ⚠ 如实声明（`[实测]`，阶段 B → **FIX-B 已推翻其结论**）──
+ * 阶段 B 曾写："只把 32 改成 24 并不能让 T0 生效；cbSize=24 时属性确已写入成功，
+ * 但派生出的子进程 `TokenUser` 仍是用户 SID —— 隔离为零"。
+ * **这条结论是错的，错在判据**：AppContainer 令牌的 `TokenUser` **本来就是用户 SID**，
+ * 包身份在 `TokenAppContainerSid(31)`；包 SID 也**不在** `TokenGroups` 里。
+ * 用 `TokenIsAppContainer(29)` 直查（`CREATE_SUSPENDED` 状态）：`cbSize=24` ⇒ **`1`**（真的在
+ * AppContainer 里，IL=Low），`cbSize=32` ⇒ `0`（High IL）。行为面同样成立（区外写被拒、网络被阻断）。
+ * 原始证据：`.t/sbx3/dev/raw-t0-forensics.txt`、`raw-t0-behaviour.txt`。
+ * 教训：**判据本身必须能被"已知坏配置"证伪** —— 我们正是靠 `cbSize=32` 那组对照
+ * （`TokenIsAppContainer=0`）才确认 `TokenIsAppContainer` 这个判据有分辨力。
+ *
+ * ⚠ 但"改成 24"**只是必要条件之一**：FIX-B 还发现 `bInheritHandles=TRUE` + 无自有控制台会让
+ * AppContainer 子进程以 `0xC0000142 (STATUS_DLL_INIT_FAILED)` 静默死亡
+ * （`CreateProcessW` 仍返回成功），见 `src/appcontainer-runtime.mjs` 的 `CREATE_NEW_CONSOLE` 注释。
+ */
+export const SECURITY_CAPABILITIES_SIZE = 24
 export const OFF_AC_SID = 0
 export const OFF_AC_CAPABILITIES = 8
 export const OFF_AC_CAPABILITY_COUNT = 16
@@ -73,7 +137,7 @@ export const ATTRIBUTE_LIST_HEADER_SIZE = 8
  * @param {bigint|object|null} appContainerSid 包 SID 指针
  * @param {Array<{sid: bigint|object, attributes: number}>} capabilities 能力 SID 列表
  *   （**不含** internetClient；要联网必须显式加入）
- * @returns {Buffer} 32 字节
+ * @returns {Buffer} 24 字节（= `[官方]` sizeof(SECURITY_CAPABILITIES)，无尾部填充）
  */
 export function buildSecurityCapabilities(appContainerSid, capabilities = []) {
   const buffer = Buffer.alloc(SECURITY_CAPABILITIES_SIZE)
@@ -137,8 +201,13 @@ export function buildCreationFlags(hasEnvironmentBlock) {
 /**
  * 真实探测 AppContainer 是否可用：调用 `CreateAppContainerProfile` 并立即删除。
  *
- * `[实测]` 受限令牌下会返回 `0x80070005`（E_ACCESSDENIED）。
+ * `[实测-阶段B/FIX-B]` 本机（High IL 管理员令牌）**成功**：`hr=0x0`，profile 用完即删。
+ * `0x80070005 (E_ACCESSDENIED)` 只在**受限令牌**会话里出现（阶段 A 的观测）。
  * 探测失败**不降级**为 T1 —— 由调用方决定是否换档；本函数只如实回报。
+ *
+ * ⚠ 本函数返回 `available: true` **只说明 profile 能建**，**不代表**隔离已生效。
+ * "隔离是否生效"必须用 `src/appcontainer-runtime.mjs` 的
+ * `readProcessTokenFacts()` + `assessAppContainerIsolation()` 采实测证据来判定。
  *
  * @param {object} koffi 已加载的 koffi 模块
  * @returns {{available: boolean, hr?: number, sid?: string, detail: string}}
