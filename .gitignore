@@ -52,13 +52,16 @@ run-*.json
 npminstall/
 
 # ── 历史探针/试验的散落产物（保持在磁盘上，但不入库）────────────────────────────
-# 这些是 past 运行留下的目录（npm 试验、占位目录）与根下的临时报告/探针文件；
-# 保留以免误删数据，仅从版本库排除。
+# 这些是 past 运行留下的目录与根下临时文件；保留以免误删数据，仅从版本库排除。
 #
-# ★ `esc/` 与 `filemod/` **不在此列**：它们被已提交文档当作证据引用
-#   （例：`filemod\bin.dat` = 1 MiB 二进制往返样本、
-#     `esc\filemod_report.txt` = 第 1 轮完整输出 17 项）
-#   —— 删掉会让那些引用断链，因此保留在工作区。
+# ★ `esc/` 与 `filemod/` 同时是**被引用的证据**：
+#     `esc\filemod_report.txt`   = 第 1 轮完整输出（17 项）
+#     `filemod\bin.dat`          = 1 MiB 二进制往返样本
+#     `filemod\test_filemod.ps1` = 测试脚本
+#   已提交文档（实测证据记录.md、file-modification-test-report.md）以表格引用它们，
+#   因此**文件必须留在磁盘上**；这里只保证它们不进版本库。
+esc/
+filemod/
 sub/
 probe2.txt
 SANDBOX_TEST_write_probe.md
