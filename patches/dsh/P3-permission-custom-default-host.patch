@@ -1,0 +1,35 @@
+# P3-permission-custom-default-host — H3（宿主半）：未钉住的 custom 默认值让 permission 行整块消失
+# target (相对 harness 根): node_modules/@deepseek-ai/dsh-permission-presets/lib/index.js
+# upstream: @deepseek-ai/dsh-permission-presets@0.2.0-rc.2 (packages/interaction/permission-presets)
+# status: verified
+# rationale: 装配期 `derive(EMPTY_KNOBS) === "custom"` 时构造函数直接抛错 ⇒ 投影单元 `permissions` 根本不注册 ⇒ 客户端拿不到 selection。
+# 本文件由 tools/dsh-patches.mjs --emit-patches 从 patches/dsh/manifest.json 派生，请勿手工编辑。
+# 应用方式（在 harness 根下）: git apply -p1 <本文件>  或  node tools\dsh-patches.mjs --apply
+diff --git a/node_modules/@deepseek-ai/dsh-permission-presets/lib/index.js b/node_modules/@deepseek-ai/dsh-permission-presets/lib/index.js
+index bebc2e3..2a0c381 100644
+--- a/node_modules/@deepseek-ai/dsh-permission-presets/lib/index.js
++++ b/node_modules/@deepseek-ai/dsh-permission-presets/lib/index.js
+@@ -176,13 +176,17 @@ let PermissionPresetService = (() => {
+ 			if ("auto" in this.presets) throw new Error(`permission: "${AUTO_PRESET}" is reserved and cannot name a configured preset`);
+ 			if (ctx.shell.sandboxMode === void 0) throw new Error("permission: the mounted bash executor does not confine (no sandboxMode) — presets bundle a sandbox mode, so composing this plugin over an unconfined executor is a misconfiguration");
+ 			const inferredDefault = this.derive(EMPTY_KNOBS);
+-			const defaultPreset = config.defaultPreset.get() ?? inferredDefault;
+-			if (defaultPreset === "custom") throw new Error("permission: composed sandbox and approval defaults match no preset; configure defaultPreset explicitly");
+-			this.resolve(defaultPreset);
++			const namedDefault = config.defaultPreset.get();
++			// H3: a genuinely unknown *named* default stays a hard misconfiguration error ...
++			if (namedDefault !== void 0) this.resolve(namedDefault);
++			const pinnedDefault = namedDefault ?? (inferredDefault === "custom" ? this.names[0] : inferredDefault);
++			if (pinnedDefault === void 0) throw new Error("permission: composed sandbox and approval defaults match no preset and no preset is configured; configure presets and defaultPreset explicitly");
++			if (inferredDefault === "custom") ctx.logger.warn(`permission: composed sandbox ("${ctx.shell.sandboxMode}") and approval ("${ctx.approval.config.policy ?? "ask"}") defaults match no preset; the "permissions" projection reports "${CUSTOM_PRESET}" for such sessions while the new-session default stays pinned to the real preset "${pinnedDefault}" (returning "${CUSTOM_PRESET}" from defaultSettings() would make the client default-settings row throw "permission catalog does not advertise its current default")`);
+ 			this.defaultSettings = () => {
+-				const defaultPreset = config.defaultPreset.get() ?? inferredDefault;
+-				if (!Object.hasOwn(this.presets, defaultPreset)) throw new Error(`permission: unknown default preset "${defaultPreset}"`);
+-				return { defaultPreset };
++				const named = config.defaultPreset.get();
++				if (named === void 0) return { defaultPreset: pinnedDefault };
++				if (!Object.hasOwn(this.presets, named)) throw new Error(`permission: unknown default preset "${named}"`);
++				return { defaultPreset: named };
+ 			};
+ 			const selectionSchema = z$1.object({ currentValue: z$1.string().min(1) });
+ 			ctx.sessionProjections.register({
