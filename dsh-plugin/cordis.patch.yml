@@ -19,7 +19,7 @@
 #
 # ── 装配（按依赖顺序）────────────────────────────────────────────────────────────
 #   1. `winstage-sandbox`（host-plugin.mjs）：设置开关、审阅快照、/winstage 命令面。
-#      用**裸包名** `@local/dsh-winstage-sandbox`：`package.json` 的 `exports["."]` =
+#      用**裸包名** `dsh-winstage-sandbox`：`package.json` 的 `exports["."]` =
 #      `./host-plugin.mjs`，与子路径 `.../host-plugin` 是**同一个模块 URL**（不会二次 apply）。
 #      理由（实测源码，行号取自 dsh-client-modules/lib/index.js）：
 #        `:82-88 exactPackageSpecifier()` 对 `@scope/name/sub` 三段 specifier 返回 undefined
@@ -124,7 +124,7 @@
 - insert:
     - id: winstage-sandbox
       # 裸包名（**不要**改回子路径 specifier —— 见文件头的源码依据）。
-      name: '@local/dsh-winstage-sandbox'
+      name: 'dsh-winstage-sandbox'
       config:
         enabled: true
         workspaceRoot: &winstageRoot C:\Users\Administrator\Desktop\WinStageSandbox
@@ -135,7 +135,7 @@
       #   a) 裸名解析到 `exports["."]` = host-plugin.mjs，会把 host-plugin **apply 两次**
       #      （命令 definitionId 冲突）；
       #   b) 改名会让 profile 覆盖层（断言 `.../fs`）整条被跳过，丢掉 `cwd` 隔离配置。
-      name: '@local/dsh-winstage-sandbox/fs'
+      name: 'dsh-winstage-sandbox/fs'
       config:
         # `cwd` 同时是暂存工作区根：`ctx.fs` 的解析基准与暂存树的根必须是同一个目录。
         # 与 host 行的 `workspaceRoot` 共用同一个锚点（C-8：结构性同源）。
@@ -145,7 +145,7 @@
 
     - id: winstage-shell
       # 子路径 specifier（与 fs 行同理：裸名会把 host-plugin 装第二遍）。
-      name: '@local/dsh-winstage-sandbox/shell'
+      name: 'dsh-winstage-sandbox/shell'
       # 不激活 = WinStage 未接管（开关关 且 未被 `WINSTAGE_SHELL=1` 强制）
       # 或已被 `WINSTAGE_SHELL=0` 强制交还。与上面 `pwsh-sandbox` 行**共用同一对条件**，
       # 保证"恰好一个启用"（服务名单例：两个都禁用 ⇒ shell 不可用；两个都启用 ⇒ 加载失败）。

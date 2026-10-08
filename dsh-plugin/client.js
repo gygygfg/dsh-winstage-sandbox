@@ -45,7 +45,7 @@
  */
 
 window.__ModuleLoader__.load({
-  id: '@local/dsh-winstage-sandbox',
+  id: 'dsh-winstage-sandbox',
 
   factory(require) {
     const React = require('react')
