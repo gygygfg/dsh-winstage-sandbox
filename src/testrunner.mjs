@@ -121,6 +121,9 @@ export const OFFLINE_SUITES = [
   //   纯函数 + 静态接线断言，零子进程 ⇒ 离线档。
   //   与 verify.cmd 的清单必须逐字一致（两处同时改；tests/suite-wiring.mjs 机器检查）。
   { id: 'session-enclosure-selftest', script: 'tests/session-enclosure-selftest.mjs', title: '子会话纳入同一审批面（parentSession 逐级归并 / 两个 provider 都接线 / 变异自证）' },
+  // Method A 主线（进程内结构化审计）轮追加：审计聚合器 `aggregateAudit` 的离线自测。
+  //   纯函数、零子进程、零 Win32 ⇒ 离线档。与 verify.cmd 清单必须逐字一致。
+  { id: 'sandbox-audit', script: 'tests/sandbox-audit.mjs', title: '审计聚合器（Method A：进程树文件/注册表读写 → workspace/outside 分类统计）' },
 ]
 
 /** 需要未受限会话的套件 */

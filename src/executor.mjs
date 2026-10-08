@@ -2477,6 +2477,21 @@ export class WindowsStageExecutor {
       logPath,
       extraPassthrough: this.options.shimPassthrough ?? [],
     })
+    /* ★ Method A（主线）：结构化操作审计。shim 把**整条进程树**的每一次被 hook 的
+     * 文件/注册表操作写成一个 JSONL（`WINSTAGE_AUDIT_LOG`），供宿主侧聚合/分类/呈现。
+     * 路径**必须落在暂存树之外**：`shim.log`/`overlay.hive*` 已经教会我们，暂存层自己的
+     * 状态文件若在 `<stagingRoot>` 内会被 `captureAfterExecution` 当成用户改动摄取
+     * （自指条目）。因此优先放会话存储根（与 manifest/queue 同处），否则放与暂存根
+     * **互斥**的私有 temp。`options.audit === false` 可显式关闭（性能）。 */
+    const auditPath = typeof this.options.auditLogPath === 'string' && this.options.auditLogPath.length > 0
+      ? this.options.auditLogPath
+      : join(
+          typeof this.options.registryStageDir === 'string' && this.options.registryStageDir.length > 0
+            ? this.options.registryStageDir
+            : tempDir,
+          'audit.jsonl',
+        )
+    this.auditPath = this.options.audit === false ? undefined : auditPath
     this.shimLauncher = new ShimLauncher(this.api, {
       artifacts: this.transparent.artifacts,
       // shim 的环境契约（T4 `winstage_shim.h`）：STAGE_ROOT / CONFIG / LOG。
@@ -2485,6 +2500,7 @@ export class WindowsStageExecutor {
         WINSTAGE_STAGE_ROOT: this.stagingRoot,
         WINSTAGE_SHIM_LOG: logPath,
         WINSTAGE_SHIM_CONFIG: configPath,
+        ...(this.auditPath ? { WINSTAGE_AUDIT_LOG: this.auditPath } : {}),
         // ── 注册表覆盖层**不得**落在暂存树里（本轮修复）─────────────────────────
         // `WINSTAGE_STAGE_ROOT` 同时是文件族的重定向根**和**注册表 overlay 的默认
         // sessionDir（`ws_entry.c` 的取值顺序：REGSTAGE_SESSION_DIR > DSH_REGSTAGE_ROOT
