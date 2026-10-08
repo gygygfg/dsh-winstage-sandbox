@@ -8,15 +8,29 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
+import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { artifactNames, checkArtifactIntegrity } from './build-shim.mjs'
 
-const REPO = 'C:\\Users\\Administrator\\Desktop\\WinStageSandbox'
+// Derive the repo from this file's location instead of hardcoding
+// C:\Users\Administrator\Desktop\WinStageSandbox: the hardcoded path made the
+// preflight report "artifacts missing" for any other checkout (measured on a
+// Windows VM running from C:\ebk\WinStageSandbox -> exit 2). Same rule as
+// smoke-inject/run-shim-closedloop.
+const HERE = path.dirname(fileURLToPath(import.meta.url))
+const REPO = path.resolve(HERE, '..')
 const OUT = process.argv.includes('--out-dir')
   ? path.resolve(REPO, process.argv[process.argv.indexOf('--out-dir') + 1])
   : path.join(REPO, 'shim', 'out')
 const INJ = path.join(OUT, 'winstage-inject.exe')
-const DLL = process.argv[2] && !process.argv[2].startsWith('--') ? path.resolve(process.argv[2]) : path.join(OUT, 'winstage-shim.dll')
+// A bare number is the iteration count, not a DLL path. The old check
+// (`!startsWith('--')`) misread `carrier-flake 30` as a DLL path, and the
+// injector then failed its precheck with "dll file does not exist" for all N
+// runs (measured on a Windows VM).
+const DLL_ARG = process.argv[2]
+const DLL = DLL_ARG && !DLL_ARG.startsWith('--') && !/^\d+$/.test(DLL_ARG)
+  ? path.resolve(DLL_ARG)
+  : path.join(OUT, 'winstage-shim.dll')
 const ITER = Number(process.argv.find((a) => /^\d+$/.test(a)) || 10)
 const DIRECT = process.argv.includes('--direct')
 const PS = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
