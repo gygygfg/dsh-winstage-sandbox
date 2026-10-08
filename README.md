@@ -7,6 +7,24 @@
 
 ---
 
+## 安装（DSH 插件）
+
+```bash
+# npm（已发布时）
+dsh plugin --profile web add dsh-winstage-sandbox
+# 或直接从 GitHub 安装（无需 npm）
+dsh plugin --profile web add github:gygygfg/dsh-winstage-sandbox
+```
+
+- **前置**：Windows 10/11；启动时会做**环境监测**（非 Windows 或本会话无法建立受限令牌 ⇒
+  **拒绝启动**，逃生口 `WINSTAGE_SKIP_ENV_GATE=1`）。
+- **开关**：设置页可开关。关闭时文件面立即退回平台 `SandboxedFileSystem`，命令面在**装配期**
+  交还平台 `pwsh-sandbox`（运行中切换需重启宿主）。详见 [`docs/插件启动-环境监测与开关保证.md`](docs/插件启动-环境监测与开关保证.md)。
+- **shim**：发行包只带 C 源码；需要透明模式先在本机 `node tools/fetch-toolchain.mjs` 再 `node tools/build-shim.mjs`。
+- 发布/收录说明见 [`PUBLISHING.md`](PUBLISHING.md)。
+
+---
+
 ## 1. 快速开始
 
 ```powershell
