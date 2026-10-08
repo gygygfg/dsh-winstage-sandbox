@@ -13,7 +13,7 @@
  *
  * 运行：node tests/sandbox-audit.mjs
  */
-import { aggregateAudit } from '../tools/sandbox-audit.mjs'
+import { aggregateAudit } from '../src/audit-report.mjs'
 
 let checks = 0
 let failures = 0

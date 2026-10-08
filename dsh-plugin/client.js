@@ -145,6 +145,8 @@ window.__ModuleLoader__.load({
         baselineStaleDrifted: '真实文件在暂存之后被外部改写',
         baselineStaleTitle: '真实文件在暂存之后被外部改动过（手册 #12.1）。批准已被拒绝，真实磁盘上的内容不会被覆盖。出路：用「重新对齐基线」/「重新对齐并批准所选」，或 /winstage rebase；丢弃这份暂存用「拒绝」。',
         staleSummary: '{count} 项基线已过期（真实文件在暂存之后被外部改动）：批准会被拒绝，不会静默覆盖真实磁盘；请先 rebase 再批准，或拒绝这份暂存',
+        // Method A 主线：AI 进程树的文件/注册表读写分类统计（宿主 `sandbox-audit.json` 的摘要）
+        auditSummary: '审计：文件 读{read} 写{write}（工作区内{inws}/工作区外{outside}）删{deleted}；注册表 读{rread} 写{rwrite}',
         rebaseAll: '重新对齐基线',
         rebaseAndApprove: '重新对齐并批准所选',
         permIdle: 'WinStage 暂存',
@@ -250,6 +252,8 @@ window.__ModuleLoader__.load({
         baselineStaleDrifted: 'the real file was changed after staging',
         baselineStaleTitle: 'The real file changed after staging (manual #12.1). Approval is refused; the content on the real disk is not overwritten. Use "re-align baseline" / "re-align and approve selected", or /winstage rebase; reject to discard this staged change.',
         staleSummary: '{count} item(s) have a stale baseline (the real file changed after staging): approval is refused and the real disk is not overwritten; re-align the baseline first, or reject this staged change',
+        // Method A main line: classified file/registry read/write counts of the AI process tree
+        auditSummary: 'Audit: files read {read}, written {write} (in-workspace {inws}/outside {outside}), deleted {deleted}; registry read {rread}, written {rwrite}',
         rebaseAll: 'Rebase onto real file',
         rebaseAndApprove: 'Rebase and approve selected',
         permIdle: 'WinStage staging',
@@ -2187,6 +2191,22 @@ window.__ModuleLoader__.load({
                 'div',
                 { ...DR, 'data-winstage-stale-summary': '1', style: styles.staleSummary },
                 t('staleSummary', { count: snapshot.counts.staleBaseline }),
+              ),
+            // Method A 主线：AI 进程树读了/改了什么的分类统计（宿主 `snapshot.audit`）。
+            // 没有审计（未开启/本会话无记录）时**不渲染**，绝不显示空括号。
+            snapshot?.audit?.summary &&
+              h(
+                'div',
+                { ...DR, 'data-winstage-audit': '1', style: { fontSize: '12px', opacity: 0.85, marginTop: '2px' } },
+                t('auditSummary', {
+                  read: snapshot.audit.summary.filesRead ?? 0,
+                  write: snapshot.audit.summary.filesWritten ?? 0,
+                  inws: snapshot.audit.summary.filesWrittenInWorkspace ?? 0,
+                  outside: snapshot.audit.summary.filesWrittenOutside ?? 0,
+                  deleted: snapshot.audit.summary.filesDeleted ?? 0,
+                  rread: snapshot.audit.summary.registryRead ?? 0,
+                  rwrite: snapshot.audit.summary.registryWritten ?? 0,
+                }),
               ),
             ...groupList.map((group) =>
               h(

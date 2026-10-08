@@ -117,8 +117,10 @@ import {
 //   （`getReviewService(...).publish()` —— 与 `/winstage refresh` 同一条调用）。
 //   ⚠ 本模块源码会被 `.t/shell-selftest.mjs` 复制成变异体，复制时要**同时**改基准：
 //     `'../src/executor.mjs'` → `'../../src/executor.mjs'`，`'./review-service.mjs'` →
-//     `'../../dsh-plugin/review-service.mjs'`（见该文件 `loadMutant()` 的 rebase）。
+//     `'../../dsh-plugin/review-service.mjs'`，`'../src/audit-report.mjs'` →
+//     `'../../src/audit-report.mjs'`（见该文件 `loadMutant()` 的 rebase）。
 import { getReviewService } from './review-service.mjs'
+import { buildAuditReport, summarizeAudit } from '../src/audit-report.mjs'
 import { captureRegistryChanges } from './registry-capture.mjs'
 import { rootSessionIdFor, rootSessionIdOf } from './session-identity.mjs'
 
@@ -1830,6 +1832,14 @@ export function createWinStageShellExecutor(options = {}) {
           )
         }
 
+        // ── ⑦.3 审计（Method A 主线）：进程树的文件/注册表读写 → `sandbox-audit.json` ──
+        //    与注册表捕获同一纪律：收尾动作、失败不打断命令。产物落在会话存储根，
+        //    `review-service.snapshot()` 会把它作为 `audit` 段带进面板（同一条读侧）。
+        const auditCapture = this.captureAudit(executor, workspace, warn)
+        if (auditCapture.handled) {
+          notes.push(`${auditCapture.text}（已写入 sandbox-audit.json）`)
+        }
+
         const envRejected = Array.isArray(execution?.envRejected) ? execution.envRejected : []
         for (const name of envRejected) {
           warn(`环境变量 ${name} 未被采纳（名字像凭据），未进入子进程。`)
@@ -2026,6 +2036,33 @@ export function createWinStageShellExecutor(options = {}) {
         warn(`冻结待审候选失败：${error?.message ?? error}（变更已在清单里，但没有生成候选）`)
       }
       return report
+    }
+
+    /**
+     * Method A 主线：把 shim 的结构化审计（`executor.auditPath`，JSONL）聚合成
+     * `sandbox-audit.json`，落在**会话存储根**（与 `review.json` 同处）⇒ 面板与 CLI
+     * 读的是同一份。内容 = AI 的进程树**读了/改了/删了哪些文件、读了/改了哪些注册表键**，
+     * 按 `workspace/outside` 分类。
+     *
+     * 这是**收尾动作**：任何失败都进 warn 并如实返回 `handled:false`，**绝不打断命令**
+     * （与 `captureRegistryChanges` 同一纪律）。
+     */
+    captureAudit(executor, workspace, warn) {
+      const auditPath = executor?.auditPath
+      const storeDir = workspace?.store?.dir
+      if (typeof auditPath !== 'string' || auditPath.length === 0) return { handled: false, reason: 'audit-disabled' }
+      if (typeof storeDir !== 'string' || storeDir.length === 0) return { handled: false, reason: 'no-store-dir' }
+      try {
+        if (!existsSync(auditPath)) return { handled: false, reason: 'no-audit-file' }
+        const lines = readFileSync(auditPath, 'utf8').split(/\r?\n/)
+        const report = buildAuditReport(lines, { root: workspace.root, audits: [auditPath] })
+        const out = join(storeDir, 'sandbox-audit.json')
+        writeFileSync(out, `${JSON.stringify(report, null, 2)}\n`)
+        return { handled: true, path: out, summary: report.summary, text: summarizeAudit(report.summary) }
+      } catch (error) {
+        warn(`聚合审计失败（命令结果不受影响）：${error?.message ?? error}`)
+        return { handled: false, reason: `error:${error?.message ?? error}` }
+      }
     }
 
     // ==================== 内部：返回形状 ====================

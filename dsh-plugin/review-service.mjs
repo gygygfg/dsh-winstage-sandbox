@@ -1120,6 +1120,34 @@ export class ReviewService {
   }
 
   /**
+   * Method A 主线读侧：把宿主 `sandbox-audit.json`（AI 进程树的文件/注册表读写分类统计）
+   * 作为快照的 `audit` 段带给面板。**纯读、有界**：只带 summary + 每类 ≤50 行样本，
+   * 完整报告在文件里。文件由 `shell-executor.captureAudit()` 写在**同一会话存储根**；
+   * 不存在则返回 null（无审计/未开启）。
+   */
+  auditSummary() {
+    try {
+      const file = join(dirname(this.reviewPath()), 'sandbox-audit.json')
+      if (!existsSync(file)) return null
+      const raw = JSON.parse(readFileSync(file, 'utf8'))
+      const slice = (arr) => (Array.isArray(arr) ? arr.slice(0, 50) : [])
+      return {
+        generatedAt: raw.generatedAt ?? null,
+        summary: raw.summary ?? null,
+        files: {
+          read: slice(raw.files?.read),
+          written: slice(raw.files?.written),
+          deleted: slice(raw.files?.deleted),
+        },
+        registry: { read: slice(raw.registry?.read), written: slice(raw.registry?.written) },
+        note: 'bounded: summary + up to 50 rows per list; full report in sandbox-audit.json',
+      }
+    } catch {
+      return null
+    }
+  }
+
+  /**
    * 当前待审快照（对象形式；Client 读的是它的 JSON 序列化）。
    *
    * ── D1：`files[]` = 净 diff 行（可批准） ∪ 冻结存档行（`frozenOnly`，只显示）──
@@ -1248,6 +1276,8 @@ export class ReviewService {
         appliedPaths: [...(candidate.appliedPaths || [])],
       })),
       readVisibility: readVisibilitySnapshot(this.sessionId),
+      /** Method A 主线：AI 进程树读了/改了什么的分类统计（见 `auditSummary()`） */
+      audit: this.auditSummary(),
       files,
     }
   }
