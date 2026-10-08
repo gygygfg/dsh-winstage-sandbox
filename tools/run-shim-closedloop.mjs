@@ -18,6 +18,10 @@
 // processes are launched with output redirected to FILES (never pipes).
 //
 // Usage: node tools/run-shim-closedloop.mjs [--json] [--keep-stage]
+//
+// Exit codes: 0 = all checks passed, 1 = a product check failed, 2 = unexpected
+// error, 3 = environment unavailable (missing/corrupt shim artifact; reported by
+// the preflight, never counted as a product check failure).
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -25,6 +29,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { parsePe } from './pe-exports.mjs';
+import { artifactNames, checkArtifactIntegrity } from './build-shim.mjs';
 import { createRegistryStage, decodeJournalRecords } from '../src/registry-stage.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -55,6 +60,19 @@ const JSON_OUT = process.argv.includes('--json');
 const T0 = Date.now();
 const checks = [];
 const evidence = {};
+const ENV_UNAVAILABLE_EXIT = 3;
+
+// Preflight: an absent winstage-inject.exe (Defender) or a truncated artifact
+// would fail the checks below as if the product were broken. Reuse build-shim's
+// integrity helper and fail as ENVIRONMENT (exit 3) up front.
+function preflightArtifacts() {
+  const rep = checkArtifactIntegrity(OUT, artifactNames('full'));
+  if (!rep.ok) {
+    const bad = [...rep.missing, ...rep.malformed.map((m) => m.name)];
+    console.error(`ENVIRONMENT UNAVAILABLE: missing/corrupt ${bad.join(', ')}; run node tools/build-shim.mjs`);
+    process.exit(ENV_UNAVAILABLE_EXIT);
+  }
+}
 
 const log = (...a) => { if (!JSON_OUT) console.log('[closedloop]', ...a); };
 
@@ -198,11 +216,7 @@ function main() {
   };
 
   // ---------------------------------------------------------------- setup
-  for (const f of [DLL, INJECTOR, PROBE]) {
-    if (!fs.existsSync(f)) {
-      throw new Error(`missing build artifact ${f}; run \`node tools/build-shim.mjs\` first`);
-    }
-  }
+  preflightArtifacts();
   // Refuse to run if our probe names already exist: we must never delete or
   // overwrite a pre-existing object that this task did not create.
   const preExisting = [PROBE_FILE, PROBE_MOVED, PROBE_DIR, FAILCLOSED_DIR].filter((p) => fs.existsSync(p));

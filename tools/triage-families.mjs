@@ -25,6 +25,10 @@ const RUN_ID = crypto.randomBytes(3).toString('hex');
 const STAGE_BASE = path.join(REPO, 'shim', '.stage', `triage-${RUN_ID}`);
 const EV = path.join(STAGE_BASE, 'evidence');
 const JSON_OUT = process.argv.includes('--json');
+// P2-8: the injector's child timeout defaults to 300s; this tool kills the
+// injector at PARENT_TIMEOUT_MS, so pin the child timeout 30s shorter.
+const PARENT_TIMEOUT_MS = 120000;
+const CHILD_TIMEOUT_MS = PARENT_TIMEOUT_MS - 30000;
 
 const configs = [
   { id: 'A-all', env: {} },
@@ -47,7 +51,7 @@ function run(exe, argv, { tag, env }) {
   const e = fs.openSync(errFile, 'w');
   let res;
   try {
-    res = spawnSync(exe, argv, { stdio: ['ignore', o, e], cwd: REPO, env, windowsHide: true, timeout: 120000 });
+    res = spawnSync(exe, argv, { stdio: ['ignore', o, e], cwd: REPO, env, windowsHide: true, timeout: PARENT_TIMEOUT_MS });
   } finally {
     fs.closeSync(o);
     fs.closeSync(e);
@@ -74,6 +78,7 @@ function main() {
         ...Object.entries(c.env).flatMap(([k, v]) => ['--set-env', `${k}=${v}`]),
         '--report', path.join(EV, `${c.id}-${t.id}.inject.json`),
         '--timeout-ms', '60000',
+        '--child-timeout-ms', String(CHILD_TIMEOUT_MS),
         '--',
         t.exe, ...t.args,
       ], { tag: `${c.id}-${t.id}`, env: process.env });

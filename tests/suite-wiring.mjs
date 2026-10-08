@@ -69,6 +69,8 @@ const KNOWN_UNREGISTERED = Object.freeze({
     '断言对象是**真实产物**（shim DLL + 闭环节报告 + 真实 WAL）；产物缺失时整段如实 SKIP，需构建后单独跑',
   'tests/registry-stage.mjs':
     '独立入口仅供定位；同一批断言已由 registry-guard（已登记）在既有关口内覆盖，重复登记只会加长关口',
+  'tests/shim-artifact-integrity.mjs':
+    '第 6 节读取真实 shim/out 产物树（DLL/EXE 与 .stale-* 现状），判定随本机是否已构建而变化；需构建后单独跑，不进确定性关口',
   'tests/dsh2-2a-outside-isolation.mjs': 'dsh2 轮次一次性诊断脚本（越界写隔离不变式），结论已归档 docs/dsh2-*.md',
   'tests/dsh2-2c-selftest.mjs': 'dsh2 轮次一次性复核脚本（NO-DEFECT 复现），结论已归档 docs/dsh2-2c-NO-DEFECT.md',
   'tests/dsh2-3-audit-mirror.mjs': 'dsh2 轮次一次性诊断脚本（审批审计镜像），结论已归档 docs/dsh2-方向3-*.md',

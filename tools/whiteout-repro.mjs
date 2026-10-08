@@ -13,6 +13,10 @@ const INJ = path.join(OUT, 'winstage-inject.exe')
 const DLL = path.join(OUT, 'winstage-shim.dll')
 const PS = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
 const BASE = path.join(REPO, 'esc', `wo-repro-${Date.now().toString(36)}`)
+// P2-8: keep the injector's child timeout below this tool's spawnSync timeout so
+// the injector can write its report before the parent kills it.
+const PARENT_TIMEOUT_MS = 120000
+const CHILD_TIMEOUT_MS = PARENT_TIMEOUT_MS - 30000
 fs.mkdirSync(BASE, { recursive: true })
 
 const SCRIPT = "Write-Output ('PSOK' + (1+2))"
@@ -36,8 +40,8 @@ function run(label, { marker, disableFile = false, verbose = false }) {
       '--set-env', `WINSTAGE_SHIM_LOG=${path.join(stage, 'shim.log')}`]
     if (disableFile) args.push('--set-env', 'WINSTAGE_SHIM_DISABLE_FILE=1')
     if (verbose) args.push('--set-env', 'WINSTAGE_SHIM_VERBOSE=1')
-    args.push('--report', path.join(stage, 'inj.json'), '--', PS, '-NoProfile', '-NonInteractive', '-Command', SCRIPT)
-    r = spawnSync(INJ, args, { stdio: ['ignore', o, e], cwd: REPO, timeout: 120000, windowsHide: true })
+    args.push('--report', path.join(stage, 'inj.json'), '--child-timeout-ms', String(CHILD_TIMEOUT_MS), '--', PS, '-NoProfile', '-NonInteractive', '-Command', SCRIPT)
+    r = spawnSync(INJ, args, { stdio: ['ignore', o, e], cwd: REPO, timeout: PARENT_TIMEOUT_MS, windowsHide: true })
   } finally { fs.closeSync(o); fs.closeSync(e) }
   const out = fs.readFileSync(outFile, 'utf8').replace(/\s+/g, ' ').trim()
   const err = fs.readFileSync(errFile, 'utf8').replace(/\s+/g, ' ').trim()

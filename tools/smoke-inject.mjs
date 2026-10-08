@@ -17,11 +17,16 @@
 //     as a failure, and both attempts stay in the evidence.
 //
 // Usage: node tools/smoke-inject.mjs [--json] [--keep-stage] [--repeat N]
+//
+// Exit codes: 0 = all carriers passed, 1 = product failure (a carrier failed),
+// 2 = unexpected thrown error, 3 = environment unavailable (missing/corrupt shim
+// artifact -- reported by the preflight below, never as a product failure).
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { artifactNames, checkArtifactIntegrity } from './build-shim.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '..');
@@ -40,6 +45,20 @@ const REPEAT = (() => {
   const n = i >= 0 ? Number(process.argv[i + 1]) : 3;
   return Number.isFinite(n) && n > 0 ? n : 3;
 })();
+const ENV_UNAVAILABLE_EXIT = 3;
+
+// Preflight before any injection: if Defender quarantined winstage-inject.exe
+// (or a build is incomplete) the run would look like "SMOKE FAILED". Validate
+// the artifact triple with build-shim's own integrity helper and exit with a
+// DISTINCT environment code (3) so it cannot be mistaken for a product failure.
+function preflightArtifacts() {
+  const rep = checkArtifactIntegrity(OUT, artifactNames('full'));
+  if (!rep.ok) {
+    const bad = [...rep.missing, ...rep.malformed.map((m) => m.name)];
+    console.error(`ENVIRONMENT UNAVAILABLE: missing/corrupt ${bad.join(', ')}; run node tools/build-shim.mjs`);
+    process.exit(ENV_UNAVAILABLE_EXIT);
+  }
+}
 
 const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
@@ -100,9 +119,7 @@ function cleanupStage() {
 }
 
 function main() {
-  for (const f of [DLL, INJECTOR]) {
-    if (!fs.existsSync(f)) throw new Error(`missing ${f}; run node tools/build-shim.mjs`);
-  }
+  preflightArtifacts();
   fs.mkdirSync(EV, { recursive: true });
 
   const defs = [

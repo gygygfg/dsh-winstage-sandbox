@@ -12,6 +12,11 @@ const DLL = path.join(OUT, 'winstage-shim.dll')
 const PS = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
 const BASE = path.join(REPO, 'esc', 'token-cmp2')
 fs.rmSync(BASE, { recursive: true, force: true })
+// P2-8: the injector's child timeout defaults to 300s; this tool kills the
+// injector at PARENT_TIMEOUT_MS, so pin the child timeout 30s shorter. This tool
+// does not pass --timeout-ms, but the default child wait still outlives us.
+const PARENT_TIMEOUT_MS = 180000
+const CHILD_TIMEOUT_MS = PARENT_TIMEOUT_MS - 30000
 
 function script(resultPath) {
   return [
@@ -38,13 +43,13 @@ function runCase(label, injectorArgs) {
     const argv = injectorArgs
       ? [...injectorArgs, '--', PS, '-NoProfile', '-NonInteractive', '-Command', s]
       : ['-NoProfile', '-NonInteractive', '-Command', s]
-    r = spawnSync(injectorArgs ? INJ : PS, argv, { stdio: ['ignore', o, e], cwd: REPO, timeout: 180000, windowsHide: true })
+    r = spawnSync(injectorArgs ? INJ : PS, argv, { stdio: ['ignore', o, e], cwd: REPO, timeout: PARENT_TIMEOUT_MS, windowsHide: true })
   } finally { fs.closeSync(o); fs.closeSync(e) }
   return { label, status: r.status, text: fs.existsSync(resultPath) ? fs.readFileSync(resultPath, 'utf8') : '(missing)' }
 }
 
 const direct = runCase('direct', null)
-const injected = runCase('injector-noinject-noinherit-noenv', ['--no-inject', '--no-inherit', '--inherit-env', '--dll', DLL])
+const injected = runCase('injector-noinject-noinherit-noenv', ['--no-inject', '--no-inherit', '--inherit-env', '--child-timeout-ms', String(CHILD_TIMEOUT_MS), '--dll', DLL])
 
 console.log('############ DIRECT ############')
 console.log(direct.text.trim())

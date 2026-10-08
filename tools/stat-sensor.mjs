@@ -14,6 +14,11 @@ const INJ = path.join(OUT, 'winstage-inject.exe')
 const DLL = path.join(OUT, 'winstage-shim.dll')
 const PS = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
 const BASE = path.join(REPO, 'esc', `stat-sensor-${Date.now().toString(36)}`)
+// P2-8: the injector's child timeout defaults to 300s, longer than this tool's
+// own spawnSync timeout, so the parent would kill the injector before it could
+// write its report. Keep the child timeout 30s under the parent timeout.
+const PARENT_TIMEOUT_MS = 120000
+const CHILD_TIMEOUT_MS = PARENT_TIMEOUT_MS - 30000
 fs.mkdirSync(BASE, { recursive: true })
 
 function scriptFor(resultPath) {
@@ -55,9 +60,10 @@ function run(label, { marker }) {
       '--set-env', `WINSTAGE_STAGE_ROOT=${stage}`,
       '--set-env', `DSH_REGSTAGE_ROOT=${stage}`,
       '--set-env', `WINSTAGE_SHIM_LOG=${path.join(stage, 'shim.log')}`,
-      '--report', path.join(stage, 'inj.json'), '--',
+      '--report', path.join(stage, 'inj.json'),
+      '--child-timeout-ms', String(CHILD_TIMEOUT_MS), '--',
       PS, '-NoProfile', '-NonInteractive', '-Command', scriptFor(resultPath)],
-      { stdio: ['ignore', o, e], cwd: REPO, timeout: 120000, windowsHide: true })
+      { stdio: ['ignore', o, e], cwd: REPO, timeout: PARENT_TIMEOUT_MS, windowsHide: true })
   } finally { fs.closeSync(o); fs.closeSync(e) }
   const res = fs.existsSync(resultPath) ? fs.readFileSync(resultPath, 'utf8') : '(no result)'
   const err = fs.readFileSync(path.join(stage, 'err.txt'), 'utf8').replace(/\s+/g, ' ').trim()

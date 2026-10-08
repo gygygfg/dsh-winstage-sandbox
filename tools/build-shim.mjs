@@ -54,6 +54,10 @@
 //   3. Recover from an interrupted old-style build: `--repair-stale` restores
 //      each missing final name from its newest well-formed `*.stale-<ts>`
 //      sibling. `.stale-*` files are never used as compiler input.
+//   4. `--sweep` (opt-in) removes regenerable residue from shim/out -- old
+//      `.tmp-*`, `.pdb` and report `*.json` -- while never touching the
+//      artifact triple and never deleting the newest `.stale-*` per artifact
+//      (the recovery source proven by tests/shim-artifact-integrity.mjs).
 //
 // Exit codes: 0 = ok, 1 = build/verify failure, 2 = usage error.
 //
@@ -90,6 +94,10 @@ const CLEAN = args.has('--clean');
  * collides with the build flags: both are pure filesystem modes, no toolchain. */
 const CHECK_ONLY = args.has('--check');
 const REPAIR_ONLY = args.has('--repair-stale');
+/* P2-10: shim/out accumulates stale .tmp-*, .pdb and old report *.json. `--sweep` is the
+ * explicit, opt-in cleanup path (see sweepResidue()). Like --check/--repair-stale
+ * it is a pure filesystem mode and needs no toolchain. */
+const SWEEP_ONLY = args.has('--sweep');
 const PROFILE = (() => {
   const flag = process.argv.slice(2).find((a) => a.startsWith('--profile='));
   if (flag) return flag.split('=')[1];
@@ -372,6 +380,69 @@ export function sweepTemps(outDir, names, olderThanMs = 0) {
   return removed;
 }
 
+/**
+ * P2-10: `--sweep` residue collection. Removes regenerable junk from the
+ * out-dir root -- `.tmp-*` staging files, `.pdb` debug symbols and report
+ * `*.json` -- while NEVER touching the artifact triple (`artifactNames`).
+ *
+ * `.stale-*` is handled deliberately conservatively. tests/shim-artifact-integrity.mjs
+ * proves that a `.stale-*` copy is the ONLY recovery source when a final artifact
+ * is missing, so blank-deleting stale files would destroy the recovery path.
+ * Here we delete only the *superseded* stales: for each managed base we keep the
+ * single newest well-formed copy chosen by findNewestStale() (the same choice
+ * --repair-stale would make) and drop the older ones. If anyone ever wants the
+ * recovery snapshots gone too, that must be a separate, explicit stronger flag
+ * (e.g. `--sweep-all-stale`) -- not a change to this default.
+ *
+ * There is intentionally no age gate on the three residue categories: `--sweep`
+ * is itself the explicit consent, every removed file is regenerable on the next
+ * build, and the artifact triple plus the newest stale per base are protected.
+ * An age gate would make `--sweep` a no-op on a freshly dirtied tree, which is
+ * exactly when the user runs it. Callers that want a gentler pass should add a
+ * `--sweep-older-than-ms` flag rather than silently tightening this default.
+ *
+ * Only the out-dir root is scanned (sub-dirs hold per-run evidence), and only
+ * bases in `names` are managed, so a concurrent build for another profile is
+ * left alone.
+ */
+export function sweepResidue(outDir, names) {
+  const removed = { temps: [], pdbs: [], reports: [], stales: [] };
+  const keptStales = [];
+  let entries;
+  try {
+    entries = fs.readdirSync(outDir, { withFileTypes: true });
+  } catch {
+    return { ok: false, outDir, removed, keptStales, error: 'out-dir unreadable' };
+  }
+  for (const ent of entries) {
+    if (!ent.isFile()) continue;
+    const name = ent.name;
+    const full = path.join(outDir, name);
+    const parsed = parseStaleName(name);
+    if (parsed && names.includes(parsed.base)) {
+      const newest = findNewestStale(path.join(outDir, parsed.base));
+      if (newest && path.basename(newest.path) === name) {
+        keptStales.push(name); // the live recovery source: never delete
+        continue;
+      }
+      try { fs.rmSync(full, { force: true }); removed.stales.push(name); }
+      catch { /* still held: collect next time */ }
+      continue;
+    }
+    const tmpBase = name.replace(/\.tmp-\d+(?:-r\d+)?$/, '');
+    const isTemp = tmpBase !== name && names.includes(tmpBase);
+    const isPdb = /\.pdb$/i.test(name);
+    const isReport = /\.json$/i.test(name);
+    if (!isTemp && !isPdb && !isReport) continue;
+    try { fs.rmSync(full, { force: true }); }
+    catch { continue; /* vanished or still held by a dying process */ }
+    if (isTemp) removed.temps.push(name);
+    else if (isPdb) removed.pdbs.push(name);
+    else removed.reports.push(name);
+  }
+  return { ok: true, outDir, removed, keptStales };
+}
+
 /** Run a native exe with stdout/stderr redirected to files (no pipes). */
 function run(exe, argv, label) {
   fs.mkdirSync(LOGS, { recursive: true });
@@ -584,14 +655,36 @@ function repairMode(names) {
   process.exit(after.ok ? 0 : 1);
 }
 
+/** `--sweep`: opt-in removal of regenerable residue in the out-dir root. */
+function sweepMode() {
+  /* Only the artifacts we (or the file-only profile) manage: a stray .tmp-* or
+   * .stale-* for any other name belongs to somebody else and is left alone. */
+  const known = [...new Set([...artifactNames('full'), ...artifactNames('file-only')])];
+  const result = sweepResidue(OUT, known);
+  const r = result.removed;
+  if (JSON_OUT) {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    log(`swept residue in ${OUT}`);
+    log(`  .tmp-* : ${r.temps.length}${r.temps.length ? ' -> ' + r.temps.join(', ') : ''}`);
+    log(`  .pdb   : ${r.pdbs.length}${r.pdbs.length ? ' -> ' + r.pdbs.join(', ') : ''}`);
+    log(`  *.json : ${r.reports.length}${r.reports.length ? ' -> ' + r.reports.join(', ') : ''}`);
+    log(`  .stale-*: removed ${r.stales.length} superseded copy(ies); kept newest per artifact: ${result.keptStales.join(', ') || '(none)'}`);
+    const live = artifactNames('full').filter((n) => fs.existsSync(path.join(OUT, n)));
+    log(`  artifact triple left untouched: ${live.join(', ') || '(none present)'}`);
+  }
+  process.exit(result.ok ? 0 : 1);
+}
+
 function main() {
   const names = artifactNames(PROFILE);
 
-  /* These two modes are pure filesystem operations: they must work even when
+  /* These modes are pure filesystem operations: they must work even when
    * the toolchain is missing, because they are the recovery path for a broken
    * artifact tree (see the post-mortem at the top of this file). */
   if (CHECK_ONLY) checkMode(names);
   if (REPAIR_ONLY) repairMode(names);
+  if (SWEEP_ONLY) sweepMode();
 
   const zig = resolveZig();
   fs.mkdirSync(OUT, { recursive: true });

@@ -13,6 +13,10 @@ const INJECTOR = path.join(REPO, 'shim', 'out', 'winstage-inject.exe');
 const SYS = process.env.SystemRoot || 'C:\\Windows';
 const OUT = path.join(REPO, 'shim', 'out', 'bisect');
 fs.mkdirSync(OUT, { recursive: true });
+// P2-8: the injector's child timeout defaults to 300s; this tool kills the
+// injector at PARENT_TIMEOUT_MS, so pin the child timeout 30s shorter.
+const PARENT_TIMEOUT_MS = 180000;
+const CHILD_TIMEOUT_MS = PARENT_TIMEOUT_MS - 30000;
 
 const TARGETS = {
   node: { exe: process.execPath, args: ['-e', "process.stdout.write('NODEOK')"], expect: /NODEOK/ },
@@ -43,10 +47,10 @@ function runOne(tag, target, skipList, extraEnv = {}) {
     ...Object.entries(extraEnv).flatMap(([k, v]) => ['--set-env', `${k}=${v}`]),
   ];
   if (skipList.length) argv.push('--set-env', `WINSTAGE_SHIM_SKIP=${skipList.join(',')}`);
-  argv.push('--report', path.join(stage, 'inject.json'), '--timeout-ms', '60000', '--', target.exe, ...target.args);
+  argv.push('--report', path.join(stage, 'inject.json'), '--timeout-ms', '60000', '--child-timeout-ms', String(CHILD_TIMEOUT_MS), '--', target.exe, ...target.args);
   let res;
   try {
-    res = spawnSync(INJECTOR, argv, { stdio: ['ignore', o, e], cwd: REPO, env: process.env, windowsHide: true, timeout: 180000 });
+    res = spawnSync(INJECTOR, argv, { stdio: ['ignore', o, e], cwd: REPO, env: process.env, windowsHide: true, timeout: PARENT_TIMEOUT_MS });
   } finally {
     fs.closeSync(o);
     fs.closeSync(e);

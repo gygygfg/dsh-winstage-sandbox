@@ -1,9 +1,15 @@
 // Quantify the flaky PowerShell carrier crash right after injection.
 // Usage: node tools/_ps-flake.mjs [dllPath] [iterations]
+//
+// Exit codes: this tool is an informer and normally exits 0 even when carriers
+// fail (the failure count is the product verdict). A missing/corrupt shim tree
+// is NOT a product verdict, so it exits 2 (ENVIRONMENT) instead of printing a
+// false "N carrier failures".
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { spawnSync } from 'node:child_process'
+import { artifactNames, checkArtifactIntegrity } from './build-shim.mjs'
 
 const REPO = 'C:\\Users\\Administrator\\Desktop\\WinStageSandbox'
 const OUT = process.argv.includes('--out-dir')
@@ -15,6 +21,19 @@ const ITER = Number(process.argv.find((a) => /^\d+$/.test(a)) || 10)
 const DIRECT = process.argv.includes('--direct')
 const PS = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
 const BASE = path.join(REPO, 'esc', `ps-flake-${Date.now().toString(36)}`)
+
+// Preflight: a quarantined/absent winstage-inject.exe (Defender) or a partial
+// build would otherwise be measured as carrier flakiness. Reuse build-shim's
+// integrity check so "missing/corrupt artifact" is an ENVIRONMENT error (exit 2).
+const ENV_UNAVAILABLE_EXIT = 2
+{
+  const rep = checkArtifactIntegrity(OUT, artifactNames('full'))
+  if (!rep.ok) {
+    const bad = [...rep.missing, ...rep.malformed.map((m) => m.name)]
+    console.error(`ENVIRONMENT UNAVAILABLE: missing/corrupt ${bad.join(', ')}; run node tools/build-shim.mjs`)
+    process.exit(ENV_UNAVAILABLE_EXIT)
+  }
+}
 
 const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', "Write-Output ('SMOKE-PS-' + (1+1))"]
 let crashes = 0

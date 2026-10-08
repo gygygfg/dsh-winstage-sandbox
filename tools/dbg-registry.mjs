@@ -14,6 +14,10 @@ const SYS = process.env.SystemRoot || 'C:\\Windows';
 const which = process.argv[2] || 'reg';
 const tag = process.argv.includes('--stage') ? process.argv[process.argv.indexOf('--stage') + 1] : `dbg-${which}-${Date.now().toString(36)}`;
 const STAGE = path.join(REPO, 'shim', '.stage', tag);
+// P2-8: the injector's child timeout defaults to 300s; this tool kills the
+// injector at PARENT_TIMEOUT_MS, so pin the child timeout 30s shorter.
+const PARENT_TIMEOUT_MS = 180000;
+const CHILD_TIMEOUT_MS = PARENT_TIMEOUT_MS - 30000;
 
 const targets = {
   node: [process.execPath, ['-e', "process.stdout.write('NODEOK')"]],
@@ -39,9 +43,10 @@ const res = spawnSync(INJECTOR, [
   '--set-env', 'WINSTAGE_SHIM_VERBOSE=1',
   '--report', path.join(STAGE, 'inject.json'),
   '--timeout-ms', '60000',
+  '--child-timeout-ms', String(CHILD_TIMEOUT_MS),
   '--',
   exe, ...args,
-], { stdio: ['ignore', o, e], cwd: REPO, env: process.env, windowsHide: true, timeout: 180000 });
+], { stdio: ['ignore', o, e], cwd: REPO, env: process.env, windowsHide: true, timeout: PARENT_TIMEOUT_MS });
 fs.closeSync(o);
 fs.closeSync(e);
 
