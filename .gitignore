@@ -35,9 +35,12 @@ run-*.json
 *.audit.json
 
 # ── 未入库的工程树：构建产物 / 采购的工具链 / 一次性探针现场 ──────────────────────
-# `shim/`：shim 与注入器是**构建产物树**（含 21 MB 中间件与证据）；套件在 DLL 缺失时
-#   按设计 skip 并打印 `node tools/build-shim.mjs`；源码封印也把 `shim/` 排除在外。
-shim/
+# `shim/`：**只有构建产物与运行时现场不入库**（`out/` 里是 DLL/EXE/PDB/报告与构建日志，
+#   `.stage/` 是测试运行时打开的句柄与 ACL 残留）。`shim/src`、`shim/include`、
+#   `shim/injector`、`shim/probe` 是**安全关键源码，必须入库** —— 此前整目录 `shim/`
+#   被忽略，等于 shim 的 C 源码从未受版本控制（与 tests/、tools/ 同类的"漂移不可见"缺陷）。
+shim/out/
+shim/.stage/
 # 采购的 zig 工具链（467 MB）；由 `node tools/fetch-toolchain.mjs` 重建
 tools/toolchain/
 tools/_probe-chan2.txt
