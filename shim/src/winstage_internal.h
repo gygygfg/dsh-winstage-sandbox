@@ -34,6 +34,10 @@ typedef struct WsConfig {
     int haveStageRoot;
     wchar_t stageRoot[WS_PATH_MAX];
     wchar_t logPath[WS_PATH_MAX];
+    /* Optional structured audit sink (WINSTAGE_AUDIT_LOG): one JSONL line per
+     * hooked file/registry operation, so an outside program can count what the
+     * agent read and modified without parsing the verbose text log. Empty = off. */
+    wchar_t auditPath[WS_PATH_MAX];
     wchar_t configPath[WS_PATH_MAX];
     int unstagedWrites;     /* 1 = deny (default, fail closed), 2 = allow the real API */
     int disableFileFamily;  /* debug/triage: leave the file-family hooks uninstalled */
@@ -174,6 +178,14 @@ static void ws_stuck_leave_cb_(void *unused)
 /* --- ws_util.c ---------------------------------------------------------- */
 void ws_log(const char *fmt, ...);
 void ws_log_w(const wchar_t *tag, const wchar_t *detail);
+/* Structured audit sink (WINSTAGE_AUDIT_LOG). `ws_audit` appends one JSONL line
+ * (with pid/tid prefix); `ws_audit_escape_w` renders a wide path/value as an
+ * escaped UTF-8 JSON string body. Both are no-ops when auditPath is empty. */
+void ws_audit(const char *fmt, ...);
+int  ws_audit_escape_w(const wchar_t *in, char *out, size_t cch);
+/* Convenience: emit `{"op":"<op>",...}` for a single path plus an optional
+ * pre-built JSON fragment (`extra`, may be NULL). */
+void ws_audit_path(const char *op, const wchar_t *path, const char *extra);
 size_t ws_strlcpy_w(wchar_t *dst, const wchar_t *src, size_t cch);
 wchar_t *ws_strdup_w(const wchar_t *s);          /* HeapAlloc; caller frees with ws_free */
 void ws_free(void *p);

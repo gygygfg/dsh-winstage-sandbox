@@ -245,6 +245,13 @@ static HANDLE ws_create_file_core(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWO
     WS_TRACE_FILE("CreateFile request raw=%ls normalized=%ls intercept=%d access=0x%lx disp=%lu",
                   lpFileName ? lpFileName : L"(null)", norm, intercept,
                   (unsigned long)dwDesiredAccess, (unsigned long)dwCreationDisposition);
+    if (g_ws.auditPath[0] && lpFileName) {
+        char esc[WS_PATH_MAX * 3];
+        ws_audit_escape_w(lpFileName, esc, sizeof(esc));
+        ws_audit("{\"op\":\"file.open\",\"mode\":\"%s\",\"path\":\"%s\",\"disp\":%lu}",
+                 (writeAccessMask || destructiveMask) ? "write" : "read", esc,
+                 (unsigned long)dwCreationDisposition);
+    }
     if (!intercept) {
         return isAnsi ? g_orig.CreateFileA((LPCSTR)lpFileName, dwDesiredAccess, dwShareMode,
                                            lpSecurityAttributes, dwCreationDisposition,
@@ -461,6 +468,9 @@ BOOL WINAPI ws_DeleteFileW(LPCWSTR lpFileName)
     int intercept = ws_should_intercept(lpFileName, norm, WS_PATH_MAX);
     WS_TRACE_FILE("DeleteFileW request raw=%ls normalized=%ls intercept=%d",
                   lpFileName ? lpFileName : L"(null)", norm, intercept);
+    if (g_ws.auditPath[0]) {
+        ws_audit_path("file.delete", lpFileName, NULL);
+    }
     if (!intercept) {
         return g_orig.DeleteFileW(lpFileName);
     }
@@ -557,6 +567,13 @@ BOOL WINAPI ws_MoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, DW
 {
     WS_STUCK("MoveFileExW");
     ws_stuck_path(lpExistingFileName);
+    if (g_ws.auditPath[0]) {
+        char e1[WS_PATH_MAX * 3];
+        char e2[WS_PATH_MAX * 3];
+        ws_audit_escape_w(lpExistingFileName, e1, sizeof(e1));
+        ws_audit_escape_w(lpNewFileName, e2, sizeof(e2));
+        ws_audit("{\"op\":\"file.move\",\"from\":\"%s\",\"to\":\"%s\"}", e1, e2);
+    }
     return ws_move_locked(lpExistingFileName, lpNewFileName, dwFlags);
 }
 

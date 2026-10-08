@@ -47,6 +47,57 @@ extern LSTATUS ws_rstore_unstaged(const wchar_t *pathOrPlaceholder, UINT16 reaso
 /* Verbose per-operation tracing, off unless WINSTAGE_SHIM_VERBOSE=1. */
 #define WS_TRACE(...) do { if (g_ws.verbose) ws_log(__VA_ARGS__); } while (0)
 
+/* Structured audit: render a registry operation as one JSONL record with a
+ * canonical "HIVE\\subkey" name. Best-effort: an unresolvable handle logs
+ * "(unresolved)" rather than dropping the event. */
+static void ws_audit_reg(const char *op, HKEY hKey, LPCWSTR subKey, LPCWSTR value)
+{
+    if (!g_ws.auditPath[0]) {
+        return;
+    }
+    wchar_t full[WS_PATH_MAX];
+    size_t pos = 0;
+    full[0] = 0;
+    int have = 0;
+    wchar_t hive[64];
+    if (subKey) {
+        wchar_t sub[WS_PATH_MAX];
+        if (ws_key_path_of_handle(hKey, subKey, hive, 64, sub, WS_PATH_MAX)) {
+            ws_append_w(full, WS_PATH_MAX, &pos, hive);
+            if (sub[0]) {
+                ws_append_w(full, WS_PATH_MAX, &pos, L"\\");
+                ws_append_w(full, WS_PATH_MAX, &pos, sub);
+            }
+            have = 1;
+        }
+    }
+    if (!have) {
+        wchar_t canon[WS_PATH_MAX];
+        if (ws_handle_reg_path(hKey, hive, 64, canon, WS_PATH_MAX) ||
+            ws_pseudo_key_path(hKey, hive, 64, canon, WS_PATH_MAX, NULL)) {
+            ws_strlcpy_w(full, canon, WS_PATH_MAX);
+            if (subKey && subKey[0]) {
+                pos = wcslen(full);
+                ws_append_w(full, WS_PATH_MAX, &pos, L"\\");
+                ws_append_w(full, WS_PATH_MAX, &pos, subKey);
+            }
+            have = 1;
+        }
+    }
+    if (!have) {
+        ws_strlcpy_w(full, L"(unresolved)", WS_PATH_MAX);
+    }
+    char esc[WS_PATH_MAX * 3];
+    ws_audit_escape_w(full, esc, sizeof(esc));
+    if (value) {
+        char ev[1024];
+        ws_audit_escape_w(value, ev, sizeof(ev));
+        ws_audit("{\"op\":\"%s\",\"key\":\"%s\",\"value\":\"%s\"}", op, esc, ev);
+    } else {
+        ws_audit("{\"op\":\"%s\",\"key\":\"%s\"}", op, esc);
+    }
+}
+
 /* bumped on every registry mutation; invalidates the merged-enumeration cache */
 static void ws_reg_bump_generation(void);
 static HKEY ws_reg_open_real(const wchar_t *hive, const wchar_t *rel, REGSAM sam);
@@ -561,6 +612,7 @@ LONG WINAPI ws_RegCreateKeyExW(HKEY hKey, LPCWSTR lpSubKey, DWORD Reserved, LPWS
 {
     WS_STUCK("RegCreateKeyExW");
     ws_stuck_path(lpSubKey);
+    ws_audit_reg("reg.create", hKey, lpSubKey, NULL);
     return ws_create_key(hKey, lpSubKey, Reserved, lpClass, dwOptions, samDesired,
                          lpSecurityAttributes, phkResult, lpdwDisposition);
 }
@@ -657,6 +709,7 @@ LONG WINAPI ws_RegOpenKeyExW(HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions, REGSA
 {
     WS_STUCK("RegOpenKeyExW");
     ws_stuck_path(lpSubKey);
+    ws_audit_reg("reg.open", hKey, lpSubKey, NULL);
     return ws_open_key(hKey, lpSubKey, ulOptions, samDesired, phkResult);
 }
 
@@ -873,6 +926,7 @@ LONG WINAPI ws_RegSetValueExW(HKEY hKey, LPCWSTR lpValueName, DWORD Reserved, DW
 {
     WS_STUCK("RegSetValueExW");
     ws_stuck_path(lpValueName);
+    ws_audit_reg("reg.set", hKey, NULL, lpValueName);
     return ws_set_value_ex(hKey, lpValueName, NULL, Reserved, dwType, lpData, cbData, 0);
 }
 
@@ -997,6 +1051,7 @@ LONG WINAPI ws_RegQueryValueExW(HKEY hKey, LPCWSTR lpValueName, LPDWORD lpReserv
 {
     WS_STUCK("RegQueryValueExW");
     ws_stuck_path(lpValueName);
+    ws_audit_reg("reg.query", hKey, NULL, lpValueName);
     /* ★ round-3：`Reg*` 按文档不设 last error，但本函数的调用链里有
      * `MultiByteToWideChar`/`HeapAlloc`/`HeapFree` 等**会**改它的 API；
      * 载体的 CLR 初始化期大量读注册表，被污染的 last error 会被
@@ -1067,6 +1122,7 @@ LONG WINAPI ws_RegDeleteKeyExW(HKEY hKey, LPCWSTR lpSubKey, REGSAM samDesired, D
 {
     WS_STUCK("RegDeleteKeyExW");
     ws_stuck_path(lpSubKey);
+    ws_audit_reg("reg.deleteKey", hKey, lpSubKey, NULL);
     (void)Reserved;
     return ws_delete_key(hKey, lpSubKey, samDesired);
 }
@@ -1142,6 +1198,7 @@ LONG WINAPI ws_RegDeleteValueW(HKEY hKey, LPCWSTR lpValueName)
 {
     WS_STUCK("RegDeleteValueW");
     ws_stuck_path(lpValueName);
+    ws_audit_reg("reg.deleteValue", hKey, NULL, lpValueName);
     return ws_delete_value(hKey, lpValueName);
 }
 

@@ -264,6 +264,94 @@ void ws_stuck_leave(void)
     InterlockedExchange(&g_trace[idx].active, 0);
 }
 
+/* ---------------------------------------------------- structured audit sink */
+/* Independent of the verbose text log: an outside program can tail one JSONL
+ * file and count exactly which files/registry keys the agent read or modified.
+ * Off unless WINSTAGE_AUDIT_LOG points somewhere. Each line is self-contained
+ * and carries pid+tid, so lines from several injected children can be merged. */
+
+int ws_audit_escape_w(const wchar_t *in, char *out, size_t cch)
+{
+    if (!out || cch == 0) {
+        return 0;
+    }
+    out[0] = 0;
+    if (!in) {
+        return 1;
+    }
+    char tmp[WS_PATH_MAX * 3];
+    int n = WideCharToMultiByte(CP_UTF8, 0, in, -1, tmp, (int)sizeof(tmp), NULL, NULL);
+    if (n <= 0) {
+        return 0;
+    }
+    size_t o = 0;
+    for (const char *p = tmp; *p && o + 2 < cch; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '\\' || c == '"') {
+            out[o++] = '\\';
+            out[o++] = (char)c;
+        } else if (c < 0x20) {
+            out[o++] = ' ';
+        } else {
+            out[o++] = (char)c;
+        }
+    }
+    out[o] = 0;
+    return 1;
+}
+
+void ws_audit(const char *fmt, ...)
+{
+    const DWORD ws_saved_last_error = GetLastError();
+    if (!g_ws.auditPath[0]) {
+        SetLastError(ws_saved_last_error);
+        return;
+    }
+    char line[WS_LOG_MAX];
+    int n = snprintf(line, sizeof(line), "[winstage-audit][%lu][%lu] ",
+                     (unsigned long)GetCurrentProcessId(), (unsigned long)GetCurrentThreadId());
+    if (n < 0 || n >= (int)sizeof(line)) {
+        SetLastError(ws_saved_last_error);
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    int m = vsnprintf(line + n, sizeof(line) - (size_t)n - 2, fmt, ap);
+    va_end(ap);
+    if (m > 0) {
+        n += m;
+    }
+    if (n > (int)sizeof(line) - 2) {
+        n = (int)sizeof(line) - 2;
+    }
+    line[n++] = '\n';
+    line[n] = 0;
+    HANDLE h;
+    if (g_orig.CreateFileW) {
+        h = g_orig.CreateFileW(g_ws.auditPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    } else {
+        h = CreateFileW(g_ws.auditPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    }
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD wrote = 0;
+        WriteFile(h, line, (DWORD)n, &wrote, NULL);
+        CloseHandle(h);
+    }
+    SetLastError(ws_saved_last_error);
+}
+
+void ws_audit_path(const char *op, const wchar_t *path, const char *extra)
+{
+    if (!g_ws.auditPath[0]) {
+        return;
+    }
+    char esc[WS_PATH_MAX * 3];
+    ws_audit_escape_w(path, esc, sizeof(esc));
+    ws_audit("{\"op\":\"%s\",\"path\":\"%s\"%s}", op, esc, extra ? extra : "");
+}
+
 /* --------------------------------------------------------------- strings */
 
 size_t ws_strlcpy_w(wchar_t *dst, const wchar_t *src, size_t cch)
@@ -556,6 +644,10 @@ void ws_config_from_env(void)
     env_to_w(WINSTAGE_ENV_LOG, buf, WS_PATH_MAX);
     if (buf[0]) {
         ws_strlcpy_w(g_ws.logPath, buf, WS_PATH_MAX);
+    }
+    env_to_w(L"WINSTAGE_AUDIT_LOG", buf, WS_PATH_MAX);
+    if (buf[0]) {
+        ws_strlcpy_w(g_ws.auditPath, buf, WS_PATH_MAX);
     }
     /* Triage switches (default off). They exist so a single build can bisect
      * which hook family breaks a target, instead of guessing. */
