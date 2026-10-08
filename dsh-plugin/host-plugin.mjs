@@ -36,6 +36,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Config } from './schema.js'
+import { evaluateEnvironment, environmentFailureMessage } from './environment-gate.mjs'
 import { probeWin32Abi } from '../src/capability.mjs'
 import { WindowsStageExecutor, resolveDshModuleRoot } from '../src/executor.mjs'
 import { compareKey } from '../src/paths.mjs'
@@ -1388,6 +1389,31 @@ export function apply(ctx, config = {}) {
     log.info('设置里当前为关闭：暂存面已交回平台沙箱（原审批模式）；/winstage* 命令仍可见但会如实拒绝执行。')
   }
 
+  /**
+   * ★ 环境监测（fail-closed）：**不通过 ⇒ 插件拒绝启动**（apply 抛错，行不激活）。
+   *
+   * 为什么放在所有注册之前：只有早抛才能保证"一个命令面、一条路由、一个后台轮询都没有装起来"。
+   * 逃生口必须**显式**写出（`probeOnStart:false` 或 `WINSTAGE_SKIP_ENV_GATE=1`），
+   * 绝不被顺手触发；默认（开关开）判红。检查项与判定在 `environment-gate.mjs`（纯函数）。
+   *
+   * 探测只跑一次：这里的结果被后面第 3 步复用，不再重复 probe。
+   */
+  const skipEnvGate = process.env.WINSTAGE_SKIP_ENV_GATE === '1' || config.probeOnStart === false
+  let startupProbe
+  if (isEnabled() && !skipEnvGate) {
+    startupProbe = probeRuntime()
+    const report = evaluateEnvironment({ enabled: true, platform: process.platform, probeResult: startupProbe, skip: false })
+    if (!report.ok) {
+      const message = environmentFailureMessage(report)
+      const error = new Error(message)
+      error.code = report.code
+      error.winstage = { code: report.code, checks: report.checks, failures: report.failures }
+      logError(`环境监测未通过，WinStage 插件拒绝启动：${message}`)
+      throw error
+    }
+    if (config.verboseLog) log.info(environmentFailureMessage(report))
+  }
+
   // 1) 审阅面：**每个会话各有自己的暂存清单与快照**，因此不再在启动时预热全局实例；
   //    服务在命令调用时按 `invocation.agent` 现场解析（见 serviceFor）。
   /**
@@ -1526,7 +1552,7 @@ export function apply(ctx, config = {}) {
     log.info('probeOnStart=false，跳过启动探测。')
     return
   }
-  const probe = probeRuntime()
+  const probe = startupProbe ?? probeRuntime()
   if (probe.ready) {
     log.info(`能力探测通过：${probe.detail}`)
   } else {
