@@ -50,18 +50,67 @@
  *   - 不 import 任何 DSH 包（只依赖 `node:*` 与 `src/store.mjs`）；
  *   - 不动 `manifest.json` 之外的任何状态机文件，不写 `review.json`（发布快照是
  *     `ReviewService.publish()` 的职责）。
+ *
+ * ── 痕迹边界（本轮复核结论，**必须保持**）───────────────────────────────────
+ * 本模块**没有任何模型可见通道**：
+ *   - `log` 默认是**空实现**（`() => {}`，见 `createRunCapture()`），生产由 host 侧注入
+ *     `ctx.logger`（人工侧：宿主控制台 / 日志文件），**绝不**写进任何命令的
+ *     stdout/stderr；
+ *   - 返回值 `{ changes, staged, restored, failures }` 只交给调用方（`warn()` → error 级
+ *     日志 + `handle.winstage.*`），`shell-executor.mjs` 已不再把它拼进 stderr
+ *     （见那里的 `settledExecution()`：模型可见输出 = 命令自己的输出，逐字节一致）。
+ *   ⚠ 改动本文件时不要新增任何 `process.stdout.write` / `console.log`：那会把
+ *     "暂存/捕获/候选"这类机制字样泄漏到模型可见面（README 缺陷 12 的同类自伤）。
+ *
+ * ── Phase 1 / WP2（成功即存在：跨进程回读）────────────────────────────────────
+ *   `verifyStagedChange()` 是捕获路径的**唯一**成功判据，三条判据读的全是磁盘：
+ *     ① 内容戳：`blobs/<aa>/<hash>` 的 sha256 == 捕获到的 after hash；
+ *     ② 磁盘 `manifest.json`（"新进程看到的那一份"）里有该键且 hash 一致；
+ *     ③ **逐字节**：blob、物化对象、本次从真实主机读到的 after 字节三者两两相等。
+ *   任一不成立 ⇒ `failures[].phase='verify'` + error 级日志，**该条不进候选**、
+ *   不计入 `staged`、也**不做还原**（没被证明存在的东西不配当"已完成"）。
+ *   失败文案取 `CAPTURE_FAILURE_TEXT`（零机制字样，见那里的说明）；机制细节只在
+ *   `error.problems` / `error.detail` 与 error 级日志里。
  */
 
 import { existsSync, lstatSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { isAbsolute, join, normalize, relative, sep } from 'node:path'
 import { canonical } from '../src/paths.mjs'
-import { STATE, hashAbsent, isExternalKey, writeFileAtomic } from '../src/store.mjs'
+import { STATE, hashAbsent, isExternalKey, sha256Buffer, writeFileAtomic } from '../src/store.mjs'
 
 /** 镜像索引的文件名（与 Store 的三份状态机文件并列，但**属于本模块**） */
 export const MIRROR_BASENAME = 'capture-mirror.json'
 
 /** 镜像格式版本：形状变了就必须能被读出来识别，解析失败的镜像一律当"无镜像" */
 export const MIRROR_VERSION = 1
+
+/**
+ * `stagedDir` 下的**第二套布局**：shim/shell 通道的落点 `fs\<盘符>\<绝对路径>`。
+ *
+ * ⚠ 口径必须与 `dsh-plugin/staging-fs.mjs::shimLayoutPathOf()`（以及
+ *   `src/workspace.mjs:118-157` 的 `ws_fs_map()` 逆映射）**逐字一致**：
+ *   `C:\a\b` → `<staged>\fs\C\a\b`、`\\server\share\x` → `<staged>\fs\_unc\server\share\x`。
+ *   本模块**刻意不 import** `staging-fs.mjs`（那个模块在装载时就去解析 DSH 安装位置、
+ *   拿不到就抛；本模块的零依赖离线自测契约不允许被它牵连），所以这里只复制这一条映射。
+ *   改了任何一边都必须同时改另一边 —— 两处不一致会让"互见"变成"看不见"。
+ */
+export function shimLayoutPathOf(stagedDir, abs, leaf = 'fs') {
+  if (typeof stagedDir !== 'string' || stagedDir.length === 0) return undefined
+  const normalized = normalize(String(abs))
+  let drive
+  let rest
+  if (normalized.startsWith('\\\\')) {
+    drive = '_unc'
+    rest = normalized.slice(2)
+  } else {
+    const match = /^([a-zA-Z]):[\\/]?(.*)$/.exec(normalized)
+    if (!match) return undefined
+    drive = match[1].toUpperCase()
+    rest = match[2]
+  }
+  const parts = rest.split(/[\\/]+/).filter((part) => part.length > 0)
+  return join(stagedDir, leaf, drive, ...parts)
+}
 
 /** 默认监视集：工作区根 */
 const DEFAULT_ROOTS = (workspaceRoot) => [workspaceRoot]
@@ -81,6 +130,20 @@ const DEFAULT_MAX_FILES = 5000
 
 /** 每个监视文件最多记多少条 skip 记录（不设上限会让 `skipped` 在巨大仓库里爆掉） */
 const MAX_SKIP_RECORDS = 200
+
+/**
+ * Phase 1 / WP2：**模型可见的失败文案**（本模块唯一的模板来源）。
+ *
+ * ⚠ 本模块**没有**模型可见通道（见文件头"痕迹边界"）：`failures[]` 只交给调用方，
+ * 由 `shell-executor.mjs` 记进 error 级日志 + `handle.winstage.*`，**绝不**拼进
+ * stdout/stderr。因此这里的文案约束是**防御性**的：即使将来有人把 `error.message`
+ * 渲染给模型，也不会有机制字样泄漏（禁用词清单见 `src/stage-guard.mjs`
+ * `FORBIDDEN_MODEL_TEXT`；`_r3/wp2-test.mjs` 用 `checkTransparentMessages()` 机检，
+ * 并逐条断言本文件里没有 `process.stdout.write` / `console.log`）。
+ */
+export const CAPTURE_FAILURE_TEXT = Object.freeze({
+  writeNotPersisted: (displayPath) => `cannot save "${displayPath}": the change could not be read back from disk and is not reported as applied`,
+})
 
 function isReparse(info) {
   if (!info) return false
@@ -447,6 +510,139 @@ export function createRunCapture(options = {}) {
   }
 
   /**
+   * ★ BUG-1 + WP2：**落暂存之后必须回读确认**，否则"暂存成功"就是一句没有证据的话。
+   *
+   * 判据（全部读**磁盘**，不看内存里的那个对象）：
+   *   文件类：① 内容戳 —— `sha256(blobs/<aa>/<afterHash>)` == `afterHash`；
+   *          ② 磁盘 `manifest.json` 里有该键且 `stagedHash == afterHash`；
+   *          ③ **逐字节**：`blobs/<aa>/<afterHash>`、物化对象（`staged/<rel>` 或
+   *             `staged-ext/...`）与**本次捕获到的 after 内容**三者两两相等
+   *             （WP2 新增：只比哈希会漏掉"哈希对、字节被换过"的形态；
+   *              哈希相等只是内容戳，**不是**内容本身）。
+   *   删除类：清单条目的 `state` 是 `DELETED`，且物化对象**已经不在**磁盘上。
+   * 任一不成立 ⇒ 抛 `staging_write_not_persisted`，由 `capture()` 记一条 `phase:'verify'`
+   * 的失败并**不把这条变化冻结进候选**（"返回成功但产物不存在"绝不能变成一条可批准的候选）。
+   *
+   * @param {object} change 变化记录
+   * @param {string} key 清单键
+   * @param {Buffer|undefined} afterBytes **提交内容**（本次从真实主机读到的 after 字节）
+   */
+  function verifyStagedChange(change, key, afterBytes) {
+    const problems = []
+    let stagedPath
+    try {
+      stagedPath = store.stagedPath(key)
+    } catch (error) {
+      problems.push(`stagedPath-unresolved(${error.message})`)
+      stagedPath = undefined
+    }
+    const entry = workspace.entryOf(key)
+    const hashOfFile = (path) => {
+      try {
+        return sha256Buffer(readFileSync(path))
+      } catch (error) {
+        return `unreadable:${error.code ?? error.message}`
+      }
+    }
+    const bytesOfFile = (path) => {
+      try {
+        return readFileSync(path)
+      } catch (error) {
+        return `unreadable:${error.code ?? error.message}`
+      }
+    }
+
+    if (change.kind === 'deleted') {
+      if (!entry) problems.push('manifest-entry-missing')
+      else if (entry.state !== STATE.DELETED) problems.push(`manifest-state=${entry.state}`)
+      if (stagedPath && existsSync(stagedPath)) problems.push(`staged-object-still-present(${stagedPath})`)
+    } else {
+      const expected = change.afterHash
+      // ① 内容戳：磁盘上的 blob 必须真的是这次提交的内容
+      if (!store.hasBlob(expected)) problems.push(`blob-missing(${expected})`)
+      else {
+        const found = hashOfFile(store.blobPath(expected))
+        if (found !== expected) problems.push(`blob-hash-mismatch(on-disk=${found})`)
+      }
+      // ② 磁盘 manifest（"新进程看到的那一份"）
+      try {
+        const raw = JSON.parse(readFileSync(join(String(store.dir), 'manifest.json'), 'utf8'))
+        const persisted = raw?.entries?.[key]
+        if (!persisted) problems.push('manifest-not-persisted')
+        else if (persisted.stagedHash !== expected) problems.push(`manifest-persisted-hash-mismatch(${persisted.stagedHash})`)
+      } catch (error) {
+        problems.push(`manifest-unreadable(${error.code ?? error.message})`)
+      }
+      if (!entry) problems.push('manifest-entry-missing')
+      else if (entry.stagedHash !== expected) problems.push(`manifest-hash-mismatch(${entry.stagedHash})`)
+      // ③ 物化对象存在 + 逐字节等于提交内容（并与 blob 互校）
+      const blobBytes = store.hasBlob(expected) ? bytesOfFile(store.blobPath(expected)) : undefined
+      let stagedBytes
+      if (stagedPath === undefined || !existsSync(stagedPath)) problems.push(`staged-object-missing(${stagedPath})`)
+      else stagedBytes = bytesOfFile(stagedPath)
+      if (typeof stagedBytes === 'string') problems.push(`staged-object-unreadable(${stagedBytes})`)
+      else if (Buffer.isBuffer(stagedBytes)) {
+        if (Buffer.isBuffer(afterBytes) && !stagedBytes.equals(afterBytes)) {
+          problems.push(`staged-object-bytes-mismatch(on-disk=${stagedBytes.length} submitted=${afterBytes.length})`)
+        }
+        if (Buffer.isBuffer(blobBytes) && !blobBytes.equals(stagedBytes)) problems.push('blob-bytes-mismatch')
+      }
+      if (Buffer.isBuffer(afterBytes) && Buffer.isBuffer(blobBytes) && !blobBytes.equals(afterBytes)) {
+        problems.push(`blob-bytes-vs-submitted-mismatch(on-disk=${blobBytes.length} submitted=${afterBytes.length})`)
+      }
+      if (!Buffer.isBuffer(afterBytes)) problems.push('submitted-bytes-unavailable')
+    }
+
+    if (problems.length === 0) return { key, stagedPath, verified: true }
+    const error = new Error(CAPTURE_FAILURE_TEXT.writeNotPersisted(change.abs))
+    error.code = 'staging_write_not_persisted'
+    error.key = key
+    error.stagedPath = stagedPath
+    // 机制细节只在**非 message 属性**与 error 级日志里（模型可见面零痕迹）
+    error.problems = problems
+    error.detail = problems.join('; ')
+    return { key, stagedPath, verified: false, error, problems }
+  }
+
+  /**
+   * ★ BUG-2：**同一逻辑目标在两套布局里都有落点** —— 必须在日志里响一次，并记进报告。
+   *
+   * 本模块的落点是清单键（`staged/<rel>` / `staged-ext/...`），shim/shell 通道的落点是
+   * `<staged>\fs\<盘符>\<绝对路径>`。3079/3081 实测：宿主工具写 `<ws>\_hostonly\a.txt`
+   * 落在 `<stage>\_hostonly\a.txt`，而 pwsh 写同类目标落在 `<stage>\fs\C\...\ws\_hostonly\a.txt`
+   * —— 两边互相看不见，却都会进同一份 `review.json`。这条告警就是那个事实的可见面
+   * （`log(..., 'error')` 在宿主侧走 error 级日志；本模块**不写** stdout/stderr，
+   *   见文件头的"痕迹边界"）。
+   */
+  function detectSplit(change, key) {
+    const stagedDir = store.stagedDir
+    const twin = shimLayoutPathOf(stagedDir, change.abs, 'fs')
+    const whiteout = shimLayoutPathOf(stagedDir, change.abs, 'wo')
+    const twinExists = twin !== undefined && existsSync(twin)
+    const whiteoutExists = whiteout !== undefined && existsSync(whiteout)
+    if (!twinExists && !whiteoutExists) return undefined
+    const record = {
+      key,
+      abs: change.abs,
+      stagedPath: (() => {
+        try {
+          return store.stagedPath(key)
+        } catch {
+          return undefined
+        }
+      })(),
+      otherLayout: twinExists ? { layout: 'shim-fs', path: twin } : { layout: 'shim-fs-whiteout', path: whiteout },
+    }
+    log(
+      `[run-capture] 暂存落点分裂（BUG-2）：同一逻辑目标 ${change.abs} 在两套布局里都有落点 —— ` +
+        `清单落点 ${record.stagedPath}（本模块写入归一到这里）；shim/shell 落点 ${record.otherLayout.path}。` +
+        '读取时两边都看（staging-fs.mjs），但清单/审批只认前者，后者不会被自动清理。',
+      'error',
+    )
+    return record
+  }
+
+  /**
    * ① 建立"执行前镜像"：遍历监视集，把每个文件的内容落成 blob，写进镜像索引。
    * @returns {Promise<{files: number, bytes: number, skipped: Array<{path: string, reason: string}>, index: object, before: Map}>}
    */
@@ -556,7 +752,10 @@ export function createRunCapture(options = {}) {
   /**
    * ④ 完整一次捕获。
    *
-   * 返回 `{ changes, staged, restored, failures }`，`failures[].phase ∈ 'blob'|'stage'|'restore'|'freeze'`。
+   * 返回 `{ changes, staged, restored, failures, splits }`，
+   * `failures[].phase ∈ 'blob'|'stage'|'verify'|'restore'|'freeze'`
+   * （`'verify'` = 落暂存后**回读确认**失败：产物不存在或内容不一致 ⇒ 该条**不进候选**；
+   *   `'stage'` 仍是"写暂存这一步本身抛错"）。
    * **绝不抛异常**：任何单点失败都进 `failures` 并同时 `log(..., 'error')`。
    *
    * 每条变化按 a) 落 after blob → b) 落暂存条目（工作区内相对键 / 工作区外规范化绝对键 +
@@ -618,12 +817,21 @@ export function createRunCapture(options = {}) {
     const { changes: changeRecords, lookup } = await diffAgainst(base)
     /** 本次真正落成暂存条目（并已钉住 before 基线）的变化 */
     const stagedChanges = []
+    /** ★ BUG-2：本次捕获里"同一逻辑目标在两套布局都有落点"的记录（会同时进 error 级日志） */
+    const splits = []
 
     for (const change of changeRecords) {
-      // (a) after 内容落 blob
+      // (a) after 内容落 blob（同时把**提交内容**的字节留在手里：回读时要逐字节比对）
+      let afterBytes
       if (change.kind !== 'deleted') {
         try {
-          afterHashOf(change.abs)
+          afterBytes = readFileSync(change.abs)
+          const hash = store.putBlob(afterBytes)
+          // 捕获时的内容戳必须与判变时算出来的那一个相同，否则"提交内容"这句话就不成立
+          if (hash !== change.afterHash) {
+            noteFailure(change.abs, 'blob', `内容戳与判变结果不一致：${hash} != ${change.afterHash}`)
+            continue
+          }
         } catch (blobError) {
           noteFailure(change.abs, 'blob', `落 after blob 失败：${blobError.message}`)
           continue
@@ -636,6 +844,20 @@ export function createRunCapture(options = {}) {
         noteFailure(change.abs, 'stage', `落暂存条目失败：${stageError.message}`)
         continue
       }
+      // (b1) ★ BUG-1 / WP2：回读确认（内容戳 + 磁盘 manifest + **逐字节**）
+      //      不成立就**不进候选**，也不计入 staged
+      const verification = verifyStagedChange(change, change.key, afterBytes)
+      if (verification.verified !== true) {
+        noteFailure(
+          change.abs,
+          'verify',
+          `落暂存后回读确认失败（BUG-1，产物不存在或内容不一致，未冻结候选）：${verification.error.detail}`,
+        )
+        continue
+      }
+      // (b2) ★ BUG-2：分裂检测（可见告警 + 报告字段）
+      const split = detectSplit(change, change.key)
+      if (split) splits.push(split)
       stagedChanges.push(change)
     }
 
@@ -748,11 +970,11 @@ export function createRunCapture(options = {}) {
     if (changeRecords.length > 0) {
       log(
         `[run-capture] 捕获完成：变化 ${changeRecords.length} 条（入暂存 ${stagedChanges.length} 条，` +
-          `还原 ${restored} 条，失败 ${failures.length} 条）`,
-        failures.length > 0 ? 'error' : 'info',
+          `还原 ${restored} 条，失败 ${failures.length} 条，落点分裂 ${splits.length} 条）`,
+        failures.length > 0 || splits.length > 0 ? 'error' : 'info',
       )
     }
-    return { changes: changeRecords, staged: stagedChanges.length, restored, failures }
+    return { changes: changeRecords, staged: stagedChanges.length, restored, failures, splits }
   }
 
   return { prime, snapshot, diff, capture, mirrorPath, roots: [...roots], exclude: [...exclude] }

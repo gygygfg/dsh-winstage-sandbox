@@ -22,9 +22,31 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join, parse, resolve, sep } from 'node:path'
 import { tmpdir } from 'node:os'
 import { resolveDshModuleRoot } from './executor.mjs'
+// 缺陷③（Fix B）：陈旧 AppContainer 包 SID ACE 的判据与落地只从 executor 来（不重写判据）
+import { repairStaleAppContainerAces } from './executor.mjs'
+// ── Phase 2 / WP1：暂存根的**授权目标解析**与稳定错误码只从 executor 来 ─────────────
+// 本文件**不**自己拼暂存路径、也不自己造错误码：`stageGrantTarget()` 与
+// `STAGE_GRANT_FAILED` 在同一条链上只有一份实现（重复一份必然与 WP0 的
+// `resolveStageRoot()` 漂移）。这里 import + 再导出，方便 WP2/WP4 从 `capability.mjs`
+// 单点取到"根从哪来"的判定，而不用关心它落在哪个文件。
+import { STAGE_GRANT_FAILED, ensureStageGrant, stageGrantError, stageGrantTarget, verifyStageGrantAce } from './executor.mjs'
+export { STAGE_GRANT_FAILED, ensureStageGrant, stageGrantError, stageGrantTarget, verifyStageGrantAce }
+// WP1 的透明性机检复用 WP0 的**唯一判据**（`FORBIDDEN_MODEL_TEXT`），不另写一份词表。
+import { FORBIDDEN_MODEL_TEXT, checkTransparentMessages } from './stage-guard.mjs'
+export { FORBIDDEN_MODEL_TEXT, checkTransparentMessages }
+// ── Phase 2 / WP10：探针一律用 WP0 的**根解析**（本文件不拼任何暂存路径）────────────
+// 两处探针曾经自带 `<root>\.dshstage` 拼法：
+//   · `instanceChecks()` 的"工作区可写"与"暂存基目录同卷"；
+//   · `measureAppContainerIsolation()` 的默认探针根。
+// 三者现在都从 `resolveStageRoot({sessionKey, workspaceRoot, env})` 取根 —— 也就是
+// 缓存面 `%LOCALAPPDATA%\Temp\winstage-stage\<会话键>`。路径只有一份实现：拼一次就会与
+// WP0 漂移一次（WP1 在 executor 侧已经踩过同一个坑）。这里 import + 再导出，方便测试
+// 从单点断言"探针到底用的是哪一个根"。
+import { resolveStageRoot } from './stage-guard.mjs'
+export { resolveStageRoot }
 // T0 隔离判据**只从这一处来**：本文件不自己造判据，避免"两处漂移"
 // （`readProcessTokenFacts` = 令牌证据；`assessAppContainerIsolation` = 五项判据缺一即 false）。
 // 静态 import（不是 require_）：它是 ESM 模块，`createRequire` 解析不了 `.mjs`。
@@ -34,6 +56,13 @@ import {
   readProcessTokenFacts,
 } from './appcontainer-runtime.mjs'
 import { WINDOWS_HIDE, suppressWindowsCriticalErrorDialogs } from './spawn-window.mjs'
+// ── 三轮接线：三个新维度（网络策略 / 进程缓解策略 / 资源上限）的报告来源 ────────────
+// 本文件**不**自己判定这三件事，只把三个模块的判定结果折成摘要写进报告。
+// 三条硬约束：默认值不改变任何既有结论；任何一步抛错都降级为显式 `unknown`；
+// `enforced:true` 只可能来自 netpolicy 的**安装证据 + 回读**（本文件不制造它）。
+import { resolveNetworkPolicy, summariseNetworkPolicy } from './netpolicy.mjs'
+import { buildMitigationPolicy, summariseMitigations, MITIGATION_PROFILE_NAMES } from './mitigations.mjs'
+import { wrapLimits, summariseLimits } from './limits.mjs'
 
 suppressWindowsCriticalErrorDialogs()
 
@@ -356,7 +385,34 @@ export function probeWin32Abi() {
         const handle =
           OpenProcess(PROCESS_TERMINATE | PROCESS_SET_QUOTA | PROCESS_QUERY_INFORMATION, false, probe.pid) || null
         if (!handle) {
-          return no(`OpenProcess(pid=${probe.pid}) failed (GetLastError=${GetLastError()})`, {
+          const openError = GetLastError()
+          // ── 分类：把"本上下文打不开自己派生的子进程"与"Job 不可用"分开（T2 收尾）────
+          // `[实测]` 受限会话下 `OpenProcess(pid, PROCESS_TERMINATE|SET_QUOTA|QUERY)` 返回 NULL +
+          // `GetLastError=5`（ACCESS_DENIED）—— 它来自**进程准入边界**（受限令牌的 restricting
+          // 检查 / 沙箱 driver），不是产品缺陷，也不是"Job Object 不可用"。
+          // 按手册 0.1 的证据分层，这里记 `unknown`（**本上下文无法实测**该判据），
+          // 与 `tests\probe-selfkill-guard.mjs` 的 `SUITE-CLASS: requires-unconstrained-session`
+          // 对应（README §1.1 的 B/C 段同类）。
+          // ⚠ fail-closed **不变**：`selectTier()` 要求 `jobObject.status === PASS`，
+          //   因此 unknown 与 fail 在档位判定上完全等价（都不会给出需要 Job 的升级档位）。
+          //   这里**绝不**返回 pass —— 那才是"把环境边界洗成可用"。
+          if (openError === 5) {
+            return unknown(
+              `OpenProcess(pid=${probe.pid}) denied (GetLastError=5 ACCESS_DENIED): this session cannot open its own derived child, ` +
+                'so job ownership cannot be measured here. Classified as a session boundary (requires an unconstrained session), ' +
+                'NOT as "Job Object unavailable" — and NOT as pass: fail-closed is preserved because selectTier requires status=pass.',
+              {
+                evidence: '[实测]',
+                boundary: 'open-process-denied',
+                win32Code: 5,
+                childSpawned: true,
+                childPid: probe.pid,
+                childKind: probe.kind,
+                selfAssigned: false,
+              },
+            )
+          }
+          return no(`OpenProcess(pid=${probe.pid}) failed (GetLastError=${openError})`, {
             evidence: '[实测]',
             childSpawned: true,
             childPid: probe.pid,
@@ -698,10 +754,43 @@ export function planAppContainerIsolationProbe(context = {}) {
  *
  * @param {{workspaceRoot: string, probeRoot?: string, profileName?: string, timeoutMs?: number}} options
  */
+/**
+ * 隔离探针的**默认探针根**（纯函数：不碰 fs、不建目录，因此可离线断言）。
+ *
+ * ── Phase 2 / WP10：默认根从工作区搬到缓存面 ─────────────────────────────────────
+ * 改动前：`join(workspaceRoot, `.dshstage`, 'appcontainer-probe-<stamp>')` ——
+ * 探针一跑就在工作区里建出 `.dshstage`（污染工作区，且与 owner 的决定相反：
+ * 暂存面在 `%LOCALAPPDATA%\Temp\winstage-stage\<会话键>`）。
+ * 现在：`<resolveStageRoot({sessionKey, workspaceRoot, env})>\appcontainer-probe-<stamp>`。
+ * 为什么是**会话根之下**而不是别处：这个探针要证明的正是"暂存目录在区内可写"，
+ * 因此它的落点必须与真实暂存面同一棵树、同一卷 —— 否则证出来的东西与执行路径无关
+ * （手册 #5.1：探测场景必须与真实执行场景一致）。
+ * `probeRoot` 显式给出时**逐字采用**（测试 / 单实例注入通道，与 WP1 的 override 同形）。
+ *
+ * @param {{workspaceRoot?:string, probeRoot?:string, sessionKey?:string, env?:object, stamp?:string}} [options]
+ * @returns {string} 探针根（绝对路径）
+ */
+export function appContainerProbeRoot(options = {}) {
+  const explicit = options.probeRoot
+  if (explicit !== undefined && explicit !== null && String(explicit).trim() !== '') {
+    return resolve(String(explicit))
+  }
+  const workspaceRoot = options.workspaceRoot ? resolve(options.workspaceRoot) : process.cwd()
+  const stamp = options.stamp ?? `${Date.now().toString(36)}${process.pid.toString(36)}`
+  return join(resolveStageRoot({ sessionKey: options.sessionKey, workspaceRoot, env: options.env }), `appcontainer-probe-${stamp}`)
+}
+
 export function measureAppContainerIsolation(options = {}) {
   const workspaceRoot = resolve(options.workspaceRoot || process.cwd())
   const stamp = `${Date.now().toString(36)}${process.pid.toString(36)}`
-  const probeRoot = options.probeRoot ? resolve(options.probeRoot) : join(workspaceRoot, '.dshstage', `appcontainer-probe-${stamp}`)
+  // WP10：默认探针根 = 缓存面的会话暂存根（不再是工作区里的 `.dshstage`）。
+  const probeRoot = appContainerProbeRoot({
+    workspaceRoot,
+    probeRoot: options.probeRoot,
+    sessionKey: options.sessionKey,
+    env: options.env,
+    stamp,
+  })
   const profileName = options.profileName || `dsh.stage.iso.${stamp}`
   const childTimeoutMs = options.timeoutMs ?? APPCONTAINER_ISOLATION_CHILD_TIMEOUT_MS
 
@@ -967,12 +1056,150 @@ function win32BoolForProbe(value) {
 }
 
 /**
+ * 三轮接线：把三个新维度（网络策略 / 缓解策略 / 资源上限）折成**报告摘要**。
+ *
+ * ── 为什么要有这一层（而不是把三行直接写进 `probe()`）──────────────────────────
+ *   1. `probe()` 内部任何一步抛错都会毁掉整份报告；而这三个维度里有**调用方可控输入**
+ *      （未知档位名、非法上限、缺 GUID…）。要求是"任何探测失败都降级成显式 unknown，
+ *      绝不抛进报告构建"，因此每个维度都必须单独 try/catch。
+ *   2. 缓存命中路径也要走同一份口径（`probe()` 的缓存分支），两处写三行必然会漂移。
+ *
+ * ── 默认值（逐字保持接线前的语义）──────────────────────────────────────────────
+ *   · `networkTier`      默认 `OBSERVED_ONLINE`：`resolveNetworkPolicy()` 对非 OFFLINE 档位
+ *     在**第 5 步计划**就以 `WFP_TIER_NOT_IMPLEMENTED` 明确拒绝构造计划 ⇒
+ *     `state:'not-implemented'`、`enforced:false`，并且**一次绑定表调用都不做**
+ *     （判定顺序里的绑定表/探测/引擎打开全部只在 `isOffline` 分支里）。
+ *   · `mitigationProfile` 默认 `none`：**刻意不用** `mitigations.mjs` 的
+ *     `DEFAULT_MITIGATION_PROFILE='baseline'` —— 默认必须与接线前一致，`baseline`/`hardened`/
+ *     `untrusted` 一律 opt-in，报告里只是"**打算**注入什么"，不等于已生效。
+ *   · `limits`           默认 `DEFAULT_LIMITS`（staging 64 GiB / output 4 MiB / 200000 行）。
+ *
+ * ── 可注入点（透传，便于离线确定性测试）────────────────────────────────────────
+ *   `networkTier` `networkBindings`(WFP 绑定表) `networkProbe` `networkGuids` `networkPin`
+ *   `networkInstall` `networkAudit` `networkTarget` `mitigationProfile` `limits`
+ *   ⚠ `networkInstall` 不是"随便一个 { installed:[...] }"：它必须由
+ *   `netpolicy.installNetworkPolicy()` 产出，否则一律降级为"未强制"（D2，见上）。
+ *
+ * @returns {{networkPolicy:object, mitigations:object, limits:object}} 三个都为**非 null 对象**，
+ *   失败时是显式的 `{state:'unknown', reason, ...}`（字段形状与成功时一致，便于消费方直接读）。
+ */
+export function capabilityDimensions(options = {}) {
+  return {
+    networkPolicy: capabilityNetworkPolicySummary(options),
+    mitigations: capabilityMitigationSummary(options),
+    limits: capabilityLimitsSummary(options),
+  }
+}
+
+/**
+ * 网络策略维度。委托 `resolveNetworkPolicy()` 判定，再经 `summariseNetworkPolicy()`
+ * 收成固定五键（`tier/state/enforced/verified/reason`）。
+ *
+ * ⚠ 本函数**只判定、不安装**：能力报告是只读面。`enforced:true` 只有在调用方把
+ * `networkInstall`（**必须**是 `installNetworkPolicy()` 亲自产出的对象）与同一份
+ * `networkAudit` 一并注入、且该证据与本 `networkBindings` 同源时才可能出现。
+ *
+ * D2 修复：`resolveNetworkPolicy()` 现在对安装证据做**来源校验**（模块私有 `WeakMap`
+ * + 私有品牌符号），调用方自造的 `{ installed: [...] }`（哪怕形状完全正确）会被判为
+ * 不可信并降级成 `state:'not-enforced'` / `enforced:false`
+ * （`[实测]` 本机离线替身：修复前该输入能报 `enforced:true`，而底层 `FwpmFilterAdd0`
+ * 调用 0 次；修复后同一输入 ⇒ `enforced:false`，`tests/netpolicy.mjs` 的 2g–2l 钉死）。
+ */
+function capabilityNetworkPolicySummary(options) {
+  const tier = options.networkTier ?? 'OBSERVED_ONLINE'
+  try {
+    return summariseNetworkPolicy(
+      resolveNetworkPolicy({
+        requested: tier,
+        api: options.networkBindings ?? null,
+        probe: options.networkProbe ?? null,
+        guids: options.networkGuids ?? null,
+        target: options.networkTarget ?? 'appcontainer',
+        pin: options.networkPin ?? null,
+        install: options.networkInstall ?? null,
+        audit: options.networkAudit ?? null,
+      }),
+    )
+  } catch (error) {
+    // 降级方向是**收紧**：不返回 enforced，也不假装是某个已知状态。
+    return {
+      tier,
+      state: 'unknown',
+      enforced: false,
+      verified: false,
+      reason: `网络策略判定抛错，降级为 unknown（不上报任何强制）：${error.code ?? ''} ${error.message}`.trim(),
+    }
+  }
+}
+
+/**
+ * 缓解策略维度。委托 `buildMitigationPolicy()` 构造 + `summariseMitigations()` 摘要。
+ *
+ * 默认 `none`（`noop:true`）：报告里 `profile` 就是调用方点名的档位，
+ * **不得**被读成"已注入"；真正注入与否由 `src/appcontainer-runtime.mjs` 的启动路径决定
+ * （`[未实测]` 本机未跑过真实 `CreateProcess`，`0x00020010` 只有宏推导 + 同规则已实测的
+ * `0x00020009` 这一条证据链）。
+ */
+function capabilityMitigationSummary(options) {
+  const profile = options.mitigationProfile ?? 'none'
+  try {
+    return {
+      ...summariseMitigations(buildMitigationPolicy({ profile })),
+      // 报告里必须能一眼看出"这是 opt-in 的打算，不是已生效的既成事实"：
+      // 默认档是 `none`；真正注入发生在 `src/appcontainer-runtime.mjs` 的启动路径上
+      // （`[未实测]` 本机未跑过真实 CreateProcess，0x00020010 未被真实内核接受过）。
+      optIn: true,
+      defaultProfile: 'none',
+      profiles: [...MITIGATION_PROFILE_NAMES],
+      note:
+        'opt-in：默认档为 none（不注入任何策略）；baseline/hardened/untrusted 必须由调用方显式点名。' +
+        '本报告只说"打算写进 PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY 的位"，' +
+        '真实是否被内核接受/生效需子进程侧观测，本机未实测。',
+    }
+  } catch (error) {
+    return {
+      profile,
+      flags: null,
+      names: [],
+      attribute: null,
+      size: null,
+      noop: null,
+      state: 'unknown',
+      reason: `缓解策略构造失败，降级为 unknown（不得据此声称已注入任何策略）：${error.code ?? ''} ${error.message}`.trim(),
+    }
+  }
+}
+
+/** 资源上限维度。委托 `wrapLimits()`（fail-closed 校验）+ `summariseLimits()`。 */
+function capabilityLimitsSummary(options) {
+  try {
+    return summariseLimits(wrapLimits(options.limits))
+  } catch (error) {
+    return {
+      stagingBytes: null,
+      stagingGiB: null,
+      maxOutputBytes: null,
+      maxOutputLines: null,
+      source: 'unknown',
+      stagingSource: null,
+      outputSource: null,
+      state: 'unknown',
+      reason: `资源上限解析失败，降级为 unknown（不得据此声称有上限）：${error.code ?? ''} ${error.message}`.trim(),
+    }
+  }
+}
+
+/**
  * 完整探测。
  *
  * @param {{root: string, cacheDir?: string, useCache?: boolean,
  *          appContainerIsolationProbe?: boolean, appContainerIsolationCache?: boolean,
  *          appContainerIsolationTtlMs?: number, appContainerIsolationProbeRoot?: string,
  *          appContainerIsolationSwitches?: {disabled:boolean,forced:boolean,source:string|null}}} options
+ *
+ * WP10 起，`sessionKey` / `env` / `stageRoot`（别名 `stagingRoot`）也喂给
+ * `instanceChecks()`：实例探针判的根必须与授权（WP1）/陈旧 ACE 修复（缺陷③）判的根一致，
+ * 否则报告里的"同卷"结论说的是另一个位置。
  *
  * `appContainerIsolationProbe` 默认 **true**（= 允许在"能建 profile"的会话里跑一次真实
  * 隔离测量并落盘缓存）；它在受限会话里会因为 `appContainer` 探测不是 pass 而**一次都不跑**。
@@ -983,14 +1210,27 @@ export function probe(options) {
   const fp = environmentFingerprint({ root })
   const cacheDir = options.cacheDir
   const cacheFile = cacheDir ? join(cacheDir, `capability-${fp.digest}.json`) : undefined
+  // WP10：实例检查的根解析通道与 `repairStaleStagingAcesForRoot()` **同一套**
+  // （显式 override > `resolveStageRoot()`），因此"探针判的是哪个根"与"授权/修复的是
+  // 哪个根"不会漂移。
+  const instanceOptions = {
+    sessionKey: options.sessionKey,
+    env: options.env,
+    stageRoot: options.stageRoot,
+    stagingRoot: options.stagingRoot,
+  }
 
   if (options.useCache && cacheFile && existsSync(cacheFile)) {
     const cached = safe(() => JSON.parse(readFileSync(cacheFile, 'utf8')), () => undefined)
     if (cached && cached.fingerprint === fp.digest) {
       // 手册 #5.5：缓存命中也要做实例级必要检查
-      const instance = instanceChecks(root)
+      const instance = instanceChecks(root, instanceOptions)
+      // ★ 三轮接线：三个新维度**不进**环境指纹（它们是调用方选项，不是环境事实），
+      //   因此缓存报告必须在返回前**重新计算**一遍 —— 否则旧缓存会让新维度整个消失，
+      //   形成"接线过了但报告里看不到"的静默回退（同一份口径见 capabilityDimensions）。
+      const cachedReport = { ...cached, ...capabilityDimensions(options) }
       return {
-        ...cached,
+        ...cachedReport,
         cached: true,
         instanceChecks: instance,
         degradedByInstanceCheck: instance.some((c) => c.status !== PASS),
@@ -1012,7 +1252,7 @@ export function probe(options) {
     appContainer: () => probeAppContainer(),
     volume: () => probeVolume(root),
     optionalFeatures: () => probeOptionalFeatures(),
-    instanceChecks: () => instanceChecks(root),
+    instanceChecks: () => instanceChecks(root, instanceOptions),
   }
   report.steps = {}
   for (const [name, run] of Object.entries(steps)) {
@@ -1035,7 +1275,19 @@ export function probe(options) {
   // 在报告里长得一样，而这两件事的处置完全不同（前者要去看 appContainerProbe.reason）。
   report.appContainerIsolation = report.appContainerProbe.isolation
   report.cached = false
+  // ── 三轮接线：三个新维度必须在 `selectTier()` **之前**写进报告 ──────────────────
+  // `selectTier()` 只读 `win32.checks` / `appContainer` / `appContainerIsolation` / `volume`，
+  // **不读**这三个键，因此 T0 闸门（`appContainerIsolation?.proven === true`）逐字不变。
+  // 顺序仍有意义：报告是唯一权威投影，追加到 `tier` 之后就会漏进缓存文件与 CLI 输出。
+  Object.assign(report, capabilityDimensions(options))
   report.tier = selectTier(report)
+  // ── 缺陷③（Fix B）：`init` 面上的修复路径 ─────────────────────────────────────
+  // 位置在 tier 判定之后、写缓存之前：修复是**副作用**，判定不该被它影响
+  // （它不改 `win32` / `appContainer` / `appContainerIsolation` 任何一项）。
+  // 为什么挂在探测上：`cli probe` 与 `cli init` 都走这里，而 `init` 是用户
+  // "把这个工作区收拾好"的既有动词 —— 于是重跑 `init` 从"不自愈"变成"自愈"。
+  // 判定与落地都在 `src/executor.mjs::repairStaleAppContainerAces`（本模块不重写判据）。
+  report.staleAppContainerAces = repairStaleStagingAcesForRoot(root, options)
   if (cacheFile) {
     safe(() => {
       mkdirSync(cacheDir, { recursive: true })
@@ -1043,6 +1295,76 @@ export function probe(options) {
     }, () => undefined)
   }
   return report
+}
+
+/**
+ * 缺陷③（Fix B）的 `probe`/`init` 侧入口：把暂存根上"上一次 T0 留下的陈旧包 SID ACE"摘掉。
+ *
+ * ── 为什么 `init` 必须做这件事 ────────────────────────────────────────────────
+ * `[实测]` 审计 `raw/82-reinit.txt` 记的是"重跑 `init` **不修复**"：
+ * 只要那条 `S-1-15-2-…:(OI)(CI)(M)` 还在，该工作区的 T1 暂存写就一直是 `Access is denied.`。
+ *
+ * ── 纪律 ────────────────────────────────────────────────────────────────────
+ *   - 只碰**授权的那个暂存根**（WP1 之后 = `stageGrantTarget()` 给出的根），不碰别的目录；
+ *   - 暂存根还不存在（新工作区）⇒ 如实返回 `checked:false`，不创建它；
+ *   - 读不到 DACL / 摘不干净 ⇒ 如实返回，绝不报"已修复"（由 Fix A 的闸门决定拒绝运行）；
+ *   - 任何异常都吞成结构化结果：一次探测不该因为清理失败而整体抛错。
+ *
+ * ── Phase 2 / WP1：目标不再自己拼 ────────────────────────────────────────────────
+ * 这里**曾经**写死 `<root>\.dshstage\staged`（工作区里的暂存树）。WP0 把默认暂存根搬到
+ * 缓存面之后，那个路径**不再是暂存面**：继续往那里做 ACE 修复等于修错目录，而真正的
+ * 暂存根上的陈旧包 SID ACE 一直留着（T1 写不进去）。现在目标一律由
+ * `stageGrantTarget()` 决定：
+ *   · 显式 `options.stagingRoot` / `options.stageRoot`（override 通道）⇒ 逐字采用；
+ *   · 否则 ⇒ `resolveStageRoot({ sessionKey, workspaceRoot: root, env })` 的缓存根。
+ * **本文件不拼任何暂存路径**（拼一次就会和 WP0 漂移一次）。
+ */
+export function repairStaleStagingAcesForRoot(root, options = {}) {
+  if (options.repairStaleAces === false) {
+    return { checked: false, repaired: false, removed: [], remaining: [], present: [], skipped: 'disabled-by-option' }
+  }
+  let target
+  try {
+    target = stageGrantTarget({
+      stagingRoot: options.stagingRoot,
+      override: options.stageRoot,
+      sessionKey: options.sessionKey,
+      workspaceRoot: options.workspaceRoot ?? root,
+      env: options.env,
+    })
+  } catch (error) {
+    // 解析不出根 ⇒ 如实报"没查"，**不**回落到工作区那棵老树。
+    return {
+      checked: false,
+      repaired: false,
+      removed: [],
+      remaining: [],
+      present: [],
+      skipped: 'stage-root-unresolved',
+      reason: `stage-root resolution failed: ${error.code ?? ''} ${error.message}`.trim(),
+    }
+  }
+  const staged = target.root
+  if (!existsSync(staged)) {
+    return { checked: false, repaired: false, removed: [], remaining: [], present: [], skipped: 'no-staging-root-yet', stagingRoot: staged, target }
+  }
+  try {
+    const impl = options.repairStaleAcesImpl ?? repairStaleAppContainerAces
+    return { checked: true, stagingRoot: staged, target, ...impl(staged, {}) }
+  } catch (error) {
+    return {
+      checked: true,
+      stagingRoot: staged,
+      target,
+      repaired: false,
+      removed: [],
+      remaining: [],
+      present: [],
+      sddlAvailable: false,
+      verifyAvailable: false,
+      reason: `stale-ACE repair threw: ${error.message}`,
+    }
+  }
 }
 
 /**
@@ -1166,32 +1488,149 @@ export function resolveAppContainerIsolation({ root, cacheDir, report, options =
   }
 }
 
-/** 实例级检查：每次启动都必须做，不能被缓存跳过（手册 #5.5） */
-export function instanceChecks(root) {
+/**
+ * ── 实例检查的机读码（Phase 2 / WP10 新增；与既有码族**不重叠**）────────────────
+ *
+ *   `STAGE_ROOT_LOST`         根/哨兵在建立**之后**失效（WP0）        —— 根没了
+ *   `STAGE_GUARD_UNAVAILABLE` 根/守护在本次运行**之前**建不起来（WP0）—— 根建不出
+ *   `STAGE_GRANT_FAILED`      根在，但没被授权给本次运行的身份（WP1） —— 授权没接上
+ *   `STAGE_ROOT_UNRESOLVED`   实例探针**算不出**缓存根（WP10）        —— 判据无从谈起
+ *   `STAGE_ROOT_CROSS_VOLUME` 缓存根与工作区根**不在同一卷**（WP10）   —— 原子替换会跨卷
+ *   `STAGE_ROOT_IN_WORKSPACE` 缓存根落在**工作区内**（WP10）          —— 工作区不得再出现暂存树
+ *
+ * 三个新码**只**出现在实例检查的结构化字段上（`code`），不进任何模型可见文案 ——
+ * 与 WP0 的透明性契约一致（`.code` 不算文案：契约要求 `STAGE_ROOT_LOST` 保持原样）。
+ * 判据只紧不松：新码对应的三种情形在老实现里**都是 PASS**（老实现只 `mkdir` 工作区里的
+ * 老位置，几乎不可能失败）——因此不存在"探针失败就当通过"。
+ */
+export const STAGE_ROOT_UNRESOLVED = 'STAGE_ROOT_UNRESOLVED'
+export const STAGE_ROOT_CROSS_VOLUME = 'STAGE_ROOT_CROSS_VOLUME'
+export const STAGE_ROOT_IN_WORKSPACE = 'STAGE_ROOT_IN_WORKSPACE'
+
+/** 卷根（`C:\` / `D:\` / `\\server\share\`）的小写规范形。纯字符串，不碰磁盘。 */
+function volumeRootOf(target) {
+  return parse(String(target)).root.toLowerCase()
+}
+
+/** `candidate` 是否落在 `ancestor` 之内（含相等）。纯字符串，不碰磁盘。 */
+function pathWithin(candidate, ancestor) {
+  const inner = resolve(String(candidate)).toLowerCase().replace(/[\\/]+$/, '')
+  const outer = resolve(String(ancestor)).toLowerCase().replace(/[\\/]+$/, '')
+  return inner === outer || inner.startsWith(`${outer}${sep}`)
+}
+
+/**
+ * 实例级检查：每次启动都必须做，不能被缓存跳过（手册 #5.5）
+ *
+ * ── Phase 2 / WP10：探针不再在工作区里建 `.dshstage`（本轮修）────────────────────
+ * 改动前两处探针都把"暂存面"当成工作区里的老位置：
+ *   ① "工作区可写" ⇒ 建 `<root>` 下的老暂存树子目录。**探一次就在工作区里留下一棵树**
+ *      —— 污染工作区，也让"暂存面不该被看见"这条硬约束当场失效；
+ *   ② "基目录与工作区同卷" ⇒ 直接 `mkdirSync` 老位置。同样建树，而且**判的是老位置**：
+ *      WP0 之后真正的暂存根在 Windows 缓存，这条判据与真实暂存面无关（等于永远 PASS）。
+ * 现在：
+ *   ① 工作区可写 ⇒ 探**工作区根本身**，用中性临时名 `.dsh-write-probe-<stamp>`
+ *      （名字刻意不含任何机制字样），`finally` 里删掉 —— 探完不留痕；
+ *   ② 同卷判据 ⇒ 拿 `resolveStageRoot({sessionKey, workspaceRoot})` 给出的**缓存根**
+ *      与 ① 的探针目标比较卷根（`path.parse(x).root`）：
+ *        · 跨卷            ⇒ **FAIL** + `STAGE_ROOT_CROSS_VOLUME`（如实报，不静默通过）
+ *        · 根落在工作区内   ⇒ **FAIL** + `STAGE_ROOT_IN_WORKSPACE`
+ *        · 根算不出来       ⇒ **FAIL** + `STAGE_ROOT_UNRESOLVED`（fail-closed）
+ * 为什么②**不**去建缓存根：根"建不建得出"是守护的判据（WP0：建不出就 fail-closed 抛
+ * `STAGE_GUARD_UNAVAILABLE`），而这条实例检查要回答的是另一个问题 ——
+ * "把文件从工作区挪到暂存根会不会跨卷（那会让原子替换失效）"。**本函数因此是纯判定
+ * （除①那次探针外不碰磁盘）**，而这个判定在老实现里根本不存在。
+ * 本文件不拼任何暂存路径：根只有 `resolveStageRoot()` 一份实现（import，不重写）。
+ *
+ * @param {string} root 工作区根
+ * @param {{sessionKey?:string, env?:object, stageRoot?:string, stagingRoot?:string}} [options]
+ *   与 `repairStaleStagingAcesForRoot()` 同一套根解析通道：显式 override（`stageRoot` /
+ *   `stagingRoot`）> `resolveStageRoot(...)`；缺省即"本会话的缓存根"。
+ *   返回项里 `name` / `detail` 是**文案**通道（透明性契约：零机制字样）；诊断用的路径、
+ *   卷根与机读码只放在非文案字段（`target` / `cacheRoot` / `cacheVolume` / `code`）。
+ */
+export function instanceChecks(root, options = {}) {
+  const workspaceRoot = resolve(root || process.cwd())
+  const stamp = `${Date.now().toString(36)}${process.pid.toString(36)}${Math.random().toString(36).slice(2, 6)}`
   const checks = []
-  // 1. 工作区可写且可建子目录
-  const probeDir = join(root, '.dshstage', 'instance-probe')
+  // 1. 工作区可写：探**工作区根**本身（中性临时名；成功失败都清理）
+  const probeDir = join(workspaceRoot, `.dsh-write-probe-${stamp}`)
   checks.push(
-    safe(
-      () => {
+    (() => {
+      try {
         mkdirSync(probeDir, { recursive: true })
         writeFileSync(join(probeDir, 'probe'), 'ok')
-        rmSync(probeDir, { recursive: true, force: true })
-        return { name: 'workspace-writable', status: PASS, detail: root }
-      },
-      (error) => ({ name: 'workspace-writable', status: FAIL, detail: error.code || error.message }),
-    ),
+        return {
+          name: 'workspace-writable',
+          status: PASS,
+          detail: 'the workspace root accepted a temporary probe directory (created then removed)',
+          target: probeDir,
+        }
+      } catch (error) {
+        return {
+          name: 'workspace-writable',
+          status: FAIL,
+          detail: `the workspace root is not writable (${error.code || 'unknown'})`,
+          code: error.code ?? null,
+          target: probeDir,
+          error: String(error.message).slice(0, 300),
+        }
+      } finally {
+        safe(
+          () => rmSync(probeDir, { recursive: true, force: true }),
+          () => undefined,
+        )
+      }
+    })(),
   )
-  // 2. 暂存区基目录必须与工作区同卷（跨卷移动会破坏原子替换）
+  // 2. 暂存根（缓存面）与工作区同卷 —— 判据对准 `resolveStageRoot()` 的根，不碰老位置
   checks.push(
-    safe(
-      () => {
-        const stageBase = join(root, '.dshstage')
-        mkdirSync(stageBase, { recursive: true })
-        return { name: 'stage-base-on-root', status: PASS, detail: stageBase }
-      },
-      (error) => ({ name: 'stage-base-on-root', status: FAIL, detail: error.code || error.message }),
-    ),
+    (() => {
+      let cacheRoot
+      try {
+        cacheRoot = resolveStageRoot({
+          sessionKey: options.sessionKey,
+          workspaceRoot,
+          env: options.env,
+          override: options.stageRoot ?? options.stagingRoot,
+        })
+      } catch (error) {
+        return {
+          name: 'cache-root-same-volume',
+          status: FAIL,
+          code: STAGE_ROOT_UNRESOLVED,
+          detail: 'the location reserved for this session could not be determined (fail-closed)',
+          target: probeDir,
+          error: String(error.message).slice(0, 300),
+        }
+      }
+      const cacheVolume = volumeRootOf(cacheRoot)
+      const workspaceVolume = volumeRootOf(probeDir)
+      const base = { name: 'cache-root-same-volume', cacheRoot, cacheVolume, workspaceVolume, target: probeDir }
+      if (pathWithin(cacheRoot, workspaceRoot)) {
+        return {
+          ...base,
+          status: FAIL,
+          code: STAGE_ROOT_IN_WORKSPACE,
+          detail: 'the resolved location lies inside the workspace root, so a working tree would appear there',
+        }
+      }
+      if (cacheVolume !== workspaceVolume) {
+        return {
+          ...base,
+          status: FAIL,
+          code: STAGE_ROOT_CROSS_VOLUME,
+          detail:
+            `the resolved location is on ${cacheVolume} while the workspace root is on ${workspaceVolume}: ` +
+            'a move between them cannot be an atomic replace',
+        }
+      }
+      return {
+        ...base,
+        status: PASS,
+        detail: `the resolved location and the workspace root share volume ${workspaceVolume}`,
+      }
+    })(),
   )
   // 3. 受限令牌/进程沙箱是否生效（真实写入尝试到工作区外）
   const outside = join(process.env.TEMP || tmpdir(), '..', `dsh-instance-probe-${Date.now().toString(36)}`)
@@ -1292,13 +1731,43 @@ export function selectTier(report) {
   return { tier: 'T3', name: 'none', reasons: reasons.length ? reasons : ['no usable primitive'], nesting, t0Gate: 'unusable' }
 }
 
-export function formatReport(report) {
+/**
+ * 把探测报告渲染成人读文本。
+ *
+ * @param {object} report `probe()` 的返回值（或兼容形状）
+ * @param {{failures?: string[], noCandidates?: boolean}} [context]
+ * @param {{staleAceRepair?: object}} [context.workspace]
+ *   `init` 面额外带上"暂存根陈旧 AppContainer 包 SID ACE"的修复结果（缺陷③ / Fix B）：
+ *   有清理动作、或**读不到 DACL**（= 修不了，必须让人看见）时打印一行 `⚠`。
+ *   这是**人读通道**：`exec` 的模型可见 stdout 一个字节都不受影响。
+ */
+export function formatReport(report, context = {}) {
   const lines = []
   lines.push(`probe v${report.probeVersion}  fingerprint=${report.fingerprint}  cached=${report.cached}`)
   lines.push(`root=${report.root}`)
   lines.push(`selected tier=${report.tier.tier} (${report.tier.name})`)
   if (report.tier.reasons?.length) lines.push(`  reasons: ${report.tier.reasons.join('; ')}`)
   if (report.tier.nesting) lines.push(`  嵌套可用性: ${report.tier.nesting.viable ? 'yes' : 'NO'} — ${report.tier.nesting.detail}`)
+  // ── 三轮接线的三个维度（报告面可见，否则接线等于没接）─────────────────────────
+  // 措辞刻意保守：网络策略只报 netpolicy 判定出来的四态；缓解策略是"打算注入"的档位
+  // （opt-in，默认 none），不是"已生效"；上限是配置值。
+  if (report.networkPolicy) {
+    const n = report.networkPolicy
+    lines.push(`  网络策略: tier=${n.tier ?? '(未解析)'} state=${n.state ?? 'unknown'} enforced=${n.enforced === true} verified=${n.verified === true} — ${n.reason ?? ''}`)
+  }
+  if (report.mitigations) {
+    const m = report.mitigations
+    lines.push(
+      `  进程缓解策略（opt-in，默认 none；报告不代表已生效）: profile=${m.profile ?? 'unknown'} flags=${m.flags ?? 'unknown'} noop=${m.noop === true}` +
+        (m.state === 'unknown' ? ` state=unknown — ${m.reason ?? ''}` : ''),
+    )
+  }
+  if (report.limits) {
+    const l = report.limits
+    lines.push(
+      `  资源上限: 暂存=${l.stagingBytes ?? 'unknown'} 字节（${l.stagingGiB ?? 'unknown'} GiB，出处 ${l.stagingSource ?? 'unknown'}）；输出=${l.maxOutputBytes ?? 'unknown'} 字节 / ${l.maxOutputLines ?? 'unknown'} 行（出处 ${l.outputSource ?? 'unknown'}）`,
+    )
+  }
   const w = report.win32?.checks
   if (w) {
     for (const [key, value] of Object.entries(w)) {
@@ -1318,6 +1787,26 @@ export function formatReport(report) {
   lines.push('  instance checks (每次启动强制):')
   for (const check of report.instanceChecks || []) {
     lines.push(`    [${check.status.toUpperCase()}] ${check.name}: ${check.detail}`)
+  }
+  // ── 缺陷③（Fix B）：暂存根上的陈旧 AppContainer 包 SID ACE ─────────────────────
+  // 判据：跑过一次 `--tier T0` 之后，暂存根顶部会留下 `S-1-15-2-…:(OI)(CI)(M)`；
+  // 只要它在，之后所有 T1 暂存写都被拒（`Access is denied.`），且重跑 init 不自愈。
+  // 因此这里要**让人看见**：清理了什么、或者为什么没清成。
+  const stale = context.workspace?.staleAceRepair
+  if (stale && stale.checked === true) {
+    if (Array.isArray(stale.removed) && stale.removed.length > 0) {
+      lines.push(
+        `  ⚠ 已清理暂存根上上一次 T0 留下的 AppContainer 包 SID ACE ${stale.removed.length} 条` +
+          `（${stale.removed.join(', ')}）—— 否则该工作区的 T1 暂存写会一直 Access is denied`,
+      )
+      lines.push(`    执行: ${(stale.commands ?? []).join(' ; ') || '(icacls /remove:g)'}`)
+    }
+    if (stale.repaired !== true && stale.sddlAvailable === false) {
+      lines.push(`  ⚠ 暂存根 DACL 读不到 ⇒ 无法确认/清理陈旧包 SID ACE: ${stale.reason ?? '(no reason)'}`)
+    }
+    if (stale.repaired !== true && stale.remaining?.length > 0) {
+      lines.push(`  ⚠ 陈旧包 SID ACE 未能摘净（剩余 ${stale.remaining.join(', ')}）: ${stale.reason ?? ''}`)
+    }
   }
   return lines.join('\n')
 }

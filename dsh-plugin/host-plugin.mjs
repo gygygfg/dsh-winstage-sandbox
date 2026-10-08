@@ -9,11 +9,21 @@
  * ── 面板的数据从哪来（一个必须如实说明的机制约束）─────────────────────────────
  * Client 的 `ctx.remote.<命名空间>` 选集是**构建时固定**的：第三方插件无法在运行时
  * 新增 Remote 命名空间或转发事件（`@deepseek-ai/dsh-api-remotes` 的 README 逐字如此）。
- * 因此本插件用两条**已有**通道：
- *   1. 读：审阅快照写成 `<workspaceRoot>/.dshstage/review.json`，Client 用
- *      `ctx.remote.workspaceFiles.read` 读；
+ * 因此本插件用三条**已有**通道：
+ *   1. 读（WP3-B 起）：本文件注册一条同源只读路由 `/winstage-panel/{snapshot,trust}`，
+ *      **存储根由宿主侧 `resolveReviewStoreDir()` 解析**（Phase 1 起在 Windows 缓存），
+ *      客户端只拿逻辑标识（路由名 + 会话 id），不再自己拼旧布局路径；
  *   2. 写：Client 用 `ctx.remote.commands.execute` 调 `/winstage approve|reject`，
- *      命令**不产生模型消息**（`dsh-commands` 的既定语义）。
+ *      命令**不产生模型消息**（`dsh-commands` 的既定语义）；
+ *   3. 兼容：路由不可用时（宿主没装 webServer / 未重启）`client.js` 仍可用旧的
+ *      `ctx.remote.workspaceFiles.read` 读**升级前**布局的快照 —— 那是**兜底**，
+ *      绝不是首选，且只有一条被注释说明的分支。
+ *
+ * ── WP3：用户侧可信性状态卡（AI 侧零注入）────────────────────────────────────
+ * `/winstage status` 输出六个面（档位 / 首次掉档 / 失根 / 未结算审批 / 未确认写入 /
+ * 读侧可见性），面板通过 `/winstage-panel/trust` 拿同一份 `buildTrustCard()`。
+ * **这些文本只走用户侧通道**：命令自身的 stdout/stderr 与工具输出逐字节不变，
+ * 卡片里的暂存路径一律被剥掉（只有逻辑标签 + 存储短哈希）。
  *
  * ── 一个必须如实说明的限制（手册第 0 章证据分层）────────────────────────────
  * `[实测]` WinStageSandbox 的**受限令牌**无法在已被沙箱化的会话里再创建
@@ -23,14 +33,29 @@
  * `probeRuntime()` 只如实报告"能否建立受限令牌"，而暂存面与它无关、照常工作。
  */
 
+import { existsSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { Config } from './schema.js'
 import { probeWin32Abi } from '../src/capability.mjs'
 import { WindowsStageExecutor, resolveDshModuleRoot } from '../src/executor.mjs'
 import { compareKey } from '../src/paths.mjs'
 import { renderCandidateDiff } from '../src/tools.mjs'
-import { getReviewService } from './review-service.mjs'
+import { verifyStageRootAlive } from '../src/stage-guard.mjs'
+import { REVIEW_BASENAME, getReviewService, resolveReviewStoreDir } from './review-service.mjs'
+import { installBaselineWatch } from './baseline-watch.mjs'
 import { createAuditMirror } from './audit-mirror.mjs'
 import { createRunCapture } from './run-capture.mjs'
+// ★ BUG-B：档位（lane）判定的**同一份**分类与结论口径。只 import 纯函数/常量，
+//   不 import 执行器类；`shell-executor.mjs` 反过来**不**依赖本模块（无环）。
+// ★ WP3：在同一份产物上补"历史"（首次掉档 / 是否曾掉档 / 失根次数）——
+//   `history` 由 `persistLane()` 写、由这里的读侧解释，**不另造第二份状态**。
+import {
+  LANE_JOURNAL_BASENAME,
+  noteStageRootLoss,
+  readLaneJournalFile,
+  summarizeLane,
+  summarizeLaneHistory,
+} from './shell-executor.mjs'
 
 export { Config }
 
@@ -155,32 +180,71 @@ export function matchPaths(changes, args) {
   })
 }
 
-export function formatList(service) {
-  const snapshot = service.snapshot()
-  if (!snapshot.pending) return 'WinStage 暂存区没有待审改动（改了文件之后会自动出现在这里）'
+/**
+ * 漂移形状 → 命令面里的短标签（与 `review-service.mjs` 的 `driftReasonOf()` 同字面量）。
+ *
+ * 缺陷②（F5b）：`baseline-appeared` 是"基线 = absent（新增）而真实文件在暂存之后出现"
+ * 这一档 —— 它过去**完全不可见**，批准会静默覆盖磁盘上那份内容。命令面必须把形状
+ * 说出来，用户才知道"先看 before/after 再决定"而不是直接点批准。
+ */
+export function staleShapeText(code) {
+  if (code === 'baseline-appeared') return '· 真实文件在暂存后出现'
+  if (code === 'baseline-deleted') return '· 真实文件被外部删除'
+  if (code === 'baseline-drifted') return '· 真实文件被外部改写'
+  return ''
+}
+
+/**
+ * @param service 审阅服务
+ * @param [snapshot] 已构建的快照（**可选**）。`/winstage status` 一次调用要同时渲染
+ *   清单与状态卡，两处都用同一份快照 —— 否则 `publish()` 会被跑两遍，快照的
+ *   `generatedAt` 还会差一版（清单与卡片各说一个时间戳）。
+ */
+export function formatList(service, snapshot) {
+  const snap = snapshot ?? service.snapshot()
+  if (!snap.pending) return 'WinStage 暂存区没有待审改动（改了文件之后会自动出现在这里）'
   const lines = [
-    `WinStage 暂存待审  ${snapshot.counts.files} 个文件  +${snapshot.counts.additions} / −${snapshot.counts.deletions}`,
+    `WinStage 暂存待审  ${snap.counts.files} 个文件  +${snap.counts.additions} / −${snap.counts.deletions}`,
   ]
-  if (snapshot.counts.frozenOnly > 0) {
+  if (snap.counts.frozenOnly > 0) {
     // D1：冻结存档行也要出现在 CLI 清单里，并**逐行标明不可批准** —— 否则
     // "N 个文件"与"能批准几个"会对不上，读的人会以为勾了就能写。
-    lines.push(`  其中 ${snapshot.counts.frozenOnly} 个已不在当前净 diff（仅存档，不可批准）`)
+    lines.push(`  其中 ${snap.counts.frozenOnly} 个已不在当前净 diff（仅存档，不可批准）`)
   }
-  if ((snapshot.counts.staleBaseline ?? 0) > 0) {
+  if ((snap.counts.staleBaseline ?? 0) > 0) {
     // "多轮修改后视图不一致"：真实文件在暂存之后被外部改过，直接批准会被拒绝。
     // 清单里必须**说出来**，否则用户只会看到一条必然失败的"批准"。
+    // ★ 缺陷②（F5b）：还要说**形状**（`baseline-appeared` = 磁盘上多出一份内容、
+    //   基线本为"不存在"）。这条形状过去没有任何可见性，批准会把它静默覆盖。
+    const lossy = snap.counts.staleBaselineLossy ?? 0
     lines.push(
-      `  其中 ${snapshot.counts.staleBaseline} 项基线已过期（真实文件在暂存之后被外部改动过）：` +
+      `  其中 ${snap.counts.staleBaseline} 项基线已过期（真实文件在暂存之后被外部改动过）：` +
         '直接批准会被拒绝；用 /winstage rebase [路径…] 以真实文件为基线重新暂存。',
     )
+    if (lossy > 0) {
+      lines.push(
+        `  ⚠ 其中 ${lossy} 项会覆盖真实磁盘上**已存在**的内容（真实文件不是空基线）：` +
+          '批准已按 STALE_BASELINE 拒绝，先 rebase 看清 before/after 再决定，或 /winstage reject 丢弃这份暂存。',
+      )
+    }
   }
-  for (const file of snapshot.files) {
+  for (const file of snap.files) {
     const frozen = file.frozenOnly === true ? '   [已不在净 diff · 不可批准]' : ''
-    const stale = file.baselineStale === true ? '   [基线已过期 · 先 rebase]' : ''
+    const stale = file.baselineStale === true ? `   [基线已过期${staleShapeText(file.baselineStaleCode)} · 先 rebase]` : ''
     lines.push(`  ${file.op.padEnd(7)} ${file.path}   +${file.totals.added} / −${file.totals.removed}${frozen}${stale}`)
   }
-  if (snapshot.truncated) lines.push('  …（列表已截断）')
-  lines.push(`候选 ${snapshot.candidateId ?? '(未冻结)'} · 工作区 ${snapshot.workspaceRoot}`)
+  if (snap.truncated) {
+    // 只写"列表已截断"不够：用户看到 40 行却不知道**到底还有多少**。
+    // `counts.files` 现在是**截断前全量**、`counts.listed` 是实际列出行数，
+    // 两者相减即被隐藏的条数（这正是"审批不显示"修复后新增的可见性）。
+    const total = snap.counts.files
+    const shown = snap.counts.listed ?? snap.files.length
+    const hidden = Math.max(0, total - shown)
+    lines.push(hidden > 0
+      ? `  …（列表已截断：共 ${total} 项，已显示 ${shown} 项，**还有 ${hidden} 项未显示**；用 /winstage diff <路径> 或按路径批准）`
+      : '  …（列表已截断）')
+  }
+  lines.push(`候选 ${snap.candidateId ?? '(未冻结)'} · 工作区 ${snap.workspaceRoot}`)
   lines.push(
     '用 /winstage diff <路径> 看改动；/winstage approve [路径…] 写入真实工作区；' +
       '/winstage rebase [路径…] 以真实文件为基线重新暂存（基线过期时）；/winstage reject [路径…] 退回真实磁盘',
@@ -205,6 +269,622 @@ export function formatDiff(service, args) {
   }
   return lines.join('\n')
 }
+
+/**
+ * ── BUG-B：`/winstage status` 必须回答"沙箱到底生效了没有" ────────────────────
+ *
+ * 事故形态（已确证）：`tier:'auto'` 的透明垫片探测不过 ⇒ `selectLaunchMode()`
+ * fail-closed 回退受限令牌档 ⇒ **没有 shim** ⇒ 写入只剩内核硬拒、子进程 stdio 被掐断。
+ * 而会话内表现与"一切正常"**一模一样**（`WINSTAGE_STAGE_ROOT` 为空、`node -v` 静默空输出），
+ * 用户与模型都看不出沙箱已经退化 —— 本仓库最忌讳的静默失败。
+ *
+ * 因此这里读执行器落下的**结构化产物**（`<会话存储根>/sandbox-lane.json`，
+ * 由 `shell-executor.mjs` 的 `persistLane()` 写），并把结论**明说**一句。
+ * ⚠ 本段只出现在 `/winstage status` 的命令文本里（人工/命令通道），
+ * 绝不进命令自身的 stdout/stderr —— 零痕迹契约不变。
+ */
+export function readLaneJournal(service) {
+  const dir = service?.workspace?.store?.dir
+  if (typeof dir !== 'string' || dir.length === 0) {
+    return { available: false, reason: 'no-store-dir', file: undefined }
+  }
+  // WP3：读法只有**一处**（`shell-executor.mjs::readLaneJournalFile()`）——
+  // 与执行器的写入侧同一份实现，读侧不再自己拼文件名/自己 JSON.parse。
+  return readLaneJournalFile(dir)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WP3：用户侧**可信性状态卡**（六个面，机读 + 人读两用）
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// ── owner 已定的模型（照做，不得偏离）────────────────────────────────────────
+//   · **AI 侧必须意识不到沙箱**：本文件产出的这些文本**只走用户侧通道**
+//     （`/winstage status` 的命令文本、面板）。**绝不**进命令自身的 stdout/stderr、
+//     也绝不进任何工具可见载荷 —— 零痕迹契约不破。
+//   · 沙箱信息只在用户侧；不做 `stage where`，不向用户暴露暂存文件清单。
+//   · 卡片里**不出现任何暂存绝对路径**（连产物文件路径也不出现）：机读侧用
+//     `storeHash`（存储根路径的短哈希）做关联，人读侧只给"会话工作根"这类**逻辑**标签。
+//     这一条是硬要求：命令文本会进会话日志，路径一旦写进去就再也收不回来。
+//
+// 六个面：①档位 ②首次掉档 ③失根 ④未结算审批 ⑤未确认写入 ⑥读侧可见性。
+// 前两个面的**真值来源**是 `sandbox-lane.json`（`persistLane` 写、`summary`/`history`），
+// 这里只做解释与呈现，**不重造**判据（`summarizeLane` / `summarizeLaneHistory` 同一份实现）。
+
+/** 存储根路径的**短哈希**：让机读侧能关联"是哪一份存储"而不泄漏路径本身（FNV-1a 32 位） */
+export function storeHash(dir) {
+  const text = typeof dir === 'string' ? dir : ''
+  if (text.length === 0) return null
+  let hash = 0x811c9dc5
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i)
+    hash = Math.imul(hash, 0x01000193) >>> 0
+  }
+  return hash.toString(16).padStart(8, '0')
+}
+
+/**
+ * 面 ④：**未结算审批** —— 会话日志里 `approval/asked` 没有配对的 `approval/decided`。
+ *
+ * 为什么读会话事件而不是自己记账：审计对（`audit-mirror.mjs`）本来就写进**会话日志**
+ * （与原生审批同一对事件名、同一套 id）。从同一份真相上读，"未结算"就与原生审批的
+ * 孤儿检测同一口径；自己再存一份必然漂移。
+ *
+ * 本轮实测形态：会话卡在"问过但没人答"上，用户在命令面与面板上**都看不出**这件事。
+ *
+ * 纯函数（只调 `session.eventAt()`），读不到会话时如实返回 `available:false`。
+ * @returns {{available: boolean, scanned: number, unsettledCount: number, unsettled: Array<object>, reason?: string}}
+ */
+export function summarizeUnsettledApprovals(session) {
+  const empty = { available: false, scanned: 0, unsettledCount: 0, unsettled: [] }
+  if (!session || typeof session.eventAt !== 'function') {
+    return { ...empty, reason: 'no-session' }
+  }
+  const seq = Number(session.seq)
+  if (!Number.isFinite(seq) || seq <= 0) return { ...empty, available: true, reason: 'no-events' }
+  const open = new Map()
+  let scanned = 0
+  for (let i = 0; i < seq; i += 1) {
+    let event
+    try {
+      event = session.eventAt(i)
+    } catch {
+      break
+    }
+    if (!event || typeof event !== 'object') continue
+    scanned += 1
+    const id = event?.data?.id
+    if (typeof id !== 'string' || id.length === 0) continue
+    if (event.type === 'approval/asked') {
+      if (!open.has(id)) open.set(id, { id, reason: event?.data?.reason ?? null, toolName: event?.data?.toolName ?? null, seq: i })
+    } else if (event.type === 'approval/decided') {
+      open.delete(id)
+    }
+  }
+  const unsettled = [...open.values()].sort((a, b) => a.seq - b.seq)
+  return { available: true, scanned, unsettledCount: unsettled.length, unsettled }
+}
+
+/**
+ * 面 ⑤：**未确认写入**（WP2 面，`staging_write_not_persisted`）。
+ *
+ * 真值来源是**清单条目**：`staging-fs.mjs::verifyPersistedWrite()` 回读闸门失败时把
+ * `entry.persistenceFailure = { at, hash, stagedPath, problems }` 记进清单并 `touch()` 落盘。
+ * 这里只**读**那份记账 —— 不重造判据、不碰 `staging-fs.mjs`。
+ *
+ * ⚠ `stagedPath` **不进卡片**（它是暂存落点）：这里只取 `at` / `hash` / `problems` / 条目键。
+ * ⚠ 诚实声明：清单条目被后续成功写入取代时该记账会随之消失 ⇒ 本面是"**最近一次已知**"，
+ *   不是"历史上发生过几次"的审计（机读字段 `note` 如实写明）。
+ *
+ * @param {string|undefined} manifestPath 清单文件绝对路径（`store.manifestPath`）
+ */
+export function summarizeUnpersistedWrites(manifestPath) {
+  const empty = { available: false, count: 0, items: [], last: null }
+  if (typeof manifestPath !== 'string' || manifestPath.length === 0) {
+    return { ...empty, reason: 'no-manifest-path' }
+  }
+  if (!existsSync(manifestPath)) return { ...empty, available: true, reason: 'no-manifest' }
+  let manifest
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  } catch (error) {
+    return { ...empty, reason: `manifest-unreadable: ${error?.message ?? error}` }
+  }
+  const entries = manifest?.entries && typeof manifest.entries === 'object' ? manifest.entries : {}
+  const items = []
+  for (const [key, entry] of Object.entries(entries)) {
+    const failure = entry?.persistenceFailure
+    if (!failure || typeof failure !== 'object') continue
+    items.push({
+      path: key,
+      at: failure.at ?? null,
+      hash: failure.hash ?? null,
+      // `problems` 是**结构化检查项**（例如 `manifest-not-persisted`），不含路径片段
+      problems: Array.isArray(failure.problems)
+        ? failure.problems.map((p) => ({ check: p?.check ?? 'unknown', detail: p?.detail ?? null }))
+        : [],
+    })
+  }
+  items.sort((a, b) => String(a.at ?? '').localeCompare(String(b.at ?? '')))
+  return {
+    available: true,
+    count: items.length,
+    items,
+    last: items.length > 0 ? items[items.length - 1] : null,
+    note: '只反映**清单里仍然留着**的未确认写入（被后续成功写入取代后该记账会消失）；不构成历史审计。',
+  }
+}
+
+/** 面 ⑥：读侧可见性摘要（WP4 面）—— 从快照的 `readVisibility` 段收敛成一行+机读字段 */
+export function summarizeReadVisibility(readVisibility) {
+  const rv = readVisibility && typeof readVisibility === 'object' ? readVisibility : undefined
+  if (!rv) return { available: false, policy: null, objects: 0, reads: 0, truncated: false, topMaskIds: [], note: null }
+  const byMaskId = rv.byMaskId && typeof rv.byMaskId === 'object' ? rv.byMaskId : {}
+  const topMaskIds = Object.entries(byMaskId)
+    .map(([maskId, count]) => ({ maskId, count: Number(count) || 0 }))
+    .sort((a, b) => b.count - a.count || (a.maskId < b.maskId ? -1 : 1))
+  return {
+    available: true,
+    policy: rv.policy ?? null,
+    objects: Number(rv.objects) || 0,
+    reads: Number(rv.reads) || 0,
+    truncated: rv.truncated === true,
+    topMaskIds,
+    note: typeof rv.note === 'string' ? rv.note : null,
+  }
+}
+
+/**
+ * 组装**可信性状态卡**（机读对象；人读渲染见 `formatTrustCard()`）。
+ *
+ * 六个面全部**总是有键**（拿不到就 `available:false` + `reason`），因为这张卡是
+ * "机读 + 人读两用"：机读侧不许出现"字段偶尔消失"的形态。
+ *
+ * @param {{service?: object, session?: object, snapshot?: object, env?: object, now?: string}} options
+ *   `service` = 审阅服务（取存储根/清单）；`session` = 会话句柄（面④读事件）；
+ *   `snapshot` = 已发布的快照（面⑥读 `readVisibility`；不传就如实标 `available:false`）
+ */
+export function buildTrustCard(options = {}) {
+  const service = options.service
+  const store = service?.workspace?.store
+  const dir =
+    typeof store?.dir === 'string' && store.dir.length > 0
+      ? store.dir
+      : typeof options.storeDir === 'string' && options.storeDir.length > 0
+        ? options.storeDir
+        : undefined
+
+  // ── 面 ①②：档位 + 首次掉档（真值来源 = `sandbox-lane.json`，判据与执行器同一份）──
+  const journal = readLaneJournalFile(dir)
+  const record = journal.available ? journal.record ?? {} : undefined
+  const lane = summarizeLane(record ?? {})
+  const history = summarizeLaneHistory(record)
+  const tier = {
+    /** 产物是否存在（= 有没有命令真的经过本执行器） */
+    recorded: journal.available,
+    recordedReason: journal.reason,
+    at: record?.at ?? null,
+    launchMode: lane.launchMode,
+    tierEffective: lane.tierEffective,
+    requestedTier: lane.requestedTier,
+    winStageEnabled: lane.winStageEnabled,
+    fallbackClass: lane.fallback,
+    fallbackText: lane.fallbackText,
+    fallbackReasonRaw: record?.fallbackReason ?? null,
+    status: lane.status,
+    degraded: lane.degraded,
+    conclusion: lane.conclusion,
+  }
+  const firstDegrade = {
+    everDegraded: history.everDegraded,
+    at: history.firstDegrade?.at ?? null,
+    seq: history.firstDegrade?.seq ?? null,
+    launchMode: history.firstDegrade?.launchMode ?? null,
+    tierEffective: history.firstDegrade?.tierEffective ?? null,
+    fallbackClass: history.firstDegrade?.fallbackClass ?? null,
+    fallbackReason: history.firstDegrade?.fallbackReason ?? null,
+    degradeCount: history.degradeCount,
+    shimCount: history.shimCount,
+    commandSeq: history.commandSeq,
+  }
+
+  // ── 面 ③：失根（**活体查询** + 观测历史）───────────────────────────────────
+  let live
+  if (store && typeof store.stageStatus === 'function') {
+    try {
+      live = store.stageStatus()
+    } catch (error) {
+      live = { alive: false, reason: `status-threw: ${error?.message ?? error}` }
+    }
+  } else if (dir !== undefined) {
+    live = verifyStageRootAlive(dir)
+  }
+  const checked = live !== undefined
+  const aliveNow = checked ? live.alive === true : null
+  /**
+   * ★ **"还没建根" 与 "根丢了" 是两件事**（本卡最容易误报的一处）。
+   *
+   * 会话还没跑过任何命令时，存储根本来就**不存在** —— 那时 `verifyStageRootAlive()`
+   * 答 `root-missing`。把它当成"失根"会对着一个"一切正常、只是还没用过"的会话报警，
+   * 而误报的告警与静默失败一样有害（用户学会忽略它）。
+   *
+   * 判据：根**曾经存在过**（有档位产物 ⇒ 至少跑过一次；或活体查询给出的不是
+   * `root-missing`/`root-not-directory`）才算"丢"。
+   */
+  const rootMissing = checked && live.alive !== true && (live.reason === 'root-missing' || live.reason === 'root-not-directory')
+  const everCreated = journal.available || (checked && !rootMissing)
+  const lossRelevant = checked && aliveNow !== true && everCreated
+  let rootLoss = history.rootLoss
+  if (lossRelevant) {
+    // 观测点②：用户查看状态也是一次观测（与命令执行前同一个记账函数）
+    const entry = noteStageRootLoss(dir, { reason: live.reason ?? 'not-alive', phase: 'status' })
+    if (entry) {
+      rootLoss = {
+        everLost: true,
+        count: entry.count,
+        lastReason: entry.lastReason,
+        lastAt: entry.lastAt,
+        lastPhase: entry.lastPhase,
+        lastSeq: entry.lastSeq,
+        observedAt: entry.observedAt,
+      }
+    }
+  }
+  const stageRoot = {
+    checked,
+    alive: aliveNow,
+    reason: live?.reason ?? null,
+    /** `never-created` = 根还没建（不是故障）；其余取值即 `verifyStageRootAlive()` 的 reason */
+    reasonCode: rootMissing && !everCreated ? 'never-created' : live?.reason ?? null,
+    guarded: live?.guarded ?? null,
+    everCreated,
+    lossRelevant,
+    everLost: rootLoss?.everLost === true,
+    lossCount: rootLoss?.count ?? 0,
+    lastLossAt: rootLoss?.lastAt ?? null,
+    lastLossReason: rootLoss?.lastReason ?? null,
+    lastLossPhase: rootLoss?.lastPhase ?? null,
+    lastLossSeq: rootLoss?.lastSeq ?? null,
+    observedAt: Array.isArray(rootLoss?.observedAt) ? [...rootLoss.observedAt] : [],
+    note: '失根次数是**被观测到**的次数（观测点：命令执行前 / 用户查看状态时），不是完整审计；"根还没建"不算失根。',
+  }
+
+  // ── 面 ④⑤⑥ ────────────────────────────────────────────────────────────────
+  const approvals = summarizeUnsettledApprovals(options.session)
+  const manifestPath =
+    typeof store?.manifestPath === 'string' && store.manifestPath.length > 0 ? store.manifestPath : dir ? join(dir, 'manifest.json') : undefined
+  const writes = summarizeUnpersistedWrites(manifestPath)
+  const readVisibility = summarizeReadVisibility(options.snapshot?.readVisibility)
+
+  // ── 一句话结论（严重度顺序：失根 > 掉档 > 写入未确认 > 档位未知 > 关闭 > 有事项 > 可信）──
+  const blockers = []
+  let level
+  if (stageRoot.lossRelevant) {
+    level = 'lost'
+    blockers.push({ code: 'stage-root-lost', detail: stageRoot.reason })
+  } else if (tier.winStageEnabled !== false && tier.status === 'degraded') {
+    level = 'degraded'
+    blockers.push({ code: 'lane-degraded', detail: tier.fallbackClass })
+  } else if (writes.count > 0) {
+    level = 'write-unconfirmed'
+    blockers.push({ code: 'unpersisted-write', detail: writes.last?.path ?? null })
+  // ★ `off` 必须**先于** `unknown`：开关被显式关掉时，"没有档位记录"是**预期形态**而不是告警
+  //   （owner 模型：关态属预期；BUG-B 的原始设计也是"关态不静默、也不谎报告警"）。
+  //   反例（改前）：关态 + 无记录 ⇒ 落到 `unknown` ⇒ `ok=false` ⇒ kind=error，用户会被假告警误导。
+  } else if (tier.winStageEnabled === false) {
+    level = 'off'
+    blockers.push({ code: 'sandbox-off', detail: null })
+  } else if (tier.status === 'unknown') {
+    level = 'unknown'
+    blockers.push({ code: tier.recorded ? 'lane-unknown' : 'lane-unrecorded', detail: tier.recordedReason })
+  } else if (approvals.unsettledCount > 0 || readVisibility.reads > 0) {
+    level = 'attention'
+    if (approvals.unsettledCount > 0) blockers.push({ code: 'unsettled-approval', detail: approvals.unsettledCount })
+    if (readVisibility.reads > 0) blockers.push({ code: 'sensitive-reads', detail: readVisibility.reads })
+  } else {
+    level = 'trusted'
+  }
+  const ok = level === 'trusted' || level === 'off' || level === 'attention'
+  const conclusion =
+    level === 'lost'
+      ? `沙箱此刻**不可信**：会话工作根已不可用（${stageRoot.reason ?? '原因未知'}）——写入会以 STAGE_ROOT_LOST 失败，不会静默改写真实文件。`
+      : level === 'degraded'
+        ? `沙箱此刻**不可信**：档位回退到 ${tier.launchMode ?? '(未报出)'}，没有去令牌化通道 —— 写入只剩内核硬拒、命令产出不进暂存。`
+        : level === 'write-unconfirmed'
+          ? `沙箱档位正常，但有 ${writes.count} 次写入**没有确认落盘**（最近一次：${writes.last?.path ?? '未知'}）——那次写入不应当成已完成。`
+          : level === 'unknown'
+            ? '沙箱档位**未知**：本会话还没有一次档位判定经过本执行器 —— 按"未证实已生效"对待。'
+            : level === 'off'
+              ? `沙箱**关闭**（属预期）：档位=${tier.launchMode ?? '(未报出)'}，本执行器不接管暂存面，此形态仅作记录。`
+              : level === 'attention'
+                ? `沙箱档位正常（已生效），但有 ${blockers.length} 类**待处理事项**：${blockers.map((b) => b.code).join('、')}。`
+                : '沙箱此刻**可信**：命令走去令牌化通道，文件/注册表写入先落暂存、批准后才写真实磁盘。'
+
+  return {
+    kind: 'winstage-trust-card',
+    version: 1,
+    at: typeof options.now === 'string' ? options.now : new Date().toISOString(),
+    /** 存储根的**短哈希**（关联用；**不是**路径 —— 路径绝不进卡片） */
+    storeHash: storeHash(dir),
+    storeLabel: dir ? '会话工作根（Windows 缓存）' : '（无会话存储根）',
+    tier,
+    firstDegrade,
+    stageRoot,
+    approvals,
+    writes,
+    readVisibility,
+    trust: { level, ok, blockers },
+    conclusion,
+  }
+}
+
+/** 面 ①②的人读渲染（`formatLaneSection()` 与状态卡共用同一份，不写第二份文案） */
+function formatTierLines(card) {
+  const { tier, firstDegrade } = card
+  const lines = ['【沙箱档位与降级告警】']
+  if (!tier.recorded) {
+    lines.push(`  · 没有档位判定记录（${tier.recordedReason}）`)
+    lines.push(
+      '  · 结论：**尚未证实沙箱真的生效**（档位判定只在命令执行时产生）。' +
+        '跑一条 pwsh 命令（例如 `node -v`）后再看这里；若那时仍无记录，说明命令没有经过 WinStage 执行器。',
+    )
+    return lines
+  }
+  lines.push(`  · 最近一次判定：${tier.at ?? '（无时间戳）'}`)
+  lines.push(
+    `  · lane（launchMode）= ${tier.launchMode ?? '（未报出）'}；tierEffective = ${tier.tierEffective ?? '（未报出）'}；` +
+      `请求档位 = ${tier.requestedTier ?? '（未报出）'}；WinStage 开关 = ${tier.winStageEnabled ? '开' : '关'}`,
+  )
+  lines.push(`  · 回退分类 = ${tier.fallbackClass}${tier.fallbackText ? ` — ${tier.fallbackText}` : ''}`)
+  lines.push(`  · 原始 fallbackReason = ${tier.fallbackReasonRaw ?? '（无）'}`)
+  lines.push(`  · 结论：${tier.conclusion}`)
+  // ★ WP3 新增的第 2 个面：**首次掉档**（"是否曾掉档"只有历史答得了）
+  lines.push(
+    firstDegrade.everDegraded
+      ? `  · 首次掉档：${firstDegrade.at ?? '（无时间戳）'}（第 ${firstDegrade.seq ?? '?'} 条命令）` +
+        `，launchMode=${firstDegrade.launchMode ?? '?'}，分类=${firstDegrade.fallbackClass ?? '?'}` +
+        `；本会话累计掉档 ${firstDegrade.degradeCount} 次 / 正常 ${firstDegrade.shimCount} 次` +
+        `（共 ${firstDegrade.commandSeq ?? '?'} 次判定）`
+      : `  · 首次掉档：**没有掉过档**（本会话 ${firstDegrade.commandSeq ?? '?'} 次判定全部走 shim 通道）`,
+  )
+  if (tier.status === 'degraded') {
+    lines.push(
+      '  · 处置：① 查 shim 产物是否齐备（DLL / winstage-inject.exe / winstage-probe.exe）；' +
+        '② 查探测证据（暂存根下的 shim.log 与能力探测输出）；' +
+        '③ 在修好之前，本窗口的写入结果按"可能只剩内核硬拒"对待，**不要**当成沙箱内成功。',
+    )
+  }
+  return lines
+}
+
+/**
+ * 渲染"沙箱档位与降级告警"一段（**保留导出**：既有调用方/文档用它，语义不变 ——
+ * 最危险的形态（`launchMode !== 'shim'` 且开关为开）返回 `kind:'error'`，命令文本要显眼）。
+ *
+ * WP3 起它是状态卡的①②两个面的**同一份**渲染（`formatTierLines`），不再自己读产物。
+ *
+ * @returns {{kind: 'success'|'error', text: string}}
+ */
+export function formatLaneSection(service) {
+  const card = buildTrustCard({ service })
+  const status = card.tier.status
+  return {
+    kind: status === 'degraded' ? 'error' : 'success',
+    text: formatTierLines(card).join('\n'),
+  }
+}
+
+/** 状态卡 → **人读文本**（机读对象见 `buildTrustCard()`；两者同一份数据，不各算一次） */
+export function formatTrustCard(card) {
+  const { tier, firstDegrade, stageRoot, approvals, writes, readVisibility, trust } = card
+  const lines = [`【WinStage 可信性状态卡】 生成于 ${card.at}`]
+  lines.push(`  结论：${card.conclusion}`)
+  lines.push(
+    `  机读：level=${trust.level} ok=${trust.ok} …` +
+      `store=${card.storeHash ?? '(none)'} markers=${trust.blockers.map((b) => b.code).join(',') || '(none)'}`,
+  )
+  lines.push('')
+  lines.push('① 档位')
+  for (const line of formatTierLines(card).slice(1)) lines.push(line)
+  lines.push('')
+  lines.push('② 首次掉档 / 是否曾掉档')
+  lines.push(
+    `  · 是否曾掉档 = ${firstDegrade.everDegraded ? '是' : '否'}；首次 = ${firstDegrade.at ?? '（无）'}` +
+      `；命令序号 = ${firstDegrade.seq ?? '（无）'}；原因分类 = ${firstDegrade.fallbackClass ?? '（无）'}`,
+  )
+  lines.push(`  · 计数：掉档 ${firstDegrade.degradeCount} 次 / 走 shim ${firstDegrade.shimCount} 次（判定总数 ${firstDegrade.commandSeq ?? 0}）`)
+  if (firstDegrade.fallbackReason) lines.push(`  · 首次原因原文 = ${firstDegrade.fallbackReason}`)
+  lines.push('')
+  lines.push('③ 失根')
+  lines.push(
+    `  · 此刻 = ${
+      !stageRoot.checked
+        ? '（未检查：没有会话存储根）'
+        : stageRoot.alive
+          ? '存活'
+          : stageRoot.reasonCode === 'never-created'
+            ? '尚未建立（本会话还没有过暂存写入 —— **不是**故障）'
+            : `**不可用**（${stageRoot.reason}）`
+    }；是否发生过 = ${stageRoot.everLost ? '是' : '否'}；次数 = ${stageRoot.lossCount}`,
+  )
+  if (stageRoot.everLost) {
+    lines.push(`  · 最近一次：${stageRoot.lastLossAt ?? '（无时间戳）'}（${stageRoot.lastLossReason ?? '原因未知'}，观测点=${stageRoot.lastLossPhase ?? '?'}，命令序号=${stageRoot.lastLossSeq ?? '?'}）`)
+  }
+  lines.push(`  · 口径：${stageRoot.note}`)
+  lines.push('')
+  lines.push('④ 未结算审批')
+  lines.push(
+    approvals.available
+      ? `  · 有 ${approvals.unsettledCount} 项 \`approval/asked\` 没有应答（扫过 ${approvals.scanned} 条会话事件）` +
+        `${approvals.unsettledCount > 0 ? '：会话可能正卡在等待决策上' : ''}`
+      : `  · 读不到会话事件（${approvals.reason ?? 'unknown'}）——这一面**未知**，不是"没有"。`,
+  )
+  for (const item of approvals.unsettled.slice(0, 5)) {
+    lines.push(`    · ${item.id}${item.reason ? ` — ${item.reason}` : ''}`)
+  }
+  lines.push('')
+  lines.push('⑤ 未确认写入（staging_write_not_persisted）')
+  lines.push(
+    writes.available
+      ? `  · 清单里还留着 ${writes.count} 条未确认写入` +
+        `${writes.last ? `：最近 ${writes.last.at ?? '（无时间戳）'} 的 ${writes.last.path}` : ''}`
+      : `  · 读不到清单（${writes.reason ?? 'unknown'}）——这一面**未知**，不是"没有"。`,
+  )
+  if (writes.last?.problems?.length) {
+    lines.push(`    · 检查项：${writes.last.problems.map((p) => p.check).join('、')}`)
+  }
+  if (writes.available) lines.push(`  · 口径：${writes.note}`)
+  lines.push('')
+  lines.push('⑥ 读侧可见性')
+  lines.push(
+    readVisibility.available
+      ? `  · 策略=${readVisibility.policy ?? '?'}；去重对象 ${readVisibility.objects} 个；读取 ${readVisibility.reads} 次` +
+        `${readVisibility.truncated ? '（已达条目上限，计数只累计不再新增）' : ''}` +
+        `${readVisibility.topMaskIds.length > 0 ? `；按类：${readVisibility.topMaskIds.map((x) => `${x.maskId}×${x.count}`).join('、')}` : ''}`
+      : '  · 还没有已发布的快照，这一面暂无数据（**不是**"没有敏感读"）。',
+  )
+  lines.push('')
+  lines.push('  说明：本卡片只走**用户侧**通道（/winstage status 文本、面板）；命令自身的 stdout/stderr 与工具输出**逐字节不变**，不含本卡任何内容。')
+  return lines.join('\n')
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WP3-B：面板**读侧路径对齐**（宿主侧解析 + 逻辑标识，客户端不再拼旧布局）
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// 缺口（实测）：存储根已迁到 Windows 缓存（`resolveStageRoot()`），而 `client.js` 仍按
+// **旧布局**拼 `<workspaceRoot>/.dshstage/sessions/<键>/review.json` ⇒ 面板永远读不到
+// 新根里的快照（读到的是"没有待审"，或者更糟：升级前遗留的**旧**快照）。
+//
+// 修法：把"存储根在哪"这一判断**收回宿主侧**，且只有一条解析路径
+// （`review-service.mjs::resolveReviewStoreDir()`，签名不改）。客户端只拿**逻辑标识**
+// （路由名 + 会话 id），**不接触任何暂存路径** —— `PANEL_STORE_LABEL` 是给人看的逻辑标签，
+// `storeHash` 是给机器关联的短哈希，两者都不含路径。
+
+export const PANEL_ROUTE_PREFIX = '/winstage-panel'
+export const PANEL_SNAPSHOT_PATH = `${PANEL_ROUTE_PREFIX}/snapshot`
+export const PANEL_TRUST_PATH = `${PANEL_ROUTE_PREFIX}/trust`
+
+/** 面板读到的存储的**逻辑**标识（不含路径）；机读 `hash` 由 `storeHash()` 给 */
+export function panelStoreIdentity(dir, sessionId) {
+  const scope = typeof sessionId === 'string' && sessionId.trim().length > 0 ? 'session' : 'shared'
+  return { scope, label: scope === 'session' ? '会话工作根（Windows 缓存）' : '共享工作根（Windows 缓存）', hash: storeHash(dir) }
+}
+
+/**
+ * 宿主侧解析某会话的存储根 —— **唯一**入口是 `resolveReviewStoreDir()`。
+ *
+ * 为什么不在客户端解析：缓存根的基目录来自宿主进程的 `%LOCALAPPDATA%`，浏览器里没有这个
+ * 事实；客户端自己拼只能拼出旧布局（这正是本次缺口）。**纯函数、无副作用、不建目录**。
+ */
+export function panelStoreDir({ workspaceRoot, sessionId, env } = {}) {
+  return resolveReviewStoreDir({ workspaceRoot, sessionId, env })
+}
+
+/**
+ * 读**已发布**的快照（只读：不实例化审阅服务 ⇒ 不建目录、不触发认领/自愈）。
+ * @returns {{ok: boolean, code?: string, dir?: string, snapshot?: object, detail?: string}}
+ */
+export function readPublishedSnapshot({ workspaceRoot, sessionId, env } = {}) {
+  const dir = panelStoreDir({ workspaceRoot, sessionId, env })
+  const file = join(dir, REVIEW_BASENAME)
+  if (!existsSync(file)) return { ok: false, code: 'no-snapshot', dir }
+  try {
+    return { ok: true, dir, snapshot: JSON.parse(readFileSync(file, 'utf8')) }
+  } catch (error) {
+    return { ok: false, code: 'snapshot-unreadable', dir, detail: String(error?.message ?? error) }
+  }
+}
+
+/**
+ * 面板路由的**纯**核心：`(pathname, query) → {status, body}`（可离线断言，不起 HTTP）。
+ *
+ * 两条路由：
+ *   · `PANEL_SNAPSHOT_PATH` → 已发布快照 + **逻辑**存储标识（路径字段一律剥掉）；
+ *   · `PANEL_TRUST_PATH`    → 可信性状态卡（与 `/winstage status` 同一份 `buildTrustCard()`）。
+ *
+ * ⚠ 关闭态返回 `503 disabled`：面板在关闭时本来就不该看到任何暂存内容（`client.js` 的
+ *   开关闸门是同一语义；这里再挡一道，免得"关掉了却仍在审批"从路由侧回来）。
+ */
+export function buildPanelPayload({ pathname, query, workspaceRoot, sessionId, env, isEnabled = () => true, session, now } = {}) {
+  const read = (key) => {
+    if (query instanceof Map) return query.get(key) ?? undefined
+    if (query && typeof query.get === 'function') return query.get(key) ?? undefined
+    return undefined
+  }
+  if (pathname !== PANEL_SNAPSHOT_PATH && pathname !== PANEL_TRUST_PATH) {
+    return { status: 404, body: { ok: false, code: 'unknown-route', route: pathname } }
+  }
+  if (!isEnabled()) return { status: 503, body: { ok: false, code: 'disabled', route: pathname } }
+  if (typeof workspaceRoot !== 'string' || workspaceRoot.length === 0) {
+    return { status: 500, body: { ok: false, code: 'no-workspace-root', route: pathname } }
+  }
+  const sid = read('session')
+  const published = readPublishedSnapshot({ workspaceRoot, sessionId: sid, env })
+  const store = panelStoreIdentity(published.dir, sid)
+  if (pathname === PANEL_SNAPSHOT_PATH) {
+    if (!published.ok) {
+      // `no-snapshot` 是**正常**的"当前没有待审"，与"读不到"必须分开
+      return { status: published.code === 'no-snapshot' ? 404 : 500, body: { ok: false, code: published.code, store, detail: published.detail } }
+    }
+    return { status: 200, body: { ok: true, store, snapshot: published.snapshot, source: 'host-route' } }
+  }
+  const card = buildTrustCard({
+    service: undefined,
+    // 面板侧**不实例化审阅服务**（那会建目录、触发认领/自愈），所以把宿主解析出的
+    // 存储根**显式**交给状态卡：①②③⑤ 四个面照样齐 —— 面板看到的与 `/winstage status`
+    // 是同一份判据、同一份数据。
+    storeDir: published.dir,
+    session,
+    // 面⑥要靠已发布快照（这里**不**写盘）
+    snapshot: published.ok ? published.snapshot : undefined,
+    now,
+  })
+  return { status: 200, body: { ok: true, store, card, source: 'host-route' } }
+}
+
+/**
+ * 造面板路由处理器（`ctx.webServer.register({kind:'prefix', path: PANEL_ROUTE_PREFIX, handler})`）。
+ *
+ * @param {{workspaceRoot: string, isEnabled?: Function, env?: object, sessionOf?: Function, log?: Function}} options
+ *   `sessionOf(invocation)`：本路由没有 command invocation，面④需要调用方给一个"当前会话"
+ *   的取法；拿不到就如实标"未知"，**不猜**。
+ */
+export function createPanelHandler(options = {}) {
+  const isEnabled = typeof options.isEnabled === 'function' ? options.isEnabled : () => true
+  const log = typeof options.log === 'function' ? options.log : () => {}
+  return async function winStagePanelHandler(req, res) {
+    let url
+    try {
+      url = new URL(String(req?.url ?? '/'), 'http://localhost')
+    } catch {
+      res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify({ ok: false, code: 'bad-url' }))
+      return
+    }
+    let session
+    try {
+      session = typeof options.sessionOf === 'function' ? options.sessionOf() : undefined
+    } catch {
+      session = undefined
+    }
+    const payload = buildPanelPayload({
+      pathname: url.pathname,
+      query: url.searchParams,
+      workspaceRoot: options.workspaceRoot,
+      sessionId: url.searchParams.get('session') ?? undefined,
+      env: options.env,
+      isEnabled,
+      session,
+    })
+    try {
+      res.writeHead(payload.status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+      res.end(JSON.stringify(payload.body))
+    } catch (error) {
+      log(`面板路由写响应失败：${error?.message ?? error}`)
+    }
+  }
+}
+
 
 /**
  * 注册 `/winstage` 命令族。
@@ -233,8 +913,40 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
     list({ service }) {
       return { kind: 'success', text: formatList(service) }
     },
+    /**
+     * `/winstage status`（含 `winstage-status`）：暂存清单 + **WP3 可信性状态卡**。
+     *
+     * 状态卡把六个面合并成一张（档位 / 首次掉档 / 失根 / 未结算审批 / 未确认写入 /
+     * 读侧可见性），机读字段与人读结论同源。**只在用户侧**：命令文本 + 面板路由；
+     * 命令自身的 stdout/stderr 与工具输出一个字节都不变（下面的 `text` 只回到命令面）。
+     */
     status(context) {
-      return handlers.list(context)
+      const service = context?.service
+      // 一次构建、两处复用：清单与卡片共用**同一份**快照（避免 publish 跑两遍、时间戳分叉）
+      let snapshot
+      if (service && typeof service.snapshot === 'function') {
+        try {
+          snapshot = service.snapshot()
+        } catch (error) {
+          return { kind: 'error', text: `读取暂存快照失败：${error?.message ?? error}` }
+        }
+      }
+      const listed = snapshot
+        ? { kind: 'success', text: formatList(service, snapshot) }
+        : handlers.list(context)
+      const card = buildTrustCard({
+        service,
+        // 面④要读会话事件（`approval/asked` 有没有配对）。命令面拿得到 agent/session，
+        // 拿不到就如实标"未知"——**不猜**。
+        session: context?.invocation?.agent?.session,
+        snapshot,
+      })
+      // 最危险的档位（掉档/失根）必须显眼：命令面用 error 级
+      const alarming = card.trust.level === 'lost' || card.trust.level === 'degraded'
+      return {
+        kind: alarming ? 'error' : listed.kind,
+        text: `${listed.text}\n\n${formatTrustCard(card)}`,
+      }
     },
     refresh({ service }) {
       const snapshot = service.publish()
@@ -310,7 +1022,13 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
       if (result.remaining?.length) lines.push(`  仍在待审：${result.remaining.join(', ')}`)
       if (result.failed.some((f) => f.code === 'STALE_BASELINE')) {
         lines.push('  说明：真实文件在暂存之后被外部改动过，因此默认拒绝覆盖（手册 #12.1）。')
-        lines.push('  处理：/winstage rebase [路径…] 以真实文件为基线重新暂存；或 /winstage approve --rebase [路径…] 一步完成；不想要这份暂存就 /winstage reject [路径…]。')
+        // ★ 缺陷②（F5b）：把**形状**说清。`baseline-appeared`（基线本为"不存在"、
+        //   真实文件在暂存之后出现）是实测那条"点批准就静默丢掉磁盘内容"的形状；
+        //   光说"基线已过期"用户不知道磁盘上已经有东西了。
+        const shapes = [...new Set(result.failed.filter((f) => f.code === 'STALE_BASELINE').map((f) => staleShapeText(f.baselineStaleCode ?? f.driftReason)))]
+          .filter((text) => text.length > 0)
+        if (shapes.length > 0) lines.push(`  形状：${shapes.join('；')}。真实磁盘上的那份内容**没有被覆盖**。`)
+        lines.push('  处理：/winstage rebase [路径…] 以真实文件为基线重新暂存（之后面板会显示 before/after，你确认的就是将要替换的内容）；或 /winstage approve --rebase [路径…] 一步完成；不想要这份暂存就 /winstage reject [路径…]。')
       }
       // "批准了 0 项、也没失败"同样是**静默无效**（面板上看就是"点了没反应"）：
       // 显式回报成 error，让 UI 把原因显示出来。
@@ -630,6 +1348,27 @@ export function installRunCapture(ctx, options = {}) {
 
 export function apply(ctx, config = {}) {
   const log = makeLog(ctx)
+  /**
+   * error 级日志通道（"失败必须响"）。
+   *
+   * ★ 必须是**具名绑定**，不能只在下面 `installRunCapture({ logError: … })` 的
+   *   options 里内联一份：`serviceFor()` 构造审计镜像时要把它传出去
+   *   （`createAuditMirror({ sessionOf, log, logError })`）。
+   *
+   * 2026-09-30 用户报障：那里引用的是裸标识符 `logError`，而 apply 作用域里从来没有这个
+   * 名字 ⇒ 任何 `/winstage*` 命令一到"按会话解析暂存服务"就抛
+   * `ReferenceError: logError is not defined`，用户看到的是
+   * 「`/winstage 失败：logError is not defined`」，整族命令（含 reject/approve）不可用。
+   * 回归门：`.t/host-command-selftest.mjs`（把 host 半真的 apply 跑起来逐个调 handler）。
+   *
+   * 语义：错误只走 error 级日志（`ctx.logger.error`，无则 warn），**绝不进命令文本 /
+   * 工具输出** —— 与 `review-service.mjs` 的 `logError` 同一契约。
+   */
+  const logError = (message) => {
+    const logger = ctx?.logger
+    if (logger && typeof logger.error === 'function') logger.error(message)
+    else log.warn(message)
+  }
   const workspaceRoot = config.workspaceRoot || new URL('..', import.meta.url).pathname.replace(/^\//, '')
 
   /**
@@ -711,6 +1450,48 @@ export function apply(ctx, config = {}) {
     }
   })
 
+  // 2.1) ★ WP3-B：面板**读侧路由**（存储根在宿主侧解析，客户端只拿逻辑标识）。
+  //
+  // 为什么需要一条宿主路由：Client 只被允许用**已有**的 Remote（`workspaceFiles.read`
+  // 要一个**路径**），而存储根自 Phase 1 起在 Windows 缓存里 —— 浏览器里没有
+  // `%LOCALAPPDATA%` 这个事实，客户端自己拼只能拼出旧布局（这就是本次实测的缺口）。
+  // 所以宿主把"根在哪"这件事收回自己这边，用 `resolveReviewStoreDir()` 解析，
+  // 通过一条同源只读路由把**快照/状态卡**给客户端；客户端拿到的只有**逻辑标识**
+  // （路由名 + 会话 id + 存储短哈希），**没有任何暂存路径**。
+  //
+  // 失败必须响（error 级日志）但**不影响**插件其余部分：拿不到 webServer 时命令面照常工作，
+  // 面板则退回"兼容旧布局"的读法（`client.js` 里那条**唯一**的兼容分支）。
+  ctx.inject(['webServer'], (webScope) => {
+    // **本装配没有 webServer**（headless / ACP / 自测桩）不是故障：面板那时会走
+    // `client.js` 那条被注释说明的兼容读法。这里用 info 级如实说明 —— 把正常形态
+    // 记成 error 级会让"失败必须响"变成噪声，真正的失败（register 抛错）才进 error。
+    if (!webScope?.webServer || typeof webScope.webServer.register !== 'function') {
+      log.info('本装配没有 webServer：面板读侧路由未注册；面板将退回兼容旧布局的读法（命令面不受影响）。')
+      return
+    }
+    try {
+      const handler = createPanelHandler({
+        workspaceRoot,
+        isEnabled,
+        log: (message) => log.warn(message),
+        // 面④（未结算审批）需要"当前会话"的事件流。本路由没有 command invocation，
+        // 拿不到就如实标"未知" —— 绝不用"最近一次命令的会话"冒充当前会话。
+      })
+      const route = { kind: 'prefix', path: PANEL_ROUTE_PREFIX, handler }
+      if (typeof webScope.effect === 'function') {
+        webScope.effect(() => webScope.webServer.register(route), 'winstage-sandbox: panel routes')
+      } else {
+        webScope.webServer.register(route)
+      }
+      log.info(`面板读侧路由已注册：${PANEL_ROUTE_PREFIX}（存储根在宿主侧解析；客户端不再拼旧布局）`)
+    } catch (error) {
+      const message = `面板读侧路由注册失败：${error?.message ?? error}（面板会退回兼容读法）`
+      const logger = ctx?.logger
+      if (logger && typeof logger.error === 'function') logger.error(message)
+      log.warn(message)
+    }
+  })
+
   // 2.5) 运行后捕获（默认关；WINSTAGE_CAPTURE=1 打开）
   //      放在启动探测**之前**：`probeOnStart=false` 会在下一步 return，
   //      若把它写在后面，关掉探测就会连带把捕获面一起关掉（静默失效）。
@@ -718,12 +1499,27 @@ export function apply(ctx, config = {}) {
     workspaceRoot,
     serviceFor,
     log: (message) => log.info(message),
-    logError: (message) => {
-      const logger = ctx?.logger
-      if (logger && typeof logger.error === 'function') logger.error(message)
-      else log.warn(message)
-    },
+    // 复用 apply 作用域里那个具名 logError（`serviceFor` 也要用同一个，别再内联一份）
+    logError,
   })
+
+  // 2.6) ★ 缺陷②（F5b）：基线漂移的**只读轮询复核**。
+  //
+  //      为什么必须有它：`review.json` 只在变更/命令时发布，而 `pwsh` 直接写真实磁盘
+  //      不产生这两种事件 ⇒ 快照的 `generatedAt` 会一直冻在上一版，面板对"外部改动"
+  //      完全不可见（F5b 实测 90 s、`staleBaseline=0`），随后点「批准所选」还会静默覆盖。
+  //      本定时器按 Client 的轮询节拍（1500 ms）跑 `ReviewService.reviewDrift()` —— 那是
+  //      **纯读**：指纹没变立刻返回、不写盘；只有事实变了才重发布 review.json。
+  //      关闭态（设置里把沙箱关掉）不装配：那时本插件不接管任何东西，不该有后台读盘。
+  if (isEnabled()) {
+    installBaselineWatch(ctx, {
+      workspaceRoot,
+      log: (message) => log.info(message),
+      // 漂移诊断走**人工侧**通道（error 级日志），绝不进模型可见的 stdout/stderr
+      logError,
+    })
+    log.info('基线漂移复核已装配（只读轮询；外部写入会在一个节拍内出现在面板上）。')
+  }
 
   // 3) 启动探测（如实报告受限令牌能力；与暂存面无关）
   if (config.probeOnStart === false) {

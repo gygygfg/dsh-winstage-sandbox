@@ -2,7 +2,8 @@
  * WinStage 审阅服务（Host 侧）——把项目自有的「暂存—候选—选择性提交」接进 DSH。
  *
  * ── 为什么需要它 ─────────────────────────────────────────────────────────────
- * 暂存树（`.dshstage/`）里的变化必须有一个**权威的读侧与决定侧**：
+ * 暂存树（Phase 1 起位于 **Windows 缓存**里的会话工作根，见 `src/stage-guard.mjs`）
+ * 里的变化必须有一个**权威的读侧与决定侧**：
  *   - 读侧：把"当前待审了什么"渲染成一份快照；
  *   - 决定侧：批准（写进真实工作区）或拒绝（把投影退回真实磁盘）。
  * 两者都走项目自有的 `Workspace`，因此与手工 CLI（`run.cmd`）**共用同一份状态**，
@@ -12,7 +13,8 @@
  * Client **无法**注册新的 `ctx.remote.<命名空间>`：`@deepseek-ai/dsh-api-remotes`
  * 的能力选集是**构建时固定**的（其 README 逐字："Client 不会在运行时发现 Host 中
  * 已启用的服务或 Remote 定义"）。因此本服务用两条**已有的**通道供数：
- *   1. 读：把快照写成工作区内的普通文件（`<workspaceRoot>/.dshstage/review.json`），
+ *   1. 读：把快照写成**本会话存储根**下的 `review.json`（Phase 1 起该根由
+ *      `resolveStageRoot()` 解析，默认在 Windows 缓存里；见 `reviewPath()`），
  *      Client 用已有的 `ctx.remote.workspaceFiles.read` 读它；
  *   2. 写：Client 用已有的 `ctx.remote.commands.execute` 执行 `/winstage approve|reject`。
  * 两条通道都已带鉴权与类型，不需要改 DSH 的 Client 装配（那是构建期产物）。
@@ -26,11 +28,39 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameS
 import { dirname, isAbsolute, join, sep } from 'node:path'
 import { MASK_CLASSES, SELF_MASK_ID, canonical, compareKey, isInside, maskReason } from '../src/paths.mjs'
 import { STATE, STORE_DIR, hashAbsent, hashFile, makeRemovable, writeFileAtomic } from '../src/store.mjs'
-import { Workspace } from '../src/workspace.mjs'
+import { resolveStageRoot } from '../src/stage-guard.mjs'
+import { Workspace, driftReasonOf } from '../src/workspace.mjs'
 import { renderCandidateDiff } from '../src/tools.mjs'
+import { REGISTRY_CANDIDATE_SOURCE, createRegistryStage, registryWireBytes } from '../src/registry-stage.mjs'
+import { createRegExeReader, createRegExeWriter } from '../src/registry-bindings.mjs'
 
-/** 快照文件名（相对 `<workspaceRoot>/.dshstage`） */
+/**
+ * 该候选是不是**注册表**候选（`src/registry-stage.mjs::freezeCandidate()` 的产物）。
+ *
+ * 判据用两个字段的并集，刻意不只看一个：`origin` 是 T3 的候选契约字段，
+ * `source` 是同一份契约里写进 `queue.json` 的那一个。历史上本仓库栽过
+ * "只认一个字段 ⇒ 另一条路径的产物被静默当成文件候选"（`registry-stage.mjs:2606`
+ * 记的正是"沙箱内写成功"与"面板看得到"断成两半那次）。
+ */
+export function isRegistryCandidate(candidate) {
+  return (
+    candidate !== null &&
+    typeof candidate === 'object' &&
+    (candidate.origin === 'registry' || candidate.source === REGISTRY_CANDIDATE_SOURCE)
+  )
+}
+
+/** 快照文件名（与暂存清单**同一个存储根**，见 `reviewPath()`） */
 export const REVIEW_BASENAME = 'review.json'
+
+/**
+ * 自动对准基线（`autoRebaseDrifted()`）的最小间隔。
+ *
+ * `reload()` 在 fs 面的每次操作上都会跑，而"基线漂移"要逐条 stat+hash 真实文件；
+ * 1 s 的节流让"漂移后立刻对齐"与"别为每次读都付这个钱"同时成立。
+ * `autoRebaseDrifted({ force: true })` 绕过节流（自测/人工诊断）。
+ */
+const AUTO_REBASE_INTERVAL_MS = 1000
 
 /**
  * `safety:"danger"` 条目写进 review.json 的 `diff` 字段的占位原因。
@@ -61,7 +91,7 @@ export const SENSITIVE_OMIT_NOTE = '内容已按敏感策略省略（不把凭�
  * 所有取值必须逐字存在于 `MASK_CLASSES`，由 `assertDangerIdsExist()` 硬失败校验。
  */
 export const DANGER_MASK_IDS = Object.freeze([
-  SELF_MASK_ID, // 'stage-store' → .dshstage
+  SELF_MASK_ID, // 'stage-store' → 本工具自身的存储树（遮蔽表里那条 hard 规则）
   'ssh',
   'aws',
   'gcloud',
@@ -133,11 +163,206 @@ export function maskEntryFor(anyPath, extraMasks = []) {
   return { resolved, mask: maskReason(resolved, extraMasks) }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// WP2：存储根的**唯一切换点**（Phase 1）
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Phase 1 起，生产默认存储根**不再**是工作区内的 `<workspaceRoot>/<STORE_DIR>`，
+// 而是 `src/stage-guard.mjs::resolveStageRoot()` 给出的 **Windows 缓存**路径
+// （默认 `%LOCALAPPDATA%\Temp\winstage-stage\<会话键>`）。
+//
+// 本函数是 `review-service.mjs` 里**唯一**拼存储根的地方：`getReviewService()`、
+// `sessionStoreDir()`、`ReviewService.reviewPath()` / `absorbSharedStore()` 全部经它。
+// 因此"某处还在拼旧布局"这种漂移在结构上只可能出现在这一个函数里。
+//
+// 显式 override 通道（保留给自测 / CLI / WP1）优先级：`storeDir` > `stageRoot` > 默认。
+// ⚠ `env` 只影响 `stageBaseDir(env)` 的基目录；生产路径**不传**（用宿主进程 env）。
+export function resolveReviewStoreDir({ workspaceRoot, sessionId, storeDir, stageRoot, env } = {}) {
+  if (storeDir !== undefined && storeDir !== null && String(storeDir).trim() !== '') {
+    return String(storeDir)
+  }
+  return resolveStageRoot({
+    // 无会话身份时用**共享服务**的会话 id（与 `ReviewService` 构造函数的默认值同源），
+    // 这样"共享服务写在哪"与"它自己的快照发布在哪"必然是同一个目录。
+    sessionKey: sessionDirKey(sessionId) || DEFAULT_REVIEW_SESSION_ID,
+    workspaceRoot,
+    env,
+    override: stageRoot,
+  })
+}
+
+/** 升级前的**旧布局**存储根（工作区内的 `<workspaceRoot>/<STORE_DIR>`）。
+ *
+ * Phase 1 之后这个位置**只读/只搬走**（`adoptLegacyStore()` / `absorbSharedStore()`），
+ * 任何写入路径都不再解析到它 —— 所以它不经过 `resolveStageRoot()`（那会把它指向新根，
+ * 旧内容就永远搬不过来了）。名字里带 `legacy` 是刻意的：出现"这里怎么还在工作区里"
+ * 的疑问时，答案就是这一句。
+ */
+export function legacyWorkspaceStoreDir(workspaceRoot) {
+  return join(String(workspaceRoot), STORE_DIR)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WP4：读侧可见性（**默认只记不拦**）
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// 登记表放在本模块而不是 `staging-fs.mjs`，理由是所有权：`review.json` 的**唯一写入者**
+// 是 `ReviewService.publish()`，读侧计数要进快照就必须与快照同一个所有者。
+// `staging-fs.mjs` 只**喂**（`recordReadVisibility()`），不持有状态 ⇒
+// "计数在 A、快照在 B"这种漂移形态结构上不可能发生。
+//
+// 去重键 = `maskId + maskKey`（**不是**逐次记录）：同一个敏感对象被读 N 次只留**一条**
+// 计数，因此"读一百次"既不产生一百条记录，也不会刷一百条提示（用户侧提示按
+// **新命中的 mask 类**至多发一条，上限 = 遮蔽表条目数）。
+//
+// ⚠ 诚实声明（必须随快照一起给用户看）：这是**黑名单**，不是边界。
+//   只记录"本插件真的读到 / 经本入口看到的"路径；换个名字、换条通道就读不到了。
+
+export const READ_POLICIES = Object.freeze(['record', 'block'])
+export const DEFAULT_READ_POLICY = 'record'
+
+/**
+ * 共享（无会话身份）服务的会话 id。
+ * 必须与 `ReviewService` 构造函数的兜底值**逐字一致**：否则"没身份的那次读"记在
+ * `shared` 桶里，而快照（由 `dsh-host` 那个服务发布）永远是空的 —— 计数与快照分家。
+ */
+export const DEFAULT_REVIEW_SESSION_ID = 'dsh-host'
+
+/** 读侧可见性登记表的最大条目数（超出只累计 `reads`，不再新增条目；防巨目录把快照撑爆） */
+const MAX_READ_VISIBILITY_KEYS = 200
+
+/** 会话键 → `{ key, policy, reads, byKey: Map<dedupKey, item>, notices: Set<maskId> }` */
+const READ_VISIBILITY = new Map()
+
+/** 会话 id → 登记表键（与存储根同一个来源：`sessionDirKey()`） */
+export function readVisibilityKey(sessionId) {
+  return sessionDirKey(sessionId) || DEFAULT_REVIEW_SESSION_ID
+}
+
+function visibilityEntry(sessionId, policy) {
+  const key = readVisibilityKey(sessionId)
+  let entry = READ_VISIBILITY.get(key)
+  if (!entry) {
+    entry = { key, policy: DEFAULT_READ_POLICY, reads: 0, byKey: new Map(), notices: new Set() }
+    READ_VISIBILITY.set(key, entry)
+  }
+  if (policy !== undefined && READ_POLICIES.includes(policy)) entry.policy = policy
+  return entry
+}
+
+/** 登记/更新本会话的读策略（`staging-fs` 在装配时登记一次；快照据此如实说明档位） */
+export function setReadVisibilityPolicy(sessionId, policy) {
+  return visibilityEntry(sessionId, policy).policy
+}
+
+export function getReadVisibilityPolicy(sessionId) {
+  return visibilityEntry(sessionId).policy
+}
+
+/**
+ * 记一次**命中遮蔽表**的读（只记不拦时由 `staging-fs.mjs` 的读入口调用）。
+ *
+ * @param {{sessionId?: string, maskId: string, maskKey: string, reason?: string, op?: string}} input
+ * @returns {{dedupKey: string, maskId: string, reads: number, firstForMaskId: boolean, dropped: boolean}}
+ *   `firstForMaskId === true` ⇒ 调用方可以发**一条**用户侧合并提示（同一个 mask 类只发一次）。
+ */
+export function recordReadVisibility(input = {}) {
+  const entry = visibilityEntry(input.sessionId)
+  const maskId = String(input.maskId ?? 'unknown')
+  const key = String(input.maskKey ?? '')
+  const dedupKey = `${maskId}\u0000${key.toLowerCase()}`
+  entry.reads += 1
+  const existing = entry.byKey.get(dedupKey)
+  if (existing) {
+    existing.reads += 1
+    existing.lastAt = new Date().toISOString()
+    if (input.op && !existing.ops.includes(input.op)) existing.ops.push(input.op)
+    return { dedupKey, maskId, reads: existing.reads, firstForMaskId: false, dropped: false }
+  }
+  if (entry.byKey.size >= MAX_READ_VISIBILITY_KEYS) {
+    return { dedupKey, maskId, reads: 1, firstForMaskId: false, dropped: true }
+  }
+  const now = new Date().toISOString()
+  entry.byKey.set(dedupKey, {
+    maskId,
+    path: key,
+    reason: input.reason,
+    reads: 1,
+    ops: input.op ? [input.op] : [],
+    firstAt: now,
+    lastAt: now,
+  })
+  const firstForMaskId = !entry.notices.has(maskId)
+  if (firstForMaskId) entry.notices.add(maskId)
+  return { dedupKey, maskId, reads: 1, firstForMaskId, dropped: false }
+}
+
+/** 该会话的读侧可见性快照（放进 `review.json` 的 `readVisibility` 段；纯读） */
+export function readVisibilitySnapshot(sessionId) {
+  const entry = visibilityEntry(sessionId)
+  const byMaskId = {}
+  const items = []
+  for (const item of entry.byKey.values()) {
+    byMaskId[item.maskId] = (byMaskId[item.maskId] ?? 0) + 1
+    items.push({
+      maskId: item.maskId,
+      path: item.path,
+      reason: item.reason,
+      reads: item.reads,
+      ops: [...item.ops],
+      firstAt: item.firstAt,
+      lastAt: item.lastAt,
+    })
+  }
+  items.sort((a, b) => (a.firstAt < b.firstAt ? -1 : a.firstAt > b.firstAt ? 1 : 0))
+  return {
+    policy: entry.policy,
+    /** 去重后的"敏感对象"条数（去重键 = `maskId + maskKey`） */
+    objects: entry.byKey.size,
+    /** 未去重的读取次数（同一个对象读 N 次就 +N，但**不**新增条目） */
+    reads: entry.reads,
+    /** 是否因为条目上限而不再新增条目（只累计 `reads`）—— 如实标注，不假装计数完整 */
+    truncated: entry.byKey.size >= MAX_READ_VISIBILITY_KEYS,
+    byMaskId,
+    items,
+    note: '读侧可见性：只记录、不改写读结果（默认 readPolicy=record）。这是黑名单式的记录，不是读边界。',
+  }
+}
+
+/** 清空某会话的读侧可见性登记（自测用；生产路径不调用） */
+export function resetReadVisibility(sessionId) {
+  READ_VISIBILITY.delete(readVisibilityKey(sessionId))
+}
+
+/**
+ * 基线漂移**形状** —— 直接复用 `src/workspace.mjs` 的实现，**不再写第二份**。
+ *
+ * 值的来源必须唯一：`Workspace.baselineDrift().reason`（面板与批准前的诊断用它）与
+ * 快照渲染用的 `change.before.hash vs 真实 hash`（渲染层用它）判的是同一件事，
+ * 两处若各写一份 `if/else`，迟早会出现"面板说 appeared、批准说 drifted"。
+ * 这里 re-export 给 `review-service.mjs` 的使用者（host/client 断言）同一入口。
+ *
+ * 缺陷②（F5b）实测的形状就是 `baseline-appeared`：基线 = absent（新增）、
+ * 真实文件在暂存之后由 shell 出现。旧实现只有一个布尔位 ⇒ 面板只能说
+ * "基线已过期"，用户看不出这是"磁盘上多出一份没有暂存副本的内容"。
+ */
+export { driftReasonOf }
+
+/**
+ * 单个漂移形状的**人话**（命令面 / 面板共用一份字面量来源）。
+ * 未知形状按最保守的"外部改写"表述。
+ */
+export function driftReasonText(reason) {
+  if (reason === 'baseline-appeared') return '真实文件在暂存之后出现（基线本为"不存在"）'
+  if (reason === 'baseline-deleted') return '真实文件在暂存之后被外部删除'
+  return '真实文件在暂存之后被外部改写'
+}
+
 /**
  * 判级纯函数：`change` → `{ external, risk, safety, riskReason }`。
  *
  * 三档**不是互斥树**，因此判级是一条**短路顺序链**：
- *   1. 命中敏感规则 ⇒ `sensitive`（不管在不在工作区内：`.dshstage` 就是"内 + 敏感"）；
+ *   1. 命中敏感规则 ⇒ `sensitive`（不管在不在工作区内：本工具自身的存储树就是"内 + 敏感"）；
  *   2. 否则不在工作区内 ⇒ `outside`；
  *   3. 否则 ⇒ `normal`。
  *
@@ -167,7 +392,7 @@ export function classifyChange(change, options = {}) {
   //
   // `external` 的判据（顺序）：显式 `change.external` 布尔 > **resolved 后是否在工作区内**。
   // 为什么不"词法上是否绝对路径"：工作区**内**的绝对路径真实存在
-  //（如 `<wsRoot>\\.dshstage\\staged\\x`），按词法会把"内+敏感"错判成 external（断言 ④ 抓到的）。
+  //（如工作区根下本工具自身存储树里的暂存对象），按词法会把"内+敏感"错判成 external（断言 ④ 抓到的）。
   // 用 resolved 判定与 `Workspace.maskOf()` 同源，也与 S3a 的暂存语义一致：
   // 外部条目 canonical 后不落在 workspace realpath 下 ⇒ 必然判为 external。
   const explicitExternal = typeof change.external === 'boolean' ? change.external : undefined
@@ -223,6 +448,31 @@ export function countRisks(files) {
 }
 
 /**
+ * ── WP5′.2：截断的**机读原因**（纯函数；`snapshot()` 与离线断言**共用同一实现**）─────
+ *
+ * 旧实现把两种完全不同的截断塞进同一个布尔位 `truncated`：
+ *   · `row-limit`     —— 行数超过 `limits.maxFiles`，**有整行没列出来**（少报条目）；
+ *   · `content-limit` —— 某条的 `diff` 片段被 `limits.maxLinesPerFile` 截了（内容不全）。
+ * 两者对用户的含义、对断言的判据都不一样，共用一个布尔位就无法机检"到底是哪一种"。
+ * 本函数把它们分开命名，合并时用 `+` 连接（`'row-limit+content-limit'`），`null` = 没截断。
+ *
+ * 为什么导出：`_r3/wp5-test.mjs` 要**直接**验证这套映射（含"行被安全策略省略 diff 时
+ * `truncated` 必须保持 false"这一条 —— 省略不是截断，两个语义不能混）。
+ *
+ * @param {Array<{truncated?: boolean}>} listed 全量行（截断前）
+ * @param {number} listedCount 本页实际列出的条数
+ * @returns {string|null}
+ */
+export function truncatedReasonOf(listed = [], listedCount = 0) {
+  const rowTruncated = listed.length > listedCount
+  const contentTruncated = listed.some((item) => item?.truncated === true)
+  const parts = []
+  if (rowTruncated) parts.push('row-limit')
+  if (contentTruncated) parts.push('content-limit')
+  return parts.length === 0 ? null : parts.join('+')
+}
+
+/**
  * 顶层 `alerts`：**只承载数据，不做任何阻断**。
  *
  * 为什么需要它（用户拍板的交互模型）：运行时**不弹任何东西**，只有"明确信息泄露"
@@ -274,7 +524,26 @@ export class ReviewService {
   constructor(options = {}) {
     if (!options?.workspaceRoot) throw new Error('ReviewService: workspaceRoot is required')
     this.workspaceRoot = options.workspaceRoot
-    this.sessionId = options.sessionId || 'dsh-host'
+    this.sessionId = options.sessionId || DEFAULT_REVIEW_SESSION_ID
+    /**
+     * 本会话的存储根（WP2：由 `resolveReviewStoreDir()` → `resolveStageRoot()` 解析；
+     * 默认 = Windows 缓存里的会话工作根，**不再**是工作区内的旧布局）。
+     *
+     * 为什么必须留住它：**注册表**候选的布局是"覆盖层 + WAL + 候选 + 队列"全在
+     * `<sessionDir>/` 下（`src/registry-stage.mjs:1758-1766`），而 `apply()`/`discard()`
+     * 要拿同一个 sessionDir 重新打开覆盖层。丢了它就只能"看得到、批不了"。
+     */
+    this.storeDir = options.storeDir
+      ? String(options.storeDir)
+      // WP2：没显式注入时**不是** `undefined`（旧版就是 undefined，于是注册表候选只能
+      // "看得到、批不了"）。这里与 `this.workspace.store.dir` 走**同一个**解析入口，
+      // 因此两者逐字相等是结构性事实，不靠约定。
+      : resolveReviewStoreDir({
+          workspaceRoot: this.workspaceRoot,
+          sessionId: this.sessionId,
+          stageRoot: options.stageRoot,
+          env: options.env,
+        })
     this.limits = { ...DEFAULT_LIMITS, ...(options.limits || {}) }
     this.log = options.log || (() => {})
     /** 可选 logger（由 `staging-fs` 传入 `ctx.logger`）：让"失败必须响"能到 warn/error 级 */
@@ -291,11 +560,25 @@ export class ReviewService {
     this.audit = options.audit
     /** 清除路径上"回收 / 丢弃失败"的记账（`reject()` / `_rebase()` 复位并随返回值上报） */
     this.clearFailures = []
+    /**
+     * 缺陷②（F5b）：只读轮询复核的记账。
+     * `driftFingerprint` = 上一次发布时"清单 mtime + 每条净 diff 两侧 hash"的指纹，
+     * 用来判断"是否值得再写一次 review.json"；`driftSnapshot` = 那一版快照。
+     * 两者都只是缓存，丢了最多多发一次快照，不影响正确性。
+     */
+    this.driftFingerprint = undefined
+    this.driftSnapshot = undefined
+    /** 已上报过的漂移（`emitDriftDiagnostics()` 按 路径+形状+两侧 hash 去重，只报一次） */
+    this.reportedDrift = new Set()
+    /** `stageBaseDir(env)` 的注入缝（自测用；生产不传 ⇒ 用宿主进程 env） */
+    this.env = options.env
     this.workspace = new Workspace({
       workspaceRoot: this.workspaceRoot,
       sessionId: this.sessionId,
-      // 会话隔离：存储根落到该会话自己的目录；不传时保持 <root>/.dshstage
+      // WP2：存储根**只有一条**解析路径（`resolveReviewStoreDir()`）；显式注入优先，
+      // 否则 `Workspace` → `Store` 也会走同一个 `resolveStageRoot()`（`src/store.mjs`）。
       ...(options.storeDir ? { storeDir: options.storeDir } : {}),
+      ...(options.env ? { env: options.env } : {}),
     })
     this.workspace.init({ origin: 'host-plugin' })
     this.markFresh()
@@ -306,6 +589,11 @@ export class ReviewService {
    *
    * 这些分支以前只用 `this.log`（= `logger.info`）记一句就吞掉，实测表现是"零报错"。
    * 顺序：`logger.warn` → `logger.error` → `console.error`（进程 stderr）。
+   *
+   * ⚠ **痕迹边界（本轮复核）**：本方法是**人工侧通道**（宿主 logger / 宿主进程 stderr），
+   * 不是模型可见通道 —— 它永远不参与命令的 stdout/stderr，也绝不能被拼进 `/winstage*`
+   * 命令的 `text` 返回值（那两路都会被模型看到）。因此这里的 `[winstage]` 前缀保留：
+   * 它是给运维/用户看的归因标记。**新增任何面向模型的文案时，不要走这里。**
    */
   logError(message) {
     const line = `[winstage] ${message}`
@@ -363,7 +651,93 @@ export class ReviewService {
   /** 每次操作前重读持久状态（CLI 与插件共用一份暂存树） */
   reload() {
     this.workspace.init()
+    // ★ 缺陷②（F5b）：这里**不再**自动对准基线。
+    //   旧版在每次 reload() 上跑 `autoRebaseDrifted()`，而 reload() 又被 snapshot() /
+    //   publish() / approve() 调用 ⇒ "重新发布快照"这个动作本身就把漂移抹掉了，
+    //   面板永远看不到 `baselineStale`（F5b 实测 90 s：`staleBaseline=0`、无徽标），
+    //   紧接着 approve() 的自动对齐还让批准**静默成功**。
+    //   现在：reload() 只重读清单；无损漂移由显式 rebase / 诊断路径处理，
+    //   有损漂移保持可见并以 `STALE_BASELINE` 拒绝落盘。
     return this.workspace
+  }
+
+  /**
+   * ★ **自动对准基线** —— 只处理**无损**漂移（缺陷② F5b 收窄后的语义）。
+   *
+   * 暂存条目是"相对某个基线的 diff"。基线一旦被**外部**改动，`applyOneChange()` 会以
+   * `STALE_BASELINE` 拒绝落盘（这层保护是对的：绝不静默覆盖）。
+   *
+   * 本方法把 `/winstage rebase` 的落地动作（`_rebase()` → `rebaseEntry()` 重述
+   * `baseHash/baseKind`，**不动** `stagedHash/state`）在一处集中执行，但**只对**
+   * 真实内容与暂存内容相同（⇒ 对准后无净变化、磁盘一个字节都不会被改）的漂移生效：
+   *   - 真实内容 == 暂存内容 ⇒ 无损：对准后条目自动退出视图；
+   *   - 真实内容 ≠ 暂存内容（含"基线 absent 而真实文件已出现"）⇒ **blocked**，
+   *     绝不自动对准 —— 否则这条会变成"可批准"，下一次批准静默覆盖外部写入
+   *     （F5b 实测的数据丢失路径）。它保持 `baselineStale`，由显式 `/winstage rebase`
+   *     或 `/winstage reject` 处置。
+   *
+   * 调用点（收窄后）：`/winstage rebase`（`rebase()`）、`approve --rebase` 的显式意图、
+   * 以及自测/人工诊断。**不在** `reload()` / `publish()` / `afterMutation()` / `approve()`
+   * 里 —— 那些路径一旦自动对准，快照就永远看不到漂移（F5b 的 90 s 静默就是这么来的）。
+   *
+   * 幂等 + 节流：没有漂移时不重冻结、不写快照；1 秒内重复调用直接返回上次结论。
+   * 逃生口：`WINSTAGE_AUTO_REBASE=0` 关掉（回到显式 `/winstage rebase`）。
+   *
+   * @param {{force?: boolean}} [options] `force` 绕过节流（自测/人工诊断用）
+   * @returns {{rebased: string[], discarded: string[], blocked: Array<{path:string,reason:string,expected:string,found:string}>, skipped: boolean, throttled?: boolean}}
+   */
+  autoRebaseDrifted(options = {}) {
+    if (process.env.WINSTAGE_AUTO_REBASE === '0') {
+      return { rebased: [], discarded: [], blocked: [], skipped: true }
+    }
+    const now = Date.now()
+    if (options.force !== true && this.autoRebaseLastAt !== undefined && now - this.autoRebaseLastAt < AUTO_REBASE_INTERVAL_MS) {
+      return { rebased: [], discarded: [], blocked: [], skipped: false, throttled: true }
+    }
+    // 重入保护：`_rebase()` 里会走 `reconcileCandidates()` / `ensureCandidate()`，
+    // 它们可能再次触发 `reload()`；没有这道闸就是无限递归。
+    if (this.autoRebasing === true) {
+      return { rebased: [], discarded: [], blocked: [], skipped: false, throttled: true }
+    }
+    this.autoRebasing = true
+    try {
+      const ws = this.workspace
+      const drifted = []
+      const blocked = []
+      for (const change of ws.diffEntries()) {
+        const drift = ws.baselineDrift(change.path)
+        if (!drift.stale) continue
+        /**
+         * ★ 缺陷②（F5b）的核心闸门：**只有在"重述基线不会丢内容"时才允许自动对准**。
+         *
+         * 重述基线的语义是"把 before 换成现实、把暂存内容留作 after"。于是：
+         *   - 真实内容 **等于** 暂存内容 ⇒ 对准后是"无净变化"，条目自动退出视图，
+         *     磁盘一个字节都不会被改 —— 无损，可以自动做；
+         *   - 真实内容 **不等于** 暂存内容 ⇒ 对准之后那一条就变成"可批准"，
+         *     下一次批准会把真实内容盖掉。旧实现在这里**静默**对准 ⇒ F5b 实测：
+         *     基线 = absent（新增）而真实盘被 shell 写成 `SHELL-VERSION`，90 s 内
+         *     无任何标记，点「批准所选」直接把真实盘覆盖成 `STAGED-VERSION`，
+         *     无提示、无告警、无错误（数据静默丢失）。
+         *
+         * 因此这一档**拒绝自动对准**：漂移留在清单里 ⇒ `renderChange()` 照旧标
+         * `baselineStale` ⇒ 面板有徽标、命令面有文案、`applyOneChange()` 以
+         * `STALE_BASELINE` 拒绝落盘。出路仍是既有的那条：显式
+         * `/winstage rebase`（`_rebase()` 不受这里约束）或 `/winstage reject`。
+         */
+        const staged = ws.entryOf(change.path)?.stagedHash ?? hashAbsent()
+        if (drift.found !== hashAbsent() && drift.found !== staged) {
+          blocked.push({ path: change.path, reason: drift.reason, expected: drift.expected, found: drift.found })
+          continue
+        }
+        drifted.push(change.path)
+      }
+      this.autoRebaseLastAt = now
+      if (drifted.length === 0) return { rebased: [], discarded: [], blocked, skipped: false }
+      const result = this._rebase(drifted)
+      return { rebased: result.rebased, discarded: result.discarded, blocked, skipped: false }
+    } finally {
+      this.autoRebasing = false
+    }
   }
 
   /** 快照文件绝对路径（与暂存清单**同一个存储根**；会话隔离时即该会话的目录） */
@@ -372,21 +746,50 @@ export class ReviewService {
   }
 
   /**
-   * **自愈**：把共享存储（`<root>/.dshstage/`）里已经落下的条目并进本会话的存储。
+   * **自愈**：把**别处**已经落下的条目并进本会话的存储（WP2：候选来源经
+   * `resolveStageRoot()` 解析，绝不硬拼旧布局）。
    *
    * 为什么需要：只要有一次调用拿不到会话身份（旧进程、agentless、initiator 不可读），
-   * 内容就会落到共享根，而面板只读自己的会话目录 ⇒ 条目"随 Turn 消失"。这里在**每次
-   * 会话级写/命令**上做一次便宜检查（共享 manifest 不存在就零成本返回）：
+   * 内容就会落到**共享根**，而面板只读自己的会话目录 ⇒ 条目"随 Turn 消失"。这里在**每次
+   * 会话级写/命令**上做一次便宜检查（manifest 不存在就零成本返回）：
    *   - 目标还没有 manifest ⇒ 整份搬（rename 优先，失败退回复制）；
    *   - 目标已有 manifest ⇒ 按**条目键**合并（目标优先），blobs/staged 只补缺失的；
-   *   - 并完清掉共享 manifest/queue（`candidates` 丢弃：净 diff 会重新冻结）。
+   *   - 并完清掉来源的 manifest/queue（`candidates` 丢弃：净 diff 会重新冻结）。
+   *
+   * 两个来源（顺序即优先级）：
+   *   1. **共享根** = `resolveReviewStoreDir({ sessionId: undefined })` —— Phase 1 之后
+   *      "没有会话身份"的那次写落在缓存里的哪，这里就扫哪；
+   *   2. **旧布局**（`legacyWorkspaceStoreDir()`）—— 升级前积在工作区里的内容。
+   *      只读/只搬走，永不回写（写入路径一个字节都不会再落到那里）。
    * @returns {number} 并入的条目数（0 = 没有可并的）
    */
   absorbSharedStore() {
-    const sharedDir = join(this.workspaceRoot, STORE_DIR)
+    const seen = new Set()
+    let total = 0
+    for (const dir of [this.sharedStoreDir(), legacyWorkspaceStoreDir(this.workspaceRoot)]) {
+      let dedup
+      try {
+        dedup = canonical(dir).toLowerCase()
+      } catch {
+        dedup = String(dir).toLowerCase()
+      }
+      if (seen.has(dedup)) continue
+      seen.add(dedup)
+      total += this.absorbFromStore(dir)
+    }
+    return total
+  }
+
+  /** 本进程"共享（无会话身份）"服务的存储根 —— 与 `getReviewService()` 同一解析入口 */
+  sharedStoreDir() {
+    return resolveReviewStoreDir({ workspaceRoot: this.workspaceRoot, sessionId: undefined, env: this.env })
+  }
+
+  /** 从**某一个**来源存储把条目并进本会话（`absorbSharedStore()` 的实体；逐来源独立记账） */
+  absorbFromStore(sharedDir) {
     const targetDir = this.workspace.store.dir
     try {
-      if (canonical(targetDir) === canonical(sharedDir)) return 0 // 本服务就是共享服务
+      if (canonical(targetDir) === canonical(sharedDir)) return 0 // 本服务就是那个来源
       const sharedManifestPath = join(sharedDir, 'manifest.json')
       if (!existsSync(sharedManifestPath)) return 0
       let shared
@@ -440,18 +843,32 @@ export class ReviewService {
         this.workspace.init()
         this.markFresh()
         this.publish()
-        this.log(`已把共享存储里的 ${moved} 条待审并入会话存储：${targetDir}`)
+        this.log(`已把来源存储里的 ${moved} 条待审并入会话存储：${targetDir}`)
       }
       return moved
     } catch (error) {
       // S11：以前只有 `logger.info`（实测"零报错"）⇒ 现在 warn/error 级
-      this.logError(`并入共享存储失败（已忽略）：${error?.message ?? error}`)
+      this.logError(`并入来源存储失败（已忽略）：${error?.message ?? error}`)
       return 0
     }
   }
 
   /** 变更过暂存树之后：冻结候选并发布快照（供 Client 轮询） */
   afterMutation(reason = 'mutation') {
+    /**
+     * ★ 缺陷②（F5b）：这里**不再**自动对准基线。
+     *
+     * 旧注释写的是"每次修改都强制对齐一次基线"，理由是"对齐必须发生在冻结候选之前，
+     * 这样候选的 before 一定是现实"。但那个理由只对**无损**形状成立：
+     *   - 真实内容 ≠ 暂存内容时，"重述基线"会把外部写入变成一条**可批准**的 diff，
+     *     于是下一次批准静默覆盖它 —— F5b 实测（基线 = absent、真实盘被 shell 写成
+     *     `SHELL-VERSION`）就是这样丢掉内容的；
+     *   - 而"本次修改"通常只涉及一个路径，无差别对齐会把**其它**路径的漂移一起抹掉。
+     *
+     * 现在的分界：`autoRebaseDrifted()` 只自动处理**无损**漂移（真实内容 == 暂存内容，
+     * 对准后无净变化）；有内容丢失风险的漂移留给显式 `/winstage rebase` / `reject`。
+     * 因此这里不再需要"先对齐再冻结"——漂移路径会以 `baselineStale` 出现在快照里。
+     */
     let frozenInfo
     try {
       frozenInfo = this.ensureCandidate(reason)
@@ -563,6 +980,9 @@ export class ReviewService {
   frozenOnlyRows(ws, netKeys) {
     const merged = new Map()
     for (const candidate of ws.listReviews()) {
+      // 注册表候选走 `registryRows()` 这条**可批准**的路，绝不在这里被降级成
+      // "冻结存档行"（那正是"看得到、勾不上、批不了"的形态）。
+      if (isRegistryCandidate(candidate)) continue
       const appliedKeys = new Set((candidate.appliedPaths || []).map((entry) => compareKey(entry)))
       for (const change of candidate.changes || []) {
         const key = compareKey(change.path)
@@ -613,6 +1033,59 @@ export class ReviewService {
     })
   }
 
+  /**
+   * 注册表候选 → Client 可直接渲染的**可批准**行。
+   *
+   * 与文件行同构（同样的 `path/op/kind/totals/diff/external/risk/safety/riskReason`），
+   * 只多两个字段：`kind:'registry'` 与 `registryPath`/`valueName`。
+   * ⚠ 这些行**没有 diff 内容**：注册表变更的内容不在文件系统里，面板至少能显示
+   * "哪个键/哪个值、什么操作、三档风险"，这与"看不到内容就不给批准"的既有硬约束
+   * 并不冲突 —— 覆盖层的语义是"批准=把这条键值变更照原样应用到真实 hive"，
+   * 而用户看到的就是那条变更本身。
+   */
+  registryRows(ws, pending) {
+    const rows = []
+    for (const candidate of pending) {
+      if (!isRegistryCandidate(candidate)) continue
+      for (const change of candidate.changes || []) {
+        let verdict
+        try {
+          verdict = classifyChange(
+            { ...change, external: true },
+            { workspaceRoot: this.workspaceRoot, masks: ws?.extraMasks },
+          )
+        } catch {
+          verdict = { external: true, risk: 'outside', safety: 'normal', riskReason: 'registry change' }
+        }
+        const row = {
+          path: change.path,
+          op: change.op,
+          kind: 'registry',
+          registry: true,
+          totals: { added: 0, removed: 0 },
+          diff: [],
+          truncated: false,
+          external: true,
+          risk: verdict.risk,
+          safety: verdict.safety,
+          riskReason: verdict.riskReason,
+          candidateIds: [candidate.id],
+          registryPath: change.registryPath ?? change.key,
+          note:
+            '注册表变更：此刻只存在于覆盖层里（**真实注册表一个字节未变**）；' +
+            '勾选并批准后才由宿主令牌写入真实 hive，拒绝则丢弃。',
+        }
+        if (change.valueName !== undefined) row.valueName = change.valueName
+        if (change.appliable === false) {
+          row.appliable = false
+          row.note = `该注册表变更**不可应用**：${change.unsupportedReason ?? '覆盖层无法表示'}`
+        }
+        rows.push(row)
+      }
+    }
+    return rows
+  }
+
   /** 真实文件当前内容哈希（不存在 / 读不了 / 非普通文件 ⇒ `hashAbsent()`，与 applyOneChange 同口径） */
   realHashOf(ws, change) {
     try {
@@ -621,6 +1094,28 @@ export class ReviewService {
       return hashFile(abs)
     } catch {
       return hashAbsent()
+    }
+  }
+
+  /**
+   * ── WP8.2：宿主原件**指纹冲突**（`snapshot` 与 `approve` 共用同一判据）──────────────
+   *
+   * 委派给 `src/workspace.mjs` 的方法（判据只有一份：`baselineConflictOf()` 纯函数 +
+   * `hostFileFingerprint()`）。**刻意不在这里重写一遍比较逻辑** —— 审批面与落盘面
+   * 一旦各持一套判据，"面板说没冲突、批准却拒绝"就会成为常态，而这类不一致正是
+   * F5b 那次静默覆盖的同源缺陷。
+   *
+   * 纯读（只 `statSync` + `hashFile`），不写任何状态；`workspace` 侧注入缝也随之失效时
+   * 一律回 `null`（不判冲突），保证老清单/外部键的行为逐字不变。
+   *
+   * @returns {{code:string,expected:object,found:object|null,changed:string[]}|null}
+   */
+  baselineConflictOf(ws, change) {
+    try {
+      if (typeof ws?.baselineConflictOf !== 'function') return null
+      return ws.baselineConflictOf(change)
+    } catch {
+      return null
     }
   }
 
@@ -638,6 +1133,26 @@ export class ReviewService {
    */
   snapshot(options = {}) {
     const ws = this.reload()
+    /**
+     * ── WP5′：审批面 = **本轮净变更**，按需实时算（不再累积）────────────────────────
+     *
+     * owner 定下的模型与顾虑（原话）："多轮的中间产物不要保留…每一轮暂存都叠加的话会使
+     * 计算量指数增长"。因此这里的分工被**钉死**成：
+     *
+     *   · `changes = ws.diffEntries()` —— **唯一**的条目来源。它是"暂存层 vs 宿主真实文件"
+     *     的实时比对结果，条数只与**逻辑路径数**有关，与**轮次**无关：
+     *     同一路径写 30 次 → 2 个 blob（当前暂存 + 基线）+ **1 条 net diff**，不是 30 条。
+     *     这就是"审批面与轮次解耦"的全部机制 —— 不存在需要清理的累积状态。
+     *   · 候选（`candidates/*.json` + `queue.json`）退化为**结案台账**：
+     *     `workspace.pruneCandidates()` 在"冻结"与"全部应用"两个唯一入口上回收
+     *     `superseded` / `applied` 的候选，只留一份 id → 终态的**墓碑**（幂等性所需，
+     *     见 `queue.resolved` 注释）。因此 `pending.length` 上界是常数（每路径一份未决候选），
+     *     `_r3/wp5-test.mjs` 断言①用 30 轮实测钉住这一点。
+     *
+     * 代价（如实声明，不是隐性行为）：每次快照都要重算净 diff（含逐条 `classifyChange`
+     * 与内容片段渲染）。这与旧实现的区别是"成本与**当前变更集**成正比"，
+     * 而旧实现是"成本与**历史**成正比"——后者是 owner 明确不要的那一种。
+     */
     const changes = ws.diffEntries()
     const pending = ws.listReviews()
     const latest = pending[pending.length - 1]
@@ -645,11 +1160,35 @@ export class ReviewService {
 
     const netKeys = new Set(changes.map((change) => compareKey(change.path)))
     const netFiles = changes.map((change) => this.renderChange(ws, change, limits))
+    const registryFiles = this.registryRows(ws, pending)
+    // 冻结存档行：只在"仍有一份活的候选、其路径却已不在本轮净 diff"时才产生。
+    // 候选被修剪之后这个集合自然收缩到空 —— 它不再是历史的容器。
     const frozenFiles = this.frozenOnlyRows(ws, netKeys)
-    const listed = [...netFiles, ...frozenFiles]
-    const files = listed.slice(0, limits.maxFiles)
-    const additions = files.reduce((sum, f) => sum + f.totals.added, 0)
-    const deletions = files.reduce((sum, f) => sum + f.totals.removed, 0)
+    const listed = [...netFiles, ...registryFiles, ...frozenFiles]
+
+    /**
+     * ── WP5′.2：`listed` / `totalFiles` / `truncated` **三者自洽** ────────────────
+     *
+     * 契约（机读，`_r3/wp5-test.mjs` 断言②逐项核对）：
+     *   · `counts.totalFiles` = **全量**待审条数（截断前）；
+     *   · `counts.listed`     = 本页实际列出的条数；
+     *   · `counts.pageSize`   = 本页上限；
+     *   · 不变式：`counts.listed === Math.min(counts.totalFiles, counts.pageSize)`；
+     *   · `counts.truncated`  = `totalFiles > listed`（**机读布尔位**，旧版恒 false）；
+     *   · `truncatedReason`   = `'row-limit'` / `'content-limit'` / `'row-limit+content-limit'`
+     *     —— 机器可判"是哪一种截断"，不必靠人读 `truncated` 猜（旧版两种语义共用一个布尔位）。
+     *
+     * `contentTruncated` 与行数无关：它是"某条 `diff` 片段被 `maxLinesPerFile` 截了"
+     * （旧版把这个也塞进顶层 `truncated`，于是"行数没超但有文件内容被截"与
+     * "行数超了"无法区分；现在两者分开给）。
+     */
+    const pageSize = Math.max(0, Number(limits.maxFiles) || 0)
+    const files = listed.slice(0, pageSize)
+    const rowTruncated = listed.length > files.length
+    const totals = listed.reduce((acc, f) => ({
+      added: acc.added + f.totals.added,
+      removed: acc.removed + f.totals.removed,
+    }), { added: 0, removed: 0 })
 
     return {
       version: 1,
@@ -658,45 +1197,57 @@ export class ReviewService {
       sessionId: ws.manifest?.sessionId,
       candidateId: latest?.id,
       revision: ws.manifest?.revision,
-      // 待审 = 面板上有**任何**一行。D1 之前这里只看净 diff：净 diff 一空，面板就整体
-      // 卸载，于是队列里的 pending 变成"空壳"（看不到、勾不到、也清不掉）。
-      pending: files.length > 0,
-      truncated: listed.length > limits.maxFiles || files.some((f) => f.truncated),
+      // 待审 = 面板上有**任何**一行（全量口径：被截断掉的行也是待审）
+      pending: listed.length > 0,
+      /** 行级截断的机读位（旧语义保留：只回 true 当"有行没列出来"） */
+      truncated: rowTruncated,
       counts: {
-        /** 面板实际列出的行数（净 diff 行 + 冻结存档行）——旧版是"净 diff 条数" */
-        files: files.length,
-        additions,
-        deletions,
-        /** 净 diff 的条数 = 真正可批准的那部分（旧口径，保留给断言与 CLI） */
+        /** 待审**总数**（截断前） */
+        files: listed.length,
+        /** 面板实际列出的行数（≤ `pageSize`）；`files - listed` 即被截断条数 */
+        listed: files.length,
+        /** 显式全量键（与 `files` 同值），名字不含歧义 */
+        totalFiles: listed.length,
+        /** 本页上限（= `limits.maxFiles`）—— 断言②要拿它做 `min()` */
+        pageSize,
+        /** `totalFiles > listed` 的机读布尔位（旧版恒 false，见文件头缺陷记录） */
+        truncated: rowTruncated,
+        additions: totals.added,
+        deletions: totals.removed,
+        /** 净 diff 的条数 = 真正可批准的那部分（**与轮次无关**，WP5′ 的核心指标） */
         net: changes.length,
-        /** 其中"冻结存档行"的条数（只显示、不可批准） */
-        frozenOnly: files.filter((f) => f.frozenOnly === true).length,
+        /** 其中"冻结存档行"的条数（只显示、不可批准）——按**全量**统计 */
+        frozenOnly: listed.filter((f) => f.frozenOnly === true).length,
+        /** 注册表候选行数（机读；本轮实测曾出现"注册表行 0 条"，故单列一项供断言） */
+        registry: listed.filter((f) => f.registry === true).length,
+        staleBaseline: listed.filter((f) => f.baselineStale === true).length,
+        staleBaselineLossy: listed.filter((f) => f.baselineStale === true && f.baselineStaleCode !== 'baseline-deleted').length,
         /**
-         * 其中"基线已过期"的条数：真实文件在暂存之后被外部改动 ⇒ 直接批准会被
-         * `STALE_BASELINE` 拒绝。面板据此提示并给出 `/winstage rebase` 的出路。
-         * （**只算可批准行**：冻结存档行本来就不可批准，不在这个口径里。）
+         * WP8.2：**基线冲突**（宿主原件在暂存之后被改过 ⇒ 判冲突、不覆盖）的条数。
+         * 与 `staleBaseline` 的区别：后者是"批准会被 `STALE_BASELINE` 拒绝"，
+         * 本键是"新指纹判据（size+mtime+sha256）命中了冲突"。两者同源不同粒度，
+         * 都保留，因为面板对二者的措辞与出路不同（前者：rebase/reject；后者：覆盖/放弃）。
          */
-        staleBaseline: files.filter((f) => f.baselineStale === true).length,
+        baselineConflict: listed.filter((f) => f.baselineConflict === true).length,
       },
-      /** 三档汇总（顶层，供面板显示"共 N 项，其中 M 项在工作区外、K 项敏感"） */
-      riskCounts: countRisks(files),
       /**
-       * 非阻断性提示（danger 档"报一次"的通道；只给数据，Client 决定怎么呈现）。
-       * ⚠ 只按**可批准**的行（净 diff）算：冻结存档行没有任何被写入的可能，
-       * 把它们算成"危险改动"会让横幅长期虚报。
+       * 截断的**机读原因**（`null` = 没截断）。合并语义用 `+` 连接：
+       *   · `row-limit`     —— 行数超过 `pageSize`，有整行没列出来；
+       *   · `content-limit` —— 某条的 `diff` 片段被 `maxLinesPerFile` 截了（行数没超也可能有）。
+       * 与两个计数位**同源**（同一个 `truncatedReasonOf()`），不在这里再推一遍。
        */
+      truncatedReason: truncatedReasonOf(listed, files.length),
+      /** 分页细节（面板据此画"显示前 N / 共 M"）；与 `counts` 同源，不另算一遍 */
+      page: { pageSize, listed: files.length, total: listed.length, omitted: Math.max(0, listed.length - files.length) },
+      riskCounts: countRisks(listed),
       alerts: buildAlerts(netFiles, latest?.id),
-      /**
-       * 仍有活的候选。`appliedPaths` 是**必需**的：删除类路径的"是否已落盘"只能由
-       * "这份候选自己应用过它"判定（`after.hash === 'absent'` 与"文件不存在"同值，
-       * 拿磁盘比对会误判），断言侧要复现同一条判据就必须拿到这份记账。
-       */
       candidates: pending.map((candidate) => ({
         id: candidate.id,
         status: candidate.status,
         paths: (candidate.changes || []).map((change) => change.path),
         appliedPaths: [...(candidate.appliedPaths || [])],
       })),
+      readVisibility: readVisibilitySnapshot(this.sessionId),
       files,
     }
   }
@@ -709,7 +1260,7 @@ export class ReviewService {
    *
    * ── 安全设计决定（Lead 已批准）──────────────────────────────────────────────
    * `diff` 承载的是**文件内容片段**。对 `safety:"danger"` 的条目
-   * （凭据/密钥/`.dsh`/`.dshstage` 等），默认**不把内容片段写进 review.json** ——
+   * （凭据/密钥/本工具自身存储等），默认**不把内容片段写进 review.json** ——
    * 否则等于把凭据渲染进浏览器（快照是普通文件，Client 用
    * `ctx.remote.workspaceFiles.read` 直接读它）。
    *
@@ -754,6 +1305,29 @@ export class ReviewService {
       if (found !== expected) {
         item.baselineStale = true
         item.baseline = { expected, found }
+        // 缺陷②（F5b）：光有布尔位说不清"会不会丢数据"。把**形状**一并给出，
+        // 面板因此能说"真实文件在暂存之后出现"而不是笼统的"基线已过期"。
+        item.baselineStaleCode = driftReasonOf(expected, found)
+      }
+      /**
+       * ── WP8.2：宿主原件**指纹冲突**（size + mtime + sha256）────────────────────────
+       *
+       * 与上面的 `baselineStale` 是**两个口径**，都要给：
+       *   · `baselineStale`    —— 批准会被 `applyOneChange()` 以 `STALE_BASELINE` 拒绝
+       *                           （判据：内容 hash；出路：`/winstage rebase|reject`）；
+       *   · `baselineConflict` —— **新的默认安全闸**：宿主原件在暂存之后被改过 ⇒
+       *                           判冲突、不覆盖，出路是用户在面板上选「覆盖 / 放弃」。
+       * 判据用与 `applyOneChange()` **同一个**纯函数（`baselineConflictOf()`），
+       * 因此"面板说冲突"与"批准会拒绝"不可能互相矛盾（同一份指纹、同一套比较）。
+       * 只在清单记过指纹（`baseFingerprint`，= 普通文件）时才可能为真。
+       */
+      const conflict = this.baselineConflictOf(ws, change)
+      if (conflict) {
+        item.baselineConflict = true
+        item.baselineConflictCode = conflict.code
+        // 变了哪几项（sha256 / size / mtime）—— 面板据此说"内容被改过"还是"只是被触碰"
+        item.baselineConflictChanged = conflict.changed
+        item.hostBaseline = { expected: conflict.expected, found: conflict.found }
       }
     }
     // 敏感省略说明：**只有** danger 档才有这个字段（`undefined` 在 JSON.stringify 里整键消失，
@@ -804,10 +1378,123 @@ export class ReviewService {
    * 语义变化**只有**"失败时不留 tmp"：原错误照旧上抛（不吞、不降级），
    * 因此调用方与断言对错误路径的观察不变。
    */
+  /**
+   * 强制自动对准基线，**失败只记 error 日志**，绝不影响调用方。
+   *
+   * ⚠ 缺陷②（F5b）收窄后：这里**只**对准无损漂移（见 `autoRebaseDrifted()`）。
+   * 有内容丢失风险的漂移会原样留在清单里（返回值里的 `blocked`），继续可见、继续拒绝批准。
+   *
+   * 调用点（收窄后）：显式 rebase 路径与自测/人工诊断。**不再**由
+   * `reload()` / `publish()` / `afterMutation()` / `approve()` 调用。
+   */
+  autoAlignQuietly() {
+    try {
+      return this.autoRebaseDrifted({ force: true })
+    } catch (error) {
+      try {
+        this.logError(`自动对准基线失败（不影响本次操作）：${error?.message ?? error}`)
+      } catch {
+        /* best effort：日志失败也不许影响调用方 */
+      }
+      return { rebased: [], discarded: [], blocked: [], skipped: false, failed: true }
+    }
+  }
+
   publish() {
+    // ★ 缺陷②（F5b）：发布路径**绝不**自动对准基线（旧版这里调 `autoAlignQuietly()`）。
+    //   原因与 `afterMutation()` 逐字相同：对齐会把"真实文件被外部改动"这件事实
+    //   从快照里抹掉，而快照正是用户唯一能看见它的地方。发布必须是**纯读**：
+    //   漂移照旧标 `baselineStale`（+ 形状），批准照旧被 `applyOneChange()` 拒绝。
+    //   显式出路只有两条：`/winstage rebase`（`_rebase()`）或 `/winstage reject`。
     const snapshot = this.snapshot()
     writeFileAtomic(this.reviewPath(), JSON.stringify(snapshot))
     return snapshot
+  }
+
+  /**
+   * **只读**轮询复核（缺陷② F5b 的"正确触发点"）。
+   *
+   * ── 为什么需要它 ────────────────────────────────────────────────────────────
+   * `review.json` 只在"变更 / 命令"时发布。shell（`pwsh` 工具）绕过 `ctx.fs`
+   * 直接写真实磁盘 **不产生任何** 上述事件 ⇒ 快照的 `generatedAt` 会一直冻在
+   * 上一次发布（F5b 实测：90 s 一次都没重发布），面板于是长期显示一条与现实
+   * 不符的"新增"行，且 `staleBaseline = 0`。
+   *
+   * 本方法是**读路径**，三条纪律：
+   *   1. **绝不改状态**：不 `init()` 之外的写、不 rebase、不 discard、不冻结候选。
+   *      不这样的话，"轮询"本身就会变成那个把外部内容盖掉的动作；
+   *   2. **代价受控**：先比一个便宜的指纹（发布时记下的"清单 mtime + 净 diff 的
+   *      before/after hash"），指纹没变就直接返回 —— 调用方因此可以按秒级节拍
+   *      轮询而不产生可见负载；
+   *   3. **指纹变了才写盘**：只在真的需要把新事实告诉面板时才 `publish()`。
+   *
+   * 返回里 `changed` = 本次是否重发布；`stale` = 当前漂移清单（含形状），
+   * 供宿主把它送上**人工侧**诊断通道（`review-service.mjs` 的 `logError` 契约：
+   * 绝不进模型可见的 stdout/stderr / 命令文本）。
+   *
+   * @returns {{changed: boolean, snapshot: object, stale: Array<{path:string,reason:string,expected:string,found:string}>}}
+   */
+  reviewDrift() {
+    const ws = this.reload()
+    const changes = ws.diffEntries()
+    const stale = []
+    const parts = []
+    for (const change of changes) {
+      const drift = ws.baselineDrift(change.path)
+      if (!drift.stale) continue
+      stale.push({ path: change.path, reason: drift.reason, expected: drift.expected, found: drift.found })
+      parts.push(`${change.path}:${drift.reason}:${drift.found}`)
+    }
+    // 指纹 = 清单 mtime + 每一条净 diff 的 before/after + 每个漂移形状。
+    // 拿它当"要不要重发布"的判据：外部写真实文件会改漂移形状（→ 变），
+    // 而一切都没动时它逐字不变（→ 不写盘）。
+    let stamp
+    try {
+      stamp = statSync(ws.store.manifestPath).mtimeMs
+    } catch {
+      stamp = 'none'
+    }
+    for (const change of changes) parts.push(`${change.path}|${change.before?.hash ?? ''}|${change.after?.hash ?? ''}`)
+    const fingerprint = `${stamp}\u0000${parts.join('\u0001')}`
+    if (this.driftFingerprint === fingerprint && this.driftSnapshot) {
+      return { changed: false, snapshot: this.driftSnapshot, stale }
+    }
+    this.driftFingerprint = fingerprint
+    this.driftSnapshot = this.publish()
+    return { changed: true, snapshot: this.driftSnapshot, stale }
+  }
+
+  /**
+   * 把漂移送上**人工侧**诊断通道（宿主 logger / 宿主 stderr），按"形状 + 路径 + 两侧 hash"
+   * 去重 ⇒ 同一次漂移只报一次，真实文件又被改一次（hash 变）才会再报。
+   *
+   * ⚠ 契约（`shell-executor.mjs:1319-1335` 的分离纪律）：这里**只**写人工通道，
+   * 绝不写模型可见的 stdout/stderr，也不进任何命令的 `text` 返回值。
+   * @returns {number} 本次真正报出的条数
+   */
+  emitDriftDiagnostics(stale) {
+    if (!Array.isArray(stale) || stale.length === 0) {
+      // 漂移都解除了 ⇒ 去重集合一并收缩，避免进程内无限增长
+      if (this.reportedDrift instanceof Set && this.reportedDrift.size > 0) this.reportedDrift.clear()
+      return 0
+    }
+    if (!(this.reportedDrift instanceof Set)) this.reportedDrift = new Set()
+    const live = new Set(stale.map((item) => item.path))
+    for (const key of this.reportedDrift) {
+      if (!live.has(key.split('\u0000')[0])) this.reportedDrift.delete(key)
+    }
+    let emitted = 0
+    for (const item of stale) {
+      const key = `${item.path}\u0000${item.reason}\u0000${item.expected}\u0000${item.found}`
+      if (this.reportedDrift.has(key)) continue
+      this.reportedDrift.add(key)
+      this.logError(
+        `基线过期（${item.reason}）：${item.path} —— ${driftReasonText(item.reason)}；` +
+          '已拒绝静默落盘，处理：/winstage rebase [路径…] 以真实文件为基线重新暂存，或 /winstage reject [路径…] 丢弃这份暂存。',
+      )
+      emitted += 1
+    }
+    return emitted
   }
 
   /**
@@ -817,31 +1504,122 @@ export class ReviewService {
    */
   approve(paths, options = {}) {
     this.reload()
-    // `rebase: true`：批准前先把"基线已过期"的条目重新对齐到真实文件。
-    // 这是**显式**动作（`/winstage approve --rebase` / 面板按钮）；默认路径仍然按
-    // 手册 #12.1 拒绝覆盖外部改动，绝不静默改语义。
-    const rebaseResult = options.rebase === true ? this._rebase(paths) : undefined
+    /**
+     * ── 注册表候选（本轮接线）──────────────────────────────────────────────────
+     * 注册表候选不是文件变更，`Workspace.applyCandidate()` 对它无能为力（它按
+     * `change.before/after` 的文件哈希落盘）。因此必须先把它**摘出来**交给
+     * `createRegistryStage().apply()`（宿主令牌 `reg.exe`），再把剩下的路径交给原来的
+     * 文件逻辑。两条路合起来仍然只有**一个**审批面（同一个 `queue.json`、同一套
+     * `/winstage approve|reject`）。
+     */
+    const pendingBefore = this.reload().listReviews()
+    const registryPending = pendingBefore.filter((candidate) => isRegistryCandidate(candidate))
+    const registryKeys = new Set(
+      registryPending.flatMap((candidate) => (candidate.changes || []).map((change) => compareKey(change.path))),
+    )
+    const selectedRegistry = paths && paths.length > 0 ? paths.filter((p) => registryKeys.has(compareKey(p))) : []
+    const wantsRegistry =
+      registryPending.length > 0 && ((paths ?? []).length === 0 || selectedRegistry.length > 0)
+    const registryOutcome = wantsRegistry ? this._approveRegistry(selectedRegistry) : undefined
+    const filePaths =
+      wantsRegistry && paths && paths.length > 0 ? paths.filter((p) => !registryKeys.has(compareKey(p))) : paths
+    /**
+     * ★ 缺陷②（F5b）：这里**删掉了**原来的 `this.autoAlignQuietly()`。
+     *
+     * 旧注释是这样写的："批准**之前**强制对齐一次基线（不受 `reload()` 的 1 s 节流限制）…
+     * 对齐只**重述 before**，所以面板展示的 before 就是现实，不存在'静默覆盖'。"
+     * 结论的后半句**是错的**：重述 before 会把"真实文件已被外部改动"这件事实从
+     * 清单里擦掉，于是紧随其后的 `applyCandidate()` 拿到的是一个 before == 现实的
+     * 候选 ⇒ 检查通过 ⇒ **静默覆盖**。F5b 实测（基线 = absent、真实盘 = `SHELL-VERSION`、
+     * 暂存 = `STAGED-VERSION`）：`approve()` 返回 `ok:true, approved:1, failed:[]`，
+     * 真实盘变成 `STAGED-VERSION`，没有任何提示。
+     *
+     * 现在批准**只**依据候选冻结时的那份 before 做条件检查：
+     *   - 未漂移 ⇒ 正常落盘（正面控制）；
+     *   - 已漂移 ⇒ `applyOneChange()` 抛 `STALE_BASELINE` ⇒ 命令面给出
+     *     "rebase / reject" 的既有出路（`host-plugin.mjs` 的 `STALE_BASELINE` 分支）。
+     * 显式 `--rebase`（`options.rebase === true`）走的仍是 `_rebase()`，一字未改。
+     */
+    // `rebase: true`：显式要求"先以真实文件为基线重新暂存，再批准"。
+    // 这是**用户明确点过**的出路（面板的「重新对齐并批准所选」/ `/winstage approve --rebase`），
+    // 与"静默对齐"的区别在于：用户在命令里看得见它，且 rebase 之后面板会显示新的
+    // before/after（真实内容出现在将被替换的那一侧）。
+    const rebaseResult = options.rebase === true ? this._rebase(filePaths) : undefined
     const rebased = rebaseResult ? rebaseResult.rebased : []
     // S13/S14：`--rebase` 也会走候选对账 ⇒ 没清干净的必须随返回值上报（新增键）
     const clearFailures = rebaseResult && Array.isArray(rebaseResult.failures) ? rebaseResult.failures : []
+    /**
+     * 注册表结果的合并口径：`ok` 取两者与，`approved` 相加，`failed` 合并。
+     * 为什么要合并而不是"先处理注册表再早退"：用户点「批准全部」时，文件面与注册表面
+     * 都必须落盘；两次调用各自返回一半真话，合起来才是"这一次批准到底发生了什么"。
+     */
+    const withRegistry = (result) => {
+      if (!registryOutcome) return result
+      const failed = [...(result.failed ?? []), ...(registryOutcome.failed ?? [])]
+      return {
+        ...result,
+        ok: result.ok === true && registryOutcome.ok === true,
+        approved: (result.approved ?? 0) + (registryOutcome.approved ?? 0),
+        failed,
+        registry: registryOutcome,
+        message: `${result.message ?? ''}${registryOutcome.message ? `；${registryOutcome.message}` : ''}`.trim(),
+      }
+    }
+    // 只勾了注册表行 ⇒ 文件面必须**一个都不碰**（`paths: []` 会被 applyCandidate 解释成
+    // "什么都没选"，但传 `undefined` 会解释成"全部" —— 两者都错，所以这里直接早退）。
+    if (registryOutcome && Array.isArray(paths) && paths.length > 0 && filePaths.length === 0) {
+      this.publish()
+      this.markFresh()
+      return withRegistry({ ok: true, approved: 0, failed: [], remaining: [], rebased, failures: clearFailures, message: '注册表变更已处理' })
+    }
     if (this.workspace.diffEntries().length === 0) {
-      return { ok: true, approved: 0, failed: [], remaining: [], rebased, failures: clearFailures, message: '没有待审文件' }
+      return withRegistry({ ok: true, approved: 0, failed: [], remaining: [], rebased, failures: clearFailures, message: '没有待审文件' })
     }
     this.ensureCandidate('approve')
     const ws = this.reload()
     const pending = ws.listReviews()
     const latest = pending[pending.length - 1]
     if (!latest) {
-      return { ok: true, approved: 0, failed: [], remaining: [], rebased, failures: clearFailures, message: '没有待审候选' }
+      return withRegistry({ ok: true, approved: 0, failed: [], remaining: [], rebased, failures: clearFailures, message: '没有待审候选' })
     }
     const result = ws.applyCandidate(latest.id, {
-      paths,
+      paths: filePaths,
       force: options.force === true,
       // 命中敏感策略时的**二次确认**（面板弹窗 / `/winstage approve --confirm-mask`）
       ...(options.confirmedMasks !== undefined ? { confirmedMasks: options.confirmedMasks } : {}),
     })
     this.publish()
     this.markFresh()
+    /**
+     * ── WP8.2：**基线冲突**（宿主原件在暂存之后被改过）⇒ 不覆盖，把选择权交回用户 ─────
+     *
+     * `applyCandidate()` 在有冲突时**一个字节都不写**（整批预检，`applied=[]`），
+     * 这里只做两件事：
+     *   1. 把冲突清单原样带进返回值（`conflicts` + 人话 `message`），命令面/面板据此
+     *      **列出这些路径**，并给出"覆盖 / 放弃"两个出口：
+     *        · 覆盖 ⇒ 再次 approve 带 `force:true`（显式知情）；
+     *        · 放弃 ⇒ `/winstage reject`（退回宿主原件视图）。
+     *   2. 审计面**不闭合**（`failed` 非空 ⇒ 走不到下面的 `decide`）—— 这次决定没有
+     *      真正落盘，闭合它会让"账本说已决定、磁盘说没变"。
+     */
+    const conflicts = Array.isArray(result.conflicts) ? result.conflicts : []
+    if (conflicts.length > 0) {
+      return withRegistry({
+        ok: false,
+        candidate: result.id,
+        approved: 0,
+        failed: result.failed,
+        conflicts,
+        remaining: result.remaining,
+        rebased,
+        failures: clearFailures,
+        message:
+          `有 ${conflicts.length} 个文件在你这次改动被记下之后又被改过，已**拒绝覆盖**（磁盘上一个字节都没改）：` +
+          `${conflicts.map((item) => item.path).join('、')}。` +
+          '逐条列出在 conflicts 里（含字节数、时间戳与两侧的内容摘要）。' +
+          '要用你这次的内容覆盖，请显式确认（批准时带 force）；要放弃，请执行 reject 丢弃本次待审内容。',
+      })
+    }
     // ★ 方向 3：**只有在这一批全部落盘成功**时才写 `approval/decided`。
     //   部分失败（`failed.length > 0`）⇒ 候选仍 pending，此时写 decided 会让
     //   审计对**提前闭合**，与 review.json 的 `pending` 说法相反 —— 那正是
@@ -857,7 +1635,7 @@ export class ReviewService {
         this.logError(`审计镜像 decide 失败（已忽略，不影响批准）：${error?.message ?? error}`)
       }
     }
-    return {
+    return withRegistry({
       ok: result.failed.length === 0,
       candidate: result.id,
       approved: result.applied.length,
@@ -870,6 +1648,64 @@ export class ReviewService {
         result.failed.length === 0
           ? `已应用 ${result.applied.length} 项`
           : `已应用 ${result.applied.length} 项，失败 ${result.failed.length} 项`,
+    })
+  }
+
+  /**
+   * 注册表候选的**懒建**执行面：`sessionDir` = 本会话的存储根。
+   *
+   * 与文件面共用同一个 `queue.json` / `candidates/`，但 apply/discard 必须走
+   * `createRegistryStage()`（它才认识覆盖层与 WAL）。拿不到 `storeDir`
+   * （无会话身份的共享存储）时返回 `undefined` —— 调用方据此如实报错，
+   * **绝不**假装批准成功。
+   */
+  registryStage() {
+    if (typeof this.storeDir !== 'string' || this.storeDir.length === 0) return undefined
+    if (!this._registryStage) {
+      this._registryStage = createRegistryStage({
+        sessionDir: this.storeDir,
+        sessionId: this.sessionId,
+        workspaceRoot: this.workspaceRoot,
+        reader: createRegExeReader(),
+        writer: createRegExeWriter({ wireBytes: registryWireBytes, log: (message) => this.log(message) }),
+      })
+    }
+    return this._registryStage
+  }
+
+  /** 内部：批准注册表候选（`selection` 为空 = 全部）。永不抛。 */
+  _approveRegistry(selection) {
+    const stage = this.registryStage()
+    if (!stage) {
+      return {
+        ok: false,
+        approved: 0,
+        failed: [{ path: '(registry)', error: 'REG_STORE_DIR_MISSING: 本会话没有存储根，无法应用注册表候选' }],
+        message: '注册表候选无法应用（缺 sessionDir）',
+      }
+    }
+    try {
+      stage.open()
+      const result = stage.apply(Array.isArray(selection) && selection.length > 0 ? { paths: selection } : {})
+      const failed = []
+      for (const entry of result.failed ?? []) {
+        failed.push({ path: entry.path, error: `${entry.status ?? ''} ${entry.reason ?? ''}`.trim() || 'registry-apply-failed' })
+      }
+      for (const entry of result.blocked ?? []) {
+        failed.push({ path: entry.path, error: `${entry.status ?? ''} ${entry.reason ?? ''}`.trim() || 'parent-key-missing' })
+      }
+      const applied = result.applied ?? []
+      return {
+        ok: failed.length === 0,
+        approved: applied.length,
+        failed,
+        stale: result.stale ?? [],
+        message: `注册表：已应用 ${applied.length} 项${failed.length ? `，失败 ${failed.length} 项` : ''}`,
+      }
+    } catch (error) {
+      const detail = `${error?.code ?? error?.name ?? 'error'}: ${error?.message ?? error}`
+      this.logError(`注册表批准失败（如实上报，不假装成功）：${detail}`)
+      return { ok: false, approved: 0, failed: [{ path: '(registry)', error: detail }], message: `注册表批准失败：${detail}` }
     }
   }
 
@@ -881,25 +1717,31 @@ export class ReviewService {
    *   1. 命中的候选整份 discard（`reconcileCandidates` 的 `affected` 规则，
    *      与 D2 的"discard 范围必须与回收范围一致"同一条纪律）；
    *   2. 剩下的净 diff 用 `ensureCandidate('rebase')` 重新冻结成新候选。
-   * @returns {{rebased: string[], discarded: string[]}}
+   * @returns {{rebased: string[], discarded: string[], reasons: Record<string,string>, failures: Array}}
    */
   _rebase(paths) {
     this.clearFailures = []
     const ws = this.reload()
     const selected = paths && paths.length > 0 ? new Set(paths.map(compareKey)) : undefined
     const rebased = []
+    /** 路径 → 漂移形状（**重述之前**读，重述之后 drift 已归零，读不到） */
+    const reasons = {}
     for (const rel of Object.keys(ws.manifest.entries)) {
       if (selected && !selected.has(compareKey(rel))) continue
-      if (!ws.baselineDrift(rel).stale) continue
-      if (ws.rebaseEntry(rel)) rebased.push(rel)
+      const drift = ws.baselineDrift(rel)
+      if (!drift.stale) continue
+      if (ws.rebaseEntry(rel)) {
+        rebased.push(rel)
+        reasons[rel] = drift.reason ?? 'baseline-drifted'
+      }
     }
-    if (rebased.length === 0) return { rebased, discarded: [], failures: [] }
+    if (rebased.length === 0) return { rebased, discarded: [], reasons, failures: [] }
     ws.store.touch(ws.manifest)
     const affected = new Set(rebased.map(compareKey))
     const netKeys = new Set(ws.diffEntries().map((change) => compareKey(change.path)))
     const discarded = this.reconcileCandidates(ws, { reason: 'rebase', affected, netKeys })
     if (ws.diffEntries().length > 0) this.ensureCandidate('rebase')
-    return { rebased, discarded, failures: this.clearFailures.slice() }
+    return { rebased, discarded, reasons, failures: this.clearFailures.slice() }
   }
 
   /**
@@ -926,7 +1768,10 @@ export class ReviewService {
       message:
         result.rebased.length === 0
           ? '没有基线过期的待审条目（视图已经与真实磁盘一致）'
-          : `已以真实文件为基线重新暂存 ${result.rebased.length} 项`,
+          : `已以真实文件为基线重新暂存 ${result.rebased.length} 项` +
+            (Object.values(result.reasons || {}).includes('baseline-appeared')
+              ? '（其中含"真实文件在暂存之后出现"的条目：现在面板显示的 before 就是磁盘上的真实内容）'
+              : ''),
     }
   }
 
@@ -949,16 +1794,69 @@ export class ReviewService {
    */
   reject(paths) {
     this.clearFailures = []
+    /**
+     * 注册表候选的拒绝 = **丢弃覆盖层意图**（`createRegistryStage().discard()`）：
+     * 真实 hive 从头到尾没被碰过，所以"拒绝"在这里是零成本的 —— 这正是暂存层的意义。
+     * 与 `approve()` 同一套切分：先摘注册表路径，剩下的交回文件面。
+     */
+    const registryPending = this.reload().listReviews().filter((candidate) => isRegistryCandidate(candidate))
+    const registryKeys = new Set(
+      registryPending.flatMap((candidate) => (candidate.changes || []).map((change) => compareKey(change.path))),
+    )
+    const selectedRegistryDiscard = paths && paths.length > 0 ? paths.filter((p) => registryKeys.has(compareKey(p))) : []
+    const wantsRegistryDiscard =
+      registryPending.length > 0 && ((paths ?? []).length === 0 || selectedRegistryDiscard.length > 0)
+    let registryDiscard
+    if (wantsRegistryDiscard) {
+      const stage = this.registryStage()
+      if (stage) {
+        try {
+          stage.open()
+          registryDiscard = stage.discard({ reason: 'user-rejected' })
+        } catch (error) {
+          const detail = `${error?.code ?? error?.name ?? 'error'}: ${error?.message ?? error}`
+          this.logError(`注册表候选丢弃失败（真实 hive 从未被改，故无残留）：${detail}`)
+          registryDiscard = { error: detail }
+        }
+      } else {
+        registryDiscard = { error: 'REG_STORE_DIR_MISSING' }
+      }
+    }
+    const rejectPaths =
+      wantsRegistryDiscard && paths && paths.length > 0 ? paths.filter((p) => !registryKeys.has(compareKey(p))) : paths
+    // 只勾了注册表行 ⇒ 文件面一个都不碰。⚠ 这里**不能**把空数组继续往下传：
+    // `paths.length === 0` 在下面的口径里等于"未给路径"= **拒绝全部文件**，那会把
+    // 用户没勾的文件改动一起回退掉。所以直接早退并如实回报。
+    if (wantsRegistryDiscard && Array.isArray(paths) && paths.length > 0 && rejectPaths.length === 0) {
+      this.publish()
+      this.markFresh()
+      return {
+        ok: registryDiscard?.error === undefined,
+        rejected: 0,
+        paths: [],
+        discarded: [],
+        registryDiscarded: registryDiscard,
+        failures: registryDiscard?.error ? [{ path: '(registry)', error: registryDiscard.error }] : [],
+        message: registryDiscard?.error ? `注册表候选丢弃失败：${registryDiscard.error}` : '注册表候选已丢弃（真实注册表从未被改）',
+      }
+    }
     const ws = this.reload()
     const changes = ws.diffEntries()
     const netKeys = new Set(changes.map((change) => compareKey(change.path)))
     const liveBefore = ws.listReviews()
-    const selected = paths && paths.length > 0 ? new Set(paths.map(compareKey)) : undefined
+    const selected = rejectPaths && rejectPaths.length > 0 ? new Set(rejectPaths.map(compareKey)) : undefined
 
     // 净 diff 已经空了、但队列里还有活候选时**不能**早退：那些候选正是"空壳 pending"，
     // 而"拒绝全部"是用户唯一能清掉它们的出口（否则面板会停在只有冻结存档行的状态里）。
     if (!selected && changes.length === 0 && liveBefore.length === 0) {
-      return { ok: true, rejected: 0, paths: [], discarded: [], message: '没有待审文件' }
+      return {
+        ok: true,
+        rejected: 0,
+        paths: [],
+        discarded: [],
+        ...(registryDiscard ? { registryDiscarded: registryDiscard } : {}),
+        message: registryDiscard ? '注册表候选已丢弃' : '没有待审文件',
+      }
     }
 
     const targets = selected ? changes.filter((c) => selected.has(compareKey(c.path))) : changes
@@ -1005,7 +1903,14 @@ export class ReviewService {
       this.logError(`审计镜像 reject-decide 失败（已忽略，不影响拒绝）：${error?.message ?? error}`)
     }
     // `failures` 是**新增键**（只加不改）：清除路径上"没清干净"的项，命令面据此报 error
-    return { ok: true, rejected: targets.length, paths: targets.map((c) => c.path), discarded, failures: this.clearFailures.slice() }
+    return {
+      ok: true,
+      rejected: targets.length,
+      paths: targets.map((c) => c.path),
+      discarded,
+      ...(registryDiscard ? { registryDiscarded: registryDiscard } : {}),
+      failures: this.clearFailures.slice(),
+    }
   }
 
   /**
@@ -1116,24 +2021,41 @@ export function sessionDirKey(sessionId) {
   return `s_${fnv1a32(raw)}_${raw.length}`
 }
 
-/** 某会话的存储根（无会话身份时返回 undefined ⇒ 调用方用默认 `<root>/.dshstage`） */
-export function sessionStoreDir(workspaceRoot, sessionId) {
-  const key = sessionDirKey(sessionId)
-  return key ? join(workspaceRoot, STORE_DIR, 'sessions', key) : undefined
+/**
+ * 某会话的存储根（WP2：`resolveReviewStoreDir()` → `resolveStageRoot()`）。
+ *
+ * ⚠ 契约变化（Phase 1）：**总是返回一个路径**。旧版在"无会话身份"时返回 `undefined`
+ * 让调用方去拼工作区里的旧布局 —— 那正是生产默认根没有真正切换过去的原因。
+ * 现在无会话身份 ⇒ 共享服务的会话 id（`DEFAULT_REVIEW_SESSION_ID`），
+ * 与 `getReviewService({ workspaceRoot })`（不传 sessionId）解析出的根**逐字相同**。
+ *
+ * `options`（全部可选）：`{ storeDir, stageRoot, env }` —— 显式注入通道，供自测 / CLI / WP1。
+ */
+export function sessionStoreDir(workspaceRoot, sessionId, options = {}) {
+  return resolveReviewStoreDir({
+    workspaceRoot,
+    sessionId,
+    storeDir: options.storeDir,
+    stageRoot: options.stageRoot,
+    env: options.env,
+  })
 }
 
 /**
- * 把**升级前**的共享存储（`<root>/.dshstage/`）认领给第一个需要会话存储的会话。
+ * 把**升级前**的共享存储（工作区内的旧布局，`legacyWorkspaceStoreDir()`）认领给
+ * 第一个需要会话存储的会话。
  *
- * 为什么需要：隔离改造之前，所有暂存内容都写在共享根里。不搬的话，用户升级前
+ * 为什么需要：隔离改造之前，所有暂存内容都写在那个共享根里。不搬的话，用户升级前
  * 的待审内容会变成"谁也看不见"的孤儿。做法是 **move**（同卷 rename，不复制大文件），
- * 并用 `.dshstage/sessions/.legacy-claimed` 的 `wx` 创建做"只有第一个会话能认领"的闸。
+ * 并用旧布局下 `sessions/.legacy-claimed` 的 `wx` 创建做"只有第一个会话能认领"的闸。
  * 任何一步失败都静默保留原处（会话拿空存储继续跑），绝不因此让插件起不来。
+ *
+ * Phase 1 之后这里**只读/只搬走**：目标 `targetDir` 是 `resolveStageRoot()` 给的缓存路径。
  * @returns {boolean} 是否真的搬走了一些东西
  */
 function adoptLegacyStore(workspaceRoot, targetDir) {
   try {
-    const legacyDir = join(workspaceRoot, STORE_DIR)
+    const legacyDir = legacyWorkspaceStoreDir(workspaceRoot)
     const legacyManifest = join(legacyDir, 'manifest.json')
     if (!targetDir || !existsSync(legacyManifest) || existsSync(targetDir)) return false
     const claimDir = join(legacyDir, 'sessions')
@@ -1192,6 +2114,24 @@ function copyTreeMissing(src, dst) {
   }
 }
 
+/**
+ * 已经在本进程里建好的审阅服务（按 `workspaceRoot#sessionKey` 缓存）。
+ *
+ * 供宿主侧的**只读轮询复核**使用（`dsh-plugin/baseline-watch.mjs`）：它必须能找到
+ * "当前工作区里所有还活着的会话服务"，才能把漂移变化重新发布给面板。
+ * 只读：返回快照数组，调用方不得借此改状态。
+ */
+export function listReviewServices(workspaceRoot) {
+  const wanted = workspaceRoot ? canonical(workspaceRoot) : undefined
+  const out = []
+  for (const service of SERVICES.values()) {
+    if (!service || typeof service.reviewDrift !== 'function') continue
+    if (wanted && canonical(service.workspaceRoot) !== wanted) continue
+    out.push(service)
+  }
+  return out
+}
+
 export function getReviewService(options = {}) {
   if (!options?.workspaceRoot) throw new Error('getReviewService: workspaceRoot is required')
   const root = canonical(options.workspaceRoot)
@@ -1199,7 +2139,19 @@ export function getReviewService(options = {}) {
   const key = sessionKey ? `${root}#${sessionKey}` : root
   let service = SERVICES.get(key)
   if (!service) {
-    const storeDir = sessionKey ? join(root, STORE_DIR, 'sessions', sessionKey) : undefined
+    // ── WP2：生产默认根的**唯一切换点** ─────────────────────────────────────────
+    // 旧实现这里是 `sessionKey ? join(root, STORE_DIR, 'sessions', sessionKey) : undefined`
+    // —— 两条都在把存储根钉在工作区里。现在一律经 `resolveReviewStoreDir()`
+    // → `resolveStageRoot()`（默认 = Windows 缓存里的会话工作根）。
+    // 显式 override 通道保留：`options.storeDir`（逐字采用）/ `options.stageRoot` /
+    // `options.env`，供离线自测与 WP1 用。
+    const storeDir = resolveReviewStoreDir({
+      workspaceRoot: root,
+      sessionId: options.sessionId,
+      storeDir: options.storeDir,
+      stageRoot: options.stageRoot,
+      env: options.env,
+    })
     // T3d：`adoptLegacyStore()` 与 `absorbSharedStore()` 是**同一类"认领别处内容"**的动作
     // （前者=目标会话目录还不存在时整份 move，后者=已存在时按键合并）。实测：在"共享存储里有
     // 别身份的内容 + 本会话目录还不存在"这一最常见形态下，真正搬走内容的是**前者**，所以

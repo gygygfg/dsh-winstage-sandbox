@@ -14,17 +14,28 @@
  * ── 数据怎么来（DSH 的机制约束，必须如实说明）────────────────────────────────
  * Client **无法**注册新的 `ctx.remote.<命名空间>`：能力选集是构建期产物
  * （`@deepseek-ai/dsh-api-remotes`）。因此：
- *   - 读：用**已有**的 `ctx.remote.workspaceFiles.read` 读宿主写出的
- *     `<workspaceRoot>/.dshstage/sessions/<会话>/review.json`（**按会话隔离**；
- *     没有会话身份时退回共享的 `<workspaceRoot>/.dshstage/review.json`）；
+ *   - 读（**WP3-B 起**）：`fetch('/winstage-panel/snapshot?session=<会话 id>')` —— 这是
+ *     宿主插件（`host-plugin.mjs`）注册的同源只读路由，**存储根在宿主侧**用
+ *     `resolveReviewStoreDir()` 解析（Phase 1 起在 Windows 缓存里）。客户端只持有
+ *     **逻辑标识**（路由名 + 会话 id + 存储短哈希），**不再自己拼任何路径**；
+ *   - 读（兼容兜底，**不是首选**）：路由不可用时（宿主没装 webServer / 进程未重启到新代码）
+ *     退回 `ctx.remote.workspaceFiles.read` 读**升级前**布局的那份快照。见
+ *     `readReviewViaLegacyPath()` —— 全文件**只有那一处**拼旧布局，且带注释与来源标记；
  *   - 写：用**已有**的 `ctx.remote.commands.execute` 执行 `/winstage approve|reject`
  *     （命令不产生模型消息）。
- * 两者都已带鉴权与类型，因此本插件不需要改任何构建产物。
+ * 两条读法都只走用户侧（面板），命令自身的 stdout/stderr 与工具输出逐字节不变。
+ * 另外 `fetch('/winstage-panel/trust')` 取同一份**可信性状态卡**（与 `/winstage status`
+ * 同一个 `buildTrustCard()`），把"沙箱此刻可不可信"直接显示在面板上。
  *
  * ── 设计约束（来自技能的 UI 规则）────────────────────────────────────────────
  *   - 外观全部用 host 主题 token（`--dsw-*`），不写死颜色，因此明暗主题都正确；
  *   - **不 import 任何 Harness Client 包**（含 ui-primitives），控件自己写；
  *   - 在 `apply` 内注册资源并由 ctx.effect 拥有，卸载即撤；
+ *   - **平台 UI 只在开关"确定开着"时才接管**（`readSwitch(form) === 'on'`）：关闭、
+ *     `loading`、`unavailable`（宿主插件没装 / 本页看不到）、没有表单，一律不注册
+ *     `conversation.input.permission` 的遮蔽，也不让 composer 审阅卡参与选举 ——
+ *     平台原来的访问模式控件与它弹出的预设菜单/审批卡必须原样保留。
+ *     见 §12.6「关闭/未知沙箱不得覆盖原版审批弹窗」。
  *   - 可见文案走 Client locale 服务；
  *   - 轮询是本实现的**已知折衷**：Client 收不到插件自定义的推送事件，
  *     所以按固定间隔读那一个小 JSON（默认 1500 ms）。文件不存在 = 没有待审。
@@ -50,7 +61,10 @@ window.__ModuleLoader__.load({
      * `conversation.input.permission` 是 **single** 槽位，平台条目在 priority 0。
      * slots 的遮蔽规则是"**最低** priority 渲染"（dsh-client-ui-slots/lib/index.js:163-172
      * 逐字：`register at a different priority to shadow it (lowest renders)`；同 priority
-     * 注册直接抛错）。因此本插件用 -10 遮蔽它；关闭开关时撤销注册，平台控件原样回来。
+     * 注册直接抛错）。因此本插件用 -10 遮蔽它。
+     * ★ **只有开关确定开着**（`readSwitch() === 'on'`）才注册：关闭、以及状态未知
+     *   （`loading` / `unavailable` / 没有表单 ⇒ 沙箱没装或本页读不到）一律撤销/不注册，
+     *   平台控件与它弹出的预设菜单原样保留（见 `readSwitch` 的注释）。
      */
     const PERMISSION_PRIORITY = -10
     /** 快照轮询间隔；Client 收不到插件自定义推送，这是刻意的折衷 */
@@ -123,8 +137,14 @@ window.__ModuleLoader__.load({
         frozenNoNetChange: '已不在当前净 diff：暂存内容已被取代，无法再批准',
         frozenSummary: '{count} 项已不在当前净 diff（仅存档，不可批准）',
         baselineStale: '基线已过期',
-        baselineStaleTitle: '真实文件在暂存之后被外部改动过；直接批准会被拒绝（手册 #12.1）。先「重新对齐基线」再批准。',
-        staleSummary: '{count} 项基线已过期（真实文件已被外部改动）：直接批准会被拒绝，请先「重新对齐基线」',
+        // 缺陷②（F5b）：这三条解释**为什么**过期。旧文案说"系统会自动重新对齐、无需手动操作"
+        // —— 那正是丢数据的那条路径（自动对齐把外部写入变成可批准的 diff）。
+        // 现在：不会自动对准有内容丢失风险的漂移，因此必须给出显式出路。
+        baselineStaleAppeared: '真实文件在暂存之后出现（基线本为"不存在"）',
+        baselineStaleDeleted: '真实文件在暂存之后被外部删除',
+        baselineStaleDrifted: '真实文件在暂存之后被外部改写',
+        baselineStaleTitle: '真实文件在暂存之后被外部改动过（手册 #12.1）。批准已被拒绝，真实磁盘上的内容不会被覆盖。出路：用「重新对齐基线」/「重新对齐并批准所选」，或 /winstage rebase；丢弃这份暂存用「拒绝」。',
+        staleSummary: '{count} 项基线已过期（真实文件在暂存之后被外部改动）：批准会被拒绝，不会静默覆盖真实磁盘；请先 rebase 再批准，或拒绝这份暂存',
         rebaseAll: '重新对齐基线',
         rebaseAndApprove: '重新对齐并批准所选',
         permIdle: 'WinStage 暂存',
@@ -148,6 +168,19 @@ window.__ModuleLoader__.load({
         opMkdir: '新建目录',
         busy: '处理中…',
         failed: '操作失败：{message}',
+        // ── WP3：可信性状态卡（面板侧；与 /winstage status 同一份 buildTrustCard）──────
+        // 这里只显示**一句话结论**，六个面的细节仍在 /winstage status 里（面板不堆术语）。
+        trustLabel: '可信性',
+        trustTrusted: '沙箱可信（命令走去令牌化通道，写入先落暂存）',
+        trustAttention: '沙箱可信，但有 {count} 类待处理事项（详见 /winstage status）',
+        trustDegraded: '⚠ 沙箱**不可信**：档位已掉档，写入只剩内核硬拒（详见 /winstage status）',
+        trustLost: '⚠ 会话工作根已不可用：写入会失败，不会静默改写真实文件',
+        trustWriteUnconfirmed: '⚠ 有写入未确认落盘（详见 /winstage status）',
+        trustUnknown: '沙箱档位未知：尚无判定记录，按"未证实已生效"对待',
+        trustOff: '沙箱已关闭（属预期）',
+        trustSourceRoute: '读取来源：宿主路由（存储根由宿主解析）',
+        trustSourceLegacy: '读取来源：兼容旧布局（宿主路由不可用，请重启宿主进程）',
+        trustDetail: '档位 {lane} · 掉档 {degrades} 次 · 失根 {lost} 次 · 未结算审批 {approvals} · 未确认写入 {writes} · 敏感读 {reads}',
       },
       en: {
         title: 'WinStage Sandbox',
@@ -212,8 +245,11 @@ window.__ModuleLoader__.load({
         frozenNoNetChange: 'no longer in the net diff: the staged content was superseded, so it cannot be approved',
         frozenSummary: '{count} item(s) are no longer in the net diff (archive only, not approvable)',
         baselineStale: 'stale baseline',
-        baselineStaleTitle: 'The real file changed after staging; approving it directly is refused (manual #12.1). Rebase before approving.',
-        staleSummary: '{count} item(s) have a stale baseline (the real file changed): approving is refused until you rebase',
+        baselineStaleAppeared: 'the real file appeared after staging (the baseline was "absent")',
+        baselineStaleDeleted: 'the real file was deleted after staging',
+        baselineStaleDrifted: 'the real file was changed after staging',
+        baselineStaleTitle: 'The real file changed after staging (manual #12.1). Approval is refused; the content on the real disk is not overwritten. Use "re-align baseline" / "re-align and approve selected", or /winstage rebase; reject to discard this staged change.',
+        staleSummary: '{count} item(s) have a stale baseline (the real file changed after staging): approval is refused and the real disk is not overwritten; re-align the baseline first, or reject this staged change',
         rebaseAll: 'Rebase onto real file',
         rebaseAndApprove: 'Rebase and approve selected',
         permIdle: 'WinStage staging',
@@ -237,6 +273,18 @@ window.__ModuleLoader__.load({
         opMkdir: 'mkdir',
         busy: 'Working…',
         failed: 'Failed: {message}',
+        // ── WP3 trust card (panel side; same buildTrustCard() as /winstage status) ──
+        trustLabel: 'Trust',
+        trustTrusted: 'Sandbox trusted (commands use the token-free channel; writes land in staging first)',
+        trustAttention: 'Sandbox trusted, with {count} kind(s) of open items (see /winstage status)',
+        trustDegraded: '⚠ Sandbox NOT trusted: the lane fell back, writes are down to kernel denial (see /winstage status)',
+        trustLost: '⚠ The session working root is unavailable: writes will fail instead of silently touching real files',
+        trustWriteUnconfirmed: '⚠ A write was not confirmed on disk (see /winstage status)',
+        trustUnknown: 'Sandbox lane unknown: no verdict recorded yet; treat as "not proven active"',
+        trustOff: 'Sandbox is off (expected)',
+        trustSourceRoute: 'Read via: host route (the host resolves the store root)',
+        trustSourceLegacy: 'Read via: legacy layout compatibility (host route unavailable; restart the host process)',
+        trustDetail: 'lane {lane} · degraded {degrades}× · root lost {lost}× · open approvals {approvals} · unconfirmed writes {writes} · sensitive reads {reads}',
       },
     }
 
@@ -326,6 +374,28 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 开关真值（**三态**）—— 唯一来源：`configForms` 的表单快照。
+     *
+     *   'on'      `status === 'ready'` 且 `value.enabled === true`
+     *   'off'     `status === 'ready'` 但 `enabled` 不是 true（明确 false / 字段缺席）
+     *   'unknown' `loading` / `unavailable` / 根本没有表单 —— **沙箱状态未知**
+     *
+     * ★ 只有 'on' 允许接管**平台 UI**（composer 审阅卡，以及
+     *   `conversation.input.permission` 上的访问模式控件与它弹出的预设菜单）。
+     *   'unknown' 一律**不接管**：`unavailable` 的语义逐字就是"该命名空间没有暴露给本客户端"
+     *   （宿主插件没装 / 本页看不到），此时平台原来的审批控件与弹窗必须原样保留。
+     *   把"读不懂"解释成"开着"会把平台控件**永久盖住** —— 那正是"关闭沙箱（或沙箱压根没装）时
+     *   原版审批弹窗仍被 WinStage 覆盖"的成因。宁可晚一拍接管，也不覆盖平台 UI。
+     *   三态定义见 dsh-client-ui-settings/lib/types/client/config-form-types.d.ts:7-14。
+     */
+    function readSwitch(form) {
+      const snapshot = form && typeof form.getSnapshot === 'function' ? form.getSnapshot() : undefined
+      if (!snapshot || snapshot.status !== 'ready') return 'unknown'
+      const value = snapshot.value
+      return value && value.enabled === true ? 'on' : 'off'
+    }
+
+    /**
      * 接管判据的**唯一实现**。
      *
      * 两处调用它，避免判据漂移：
@@ -336,6 +406,10 @@ window.__ModuleLoader__.load({
      */
     function winstageElection(sessionId) {
       if (!sessionId) return null
+      // ★ 开关必须先**确定开着**（轮询器只在 readSwitch()==='on' 时发布 enabled:true）。
+      //   'unknown'（configForms 还在 loading，或命名空间 unavailable ⇒ 宿主插件没装）
+      //   ⇒ 不接管 composer：那时输入区必须留给平台自己的审批卡/审批弹窗。
+      if (store.state.enabled !== true) return null
       const snapshot = store.state.snapshot
       // β（V2-1）：判据收敛为 `pending === true`。
       // 为什么不保留 `counts.files >= 1`：`review-service.snapshot()` 的 `pending` 就是
@@ -394,6 +468,23 @@ window.__ModuleLoader__.load({
       return typeof item.note === 'string' && item.note.length > 0 ? item.note : null
     }
 
+    /**
+     * 漂移形状 → 行内说明（缺陷② F5b）。
+     *
+     * 值来自宿主快照的 `baselineStaleCode`（`review-service.driftReasonOf()` 的字面量）：
+     *   - `baseline-appeared`：基线 = absent（新增）而真实文件在暂存之后出现 ——
+     *     实测那条"点批准就静默丢掉磁盘内容"的形状，必须说得最清楚；
+     *   - `baseline-deleted` / `baseline-drifted`：外部删除 / 外部改写；
+     *   - 缺字段（旧快照）⇒ `null`，行内不显示额外说明（行为与旧版一致）。
+     */
+    function baselineStaleReasonText(t, item) {
+      const code = item?.baselineStaleCode
+      if (code === 'baseline-appeared') return t('baselineStaleAppeared')
+      if (code === 'baseline-deleted') return t('baselineStaleDeleted')
+      if (code === 'baseline-drifted') return t('baselineStaleDrifted')
+      return null
+    }
+
     /** 组内按 path 稳定排序（大小写不敏感；同键保持入参顺序） */
     function sortByPath(items) {
       return items
@@ -425,7 +516,7 @@ window.__ModuleLoader__.load({
      * （`counts.files` 本来就是全量的）。两者各自都是**下界** ⇒ 取大即"绝不比看得见的少报"。
      * 而"少报高危项"是安全方向上最不该犯的错。
      */
-    function summarize(files, declared) {
+    function summarize(files, declared, declaredTotal) {
       const list = Array.isArray(files) ? files : []
       const counts = { files: list.length, normal: 0, outside: 0, sensitive: 0, danger: 0 }
       for (const item of list) {
@@ -433,17 +524,17 @@ window.__ModuleLoader__.load({
         counts[risk] += 1
         if (risk === 'sensitive' && isDanger(item)) counts.danger += 1
       }
+      // `declared` 是宿主顶层的 `riskCounts`（只有 normal/outside/sensitive/danger 四档，
+      // **不含**总数）；总数必须单独从 `counts.totalFiles` 传入。旧版误从 riskCounts 里
+      // 三档求和当总数，口径本身就是错的（那三档是按截断后的列表算的）。
       if (declared && typeof declared === 'object') {
         for (const key of ['normal', 'outside', 'sensitive', 'danger']) {
           const value = Number(declared[key])
           if (Number.isFinite(value) && value > counts[key]) counts[key] = value
         }
-        const declaredTotal = ['normal', 'outside', 'sensitive'].reduce((sum, key) => {
-          const value = Number(declared[key])
-          return sum + (Number.isFinite(value) && value > 0 ? value : 0)
-        }, 0)
-        if (declaredTotal > counts.files) counts.files = declaredTotal
       }
+      const total = Number(declaredTotal)
+      if (Number.isFinite(total) && total > counts.files) counts.files = total
       return counts
     }
 
@@ -457,9 +548,16 @@ window.__ModuleLoader__.load({
      * 用宿主的 `riskCounts`，绝不比声明的少报）。
      * `truncated` = 生效总数 > 实际列出的条数 ⇒ chip 要标 `+`，**不静默少报**。
      */
-    function levelCounts(files, declared) {
+    function levelCounts(files, declared, snapshotTruncated, declaredTotal) {
       const list = Array.isArray(files) ? files : []
-      const counts = summarize(list, declared)
+      const counts = summarize(list, declared, declaredTotal)
+      // 截断信号有两条来源，**任一为真**都不得静默少报：
+      //   · 计数：生效总数 > 实际列出条数（宿主 `counts.files` 已是全量）；
+      //   · 声明：宿主顶层 `snapshot.truncated`（`review-service.snapshot()` 在
+      //     `listed.length > maxFiles` 或某条内容被按敏感策略省略时置真）。
+      // 修复前的症状：宿主把 `counts.files` 报成**截断后**的条数，于是这里恒 false，
+      // chip 不显示 `+`、标题条不显示"列表已截断" —— 用户只看到 maxFiles(40) 条。
+      const truncated = counts.files > list.length || snapshotTruncated === true
       return {
         L1: counts.normal,
         L2: counts.outside,
@@ -467,7 +565,7 @@ window.__ModuleLoader__.load({
         danger: counts.danger,
         total: counts.files,
         listed: list.length,
-        truncated: counts.files > list.length,
+        truncated,
       }
     }
 
@@ -658,7 +756,9 @@ window.__ModuleLoader__.load({
 
     /**
      * 会话 id → **存储目录名**（与 host 侧 `sessionDirKey` 逐字同规则）。
-     * 无会话身份 ⇒ `''` ⇒ 读/写都走旧的共享 `.dshstage/` 根。
+     *
+     * WP3-B：这个键**只**用于两件事 —— ① 宿主路由的 `?session=` 参数（宿主据此解析存储根）；
+     * ② 兜底读法里那条**历史兼容**路径。它**不再**是新布局的路径来源（新布局由宿主解析）。
      */
     function sessionDirKey(sessionId) {
       const raw = typeof sessionId === 'string' ? sessionId.trim() : ''
@@ -674,11 +774,72 @@ window.__ModuleLoader__.load({
       return [String(root).replace(/[\\/]+$/, ''), ...parts].join(sep)
     }
 
-    /** 读那份小 JSON；返回 null 表示"当前没有待审" */
-    function readReview(ctx, sessionId, root) {
+    // ── WP3-B：面板读侧的两条路（顺序 = 优先级；**首选永远是宿主路由**）──────────
+    /**
+     * 宿主侧只读路由（`host-plugin.mjs::PANEL_ROUTE_PREFIX`，两边**同一份**字面量约定）。
+     * 客户端只认**逻辑标识**：路由名 + 会话 id。存储根在哪由宿主解析 ——
+     * 浏览器里没有 `%LOCALAPPDATA%` 这个事实，客户端自己拼只能拼出**旧布局**。
+     */
+    const PANEL_ROUTE_PREFIX = '/winstage-panel'
+    const PANEL_SNAPSHOT_ROUTE = PANEL_ROUTE_PREFIX + '/snapshot'
+    const PANEL_TRUST_ROUTE = PANEL_ROUTE_PREFIX + '/trust'
+
+    /**
+     * 取一次面板路由 JSON（同源 fetch）。
+     *
+     * ⚠ 必须校验 `content-type`：路由没注册时 webserver 的**SPA 兜底**会回 `index.html`
+     * （HTTP 200 + text/html）。不校验就会把一份 HTML 当快照解析，报出一个与事实无关的错。
+     *
+     * @returns {{ok: boolean, value?: object, code?: string}}
+     *   `code === 'no-snapshot'` 是**确定**的"当前没有待审"（宿主路由答的），
+     *   与"路由不可用"必须分开：前者不该退回兼容读法。
+     */
+    function fetchPanelRoute(path, sessionId) {
+      if (typeof fetch !== 'function') return Promise.resolve({ ok: false, code: 'no-fetch' })
       const controller = new AbortController()
-      // **按会话隔离**：读自己那份快照（宿主把存储根放在 `.dshstage/sessions/<key>/`）。
-      // 没有会话身份时退回旧的共享路径（升级前的布局 / agentless 调用）。
+      const url = `${path}?session=${encodeURIComponent(typeof sessionId === 'string' ? sessionId : '')}`
+      return Promise.resolve(fetch(url, { signal: controller.signal, headers: { accept: 'application/json' } }))
+        .then(async (response) => {
+          const type = String((response && response.headers && response.headers.get && response.headers.get('content-type')) || '')
+          if (!type.includes('application/json')) return { ok: false, code: 'not-json' }
+          const body = await response.json().catch(() => undefined)
+          if (!response.ok) return { ok: false, code: String(body && body.code ? body.code : `http-${response.status}`) }
+          if (!body || body.ok !== true) return { ok: false, code: String((body && body.code) || 'bad-body') }
+          return { ok: true, value: body }
+        })
+        .catch((error) => ({ ok: false, code: `fetch-failed: ${String((error && error.message) || error)}` }))
+        .finally(() => controller.abort())
+    }
+
+    /**
+     * **首选**读法：宿主路由。拿到 `{ snapshot, store, source: 'host-route' }`。
+     * `snapshot === null` 且 `ok === true` ⇒ 宿主解析出的存储里**确实**没有快照。
+     */
+    async function readReviewViaRoute(ctx, sessionId) {
+      const result = await fetchPanelRoute(PANEL_SNAPSHOT_ROUTE, sessionId)
+      if (!result.ok) {
+        return result.code === 'no-snapshot'
+          ? { ok: true, snapshot: null, store: undefined, source: 'host-route' }
+          : { ok: false, code: result.code }
+      }
+      const body = result.value
+      return { ok: true, snapshot: body.snapshot ?? null, store: body.store, source: 'host-route' }
+    }
+
+    /**
+     * 兼容兜底（**历史布局**，绝不是首选 —— 首选是上面的宿主路由）。
+     *
+     * 为什么保留这一条：路由需要宿主进程**重启**到带 `createPanelHandler()` 的版本才会注册，
+     * 而升级前发布的快照确实躺在工作区的旧布局里。没有它，面板在那段窗口里会**整片空白**；
+     * 有它，面板至少能显示旧快照，并且明确标出 `legacyCompat` 让用户知道读的是哪一份。
+     *
+     * 全文件**只有这里**拼旧布局，且：
+     *   · 只在宿主路由不可用时执行（`readReview()` 的第二分支）；
+     *   · 返回的 `source` 是 `'legacy-compat-path'`（不是 `'host-route'`），面板据此可区分；
+     *   · 存储短哈希/逻辑标签一律为 `undefined`（旧布局没有"宿主解析的标识"可言）。
+     */
+    function readReviewViaLegacyPath(ctx, sessionId, root) {
+      const controller = new AbortController()
       const key = sessionDirKey(sessionId)
       const path = key
         ? joinPath(root, '.dshstage', 'sessions', key, 'review.json')
@@ -696,6 +857,26 @@ window.__ModuleLoader__.load({
           return JSON.parse(value.text)
         })
         .finally(() => controller.abort())
+    }
+
+    /**
+     * 读那一份小 JSON。返回 `{ snapshot, source }`：
+     *   `source: 'host-route'`         宿主解析出的存储（**首选**）
+     *   `source: 'legacy-compat-path'` 兜底的旧布局（路由不可用）
+     * `snapshot === null` = 当前没有待审（两种来源都可能是 null）。
+     */
+    async function readReview(ctx, sessionId, root) {
+      const viaRoute = await readReviewViaRoute(ctx, sessionId)
+      if (viaRoute.ok) return { snapshot: viaRoute.snapshot, source: viaRoute.source, store: viaRoute.store }
+      const snapshot = await readReviewViaLegacyPath(ctx, sessionId, root)
+      return { snapshot, source: 'legacy-compat-path', store: undefined, routeFallback: viaRoute.code }
+    }
+
+    /** 可信性状态卡（**用户侧**；与 `/winstage status` 同一个 `buildTrustCard()`） */
+    async function readTrustCard(ctx, sessionId) {
+      const result = await fetchPanelRoute(PANEL_TRUST_ROUTE, sessionId)
+      if (!result.ok) return { ok: false, code: result.code }
+      return { ok: true, card: result.value.card ?? null, store: result.value.store }
     }
 
     function runCommand(ctx, sessionId, line) {
@@ -716,11 +897,17 @@ window.__ModuleLoader__.load({
         try {
           const configSnapshot = configForm ? configForm.getSnapshot() : undefined
           const configValue = (configSnapshot && configSnapshot.value) || {}
-          // ── 开关关闭：审阅面**整体卸载**（面板 / 常驻 chip / 轮询全部停）────────────
+          // ── 开关**关着或状态未知**：审阅面整体卸载（面板 / 常驻 chip / 读快照全停）──
           // 关闭语义 = 暂存与审批面交回平台（fs-entry.mjs 按同一个开关现读退回平台的
           // 沙箱/审批模式）。这里若继续读 review.json，用户会看到**上一版快照**的待审行，
           // 点"批准"还会调到已拒绝执行的命令 —— 那正是"关掉了却仍在审批"的错觉来源。
-          if (configValue.enabled === false) {
+          //
+          // ★ 'unknown'（configForms 还在 loading，或命名空间 unavailable ⇒ 宿主插件
+          //   没装/本客户端看不到）按**关闭**处理，不再按"开"：未知时继续发布快照会让
+          //   composer 上的 WinStage 审阅卡顶掉平台自己的审批卡与审批弹窗 ——
+          //   "沙箱没有真正生效"绝不能表现成"平台 UI 被覆盖"。代价只是多一拍延迟：
+          //   一旦快照 ready 且 enabled===true，下一拍即接管。
+          if (readSwitch(configForm) !== 'on') {
             const configuredRoot =
               typeof configValue.workspaceRoot === 'string' && configValue.workspaceRoot.trim().length > 0
                 ? configValue.workspaceRoot.trim()
@@ -729,10 +916,11 @@ window.__ModuleLoader__.load({
             return
           }
           // C-7：根**只有一个来源** —— 插件 Config 里的 workspaceRoot。
-          // 绝不回退到 `owner.session.cwd`：那会让面板去读"另一个工作区"的
-          // `.dshstage/review.json`（项目根那份 pending=true 的快照就是这么被
-          // 3081 显示出来的，实测见 T2 报告 §4.4）。没显式配置 = 没有可信的根
-          // = 视为"没有待审"，宁可不显示。
+          // 绝不回退到 `owner.session.cwd`：那会让面板去读"另一个工作区"的快照
+          // （项目根那份 pending=true 的快照就是这么被 3081 显示出来的，实测见 T2 报告
+          // §4.4）。没显式配置 = 没有可信的根 = 视为"没有待审"，宁可不显示。
+          // WP3-B：本值现在是**宿主路由**的一致性自校验基准（快照自带的 workspaceRoot
+          // 必须与它同根），也是兜底读法拼旧布局时的根。
           const root = typeof configValue.workspaceRoot === 'string' ? configValue.workspaceRoot.trim() : ''
           if (!sessionId || root.length === 0) {
             // ⚠ S3g：**idle 不许清 `alert`**。这两个 idle 分支原本都写 `alert: null`，
@@ -744,12 +932,20 @@ window.__ModuleLoader__.load({
             store.publish({ status: 'idle', snapshot: null, workspaceRoot: undefined, sessionId, enabled: true })
             return
           }
-          const snapshot = await readReview(ctx, sessionId, root)
+          const read = await readReview(ctx, sessionId, root)
+          const snapshot = read.snapshot
           // 自校验（零额外 IO）：读到的那份快照必须声明同一个根，否则丢弃
           if (snapshot && !sameRoot(snapshot.workspaceRoot, root)) {
             store.publish({ status: 'idle', snapshot: null, workspaceRoot: root, sessionId, enabled: true })
             return
           }
+          /**
+           * WP3：同一拍取一次**可信性状态卡**（用户侧）。
+           * 它回答的是"沙箱此刻可不可信"（档位/首次掉档/失根/未结算审批/未确认写入/
+           * 读侧可见性），与快照是**两块**数据：快照说"有什么待审"，卡片说"这套机制本身
+           * 现在靠不靠得住"。取不到就如实不显示（**不**拿旧卡片冒充现状）。
+           */
+          const trust = await readTrustCard(ctx, sessionId)
           // S3e：「收起」的两个来源（sessionStorage 记住的那一版 + 「默认收起」启动偏好）
           // 都收敛到纯函数 `nextDismissed()`（离线可断言）。**关键**：「默认收起」只在
           // 本次页面加载后的第一版有待审快照上生效一次（`store.defaultCollapseApplied`），
@@ -801,6 +997,13 @@ window.__ModuleLoader__.load({
             sessionId,
             alert: currentAlert,
             enabled: true,
+            // WP3-B：读侧来源（`host-route` = 宿主解析的新存储 / `legacy-compat-path` = 兜底旧布局）。
+            // 面板据此显示一行"读取来源"，让"读到的是哪一份"永远可分辨。
+            storeSource: read.source,
+            ...(read.routeFallback ? { routeFallback: read.routeFallback } : {}),
+            // WP3：可信性状态卡（取不到就是 undefined ⇒ 面板不显示，而不是显示旧结论）
+            trust: trust.ok ? trust.card : undefined,
+            ...(trust.ok ? {} : { trustCode: trust.code }),
             ...(pruned.dropped > 0 ? { failures: pruned.failures, notice: pruned.notice } : {}),
           })
         } catch (error) {
@@ -1060,6 +1263,16 @@ window.__ModuleLoader__.load({
         fontSize: '12px',
         lineHeight: '18px',
         paddingBottom: '2px',
+        color: 'var(--dsw-alias-state-warn-primary, #8a6100)',
+      },
+      /**
+       * 逐行的漂移形状说明（缺陷② F5b）。与 frozenReason 同一缩进语言：
+       * 贴在那一行**下面**，因此"哪一条、为什么"不会被读成面板级告警。
+       */
+      staleNote: {
+        fontSize: '12px',
+        lineHeight: '17px',
+        padding: '0 0 4px 26px',
         color: 'var(--dsw-alias-state-warn-primary, #8a6100)',
       },
       // ── 替代「访问模式」控件的视觉：与平台 PermissionSelect 同一位置、同一尺寸语言 ──
@@ -1447,6 +1660,47 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * WP3：**可信性状态卡** → 面板上的两行（纯函数，离线可断言）。
+     *
+     * 六个面的细节留在 `/winstage status`（面板不堆术语），这里只给：
+     *   ① 一句话结论（level → locale 文案）；
+     *   ② 一行机读式摘要（档位/掉档次数/失根次数/未结算审批/未确认写入/敏感读）。
+     *
+     * 卡片读不到（宿主路由不可用）⇒ 返回 `null`：面板**不显示**任何可信性结论，
+     * 而不是拿旧的乐观结论冒充现状。文案里**没有路径**（卡片本身也不含路径）。
+     */
+    function trustLine(t, trust) {
+      if (!trust || typeof trust !== 'object' || !trust.trust) return null
+      const level = trust.trust.level
+      const text =
+        level === 'trusted'
+          ? t('trustTrusted')
+          : level === 'attention'
+            ? t('trustAttention', { count: (trust.trust.blockers || []).length })
+            : level === 'degraded'
+              ? t('trustDegraded')
+              : level === 'lost'
+                ? t('trustLost')
+                : level === 'write-unconfirmed'
+                  ? t('trustWriteUnconfirmed')
+                  : level === 'off'
+                    ? t('trustOff')
+                    : level === 'unknown'
+                      ? t('trustUnknown')
+                      : null
+      if (text === null) return null
+      const detail = t('trustDetail', {
+        lane: trust.tier?.launchMode ?? '?',
+        degrades: trust.firstDegrade?.degradeCount ?? 0,
+        lost: trust.stageRoot?.lossCount ?? 0,
+        approvals: trust.approvals?.unsettledCount ?? 0,
+        writes: trust.writes?.count ?? 0,
+        reads: trust.readVisibility?.reads ?? 0,
+      })
+      return { level, ok: trust.trust.ok === true, text, detail }
+    }
+
+    /**
      * 审阅悬浮窗：输入框上方的卡片，列出待审文件、逐文件 diff 与批准/拒绝动作。
      * 收到的 props：`matched`（select 的返回值）、`t`、`poller`、`executeCommand`。
      */
@@ -1463,6 +1717,18 @@ window.__ModuleLoader__.load({
        * 这里把它并进同一条 `[data-winstage-notice]` 通道（`notice` 优先：它是本次手势的结果）。
        */
       const pollError = typeof state.error === 'string' && state.error.length > 0 ? state.error : undefined
+      /**
+       * WP3：可信性状态卡（面板侧）。与 `/winstage status` 同一份 `buildTrustCard()`；
+       * 读不到（`state.trust` 为 undefined）就**不显示** —— 不让旧结论冒充现状。
+       */
+      const trust = trustLine(t, state.trust)
+      /** WP3-B：读侧来源（宿主路由 / 兜底旧布局）。只显示"是哪一条通道"，不显示任何路径。 */
+      const storeSourceText =
+        state.storeSource === 'host-route'
+          ? t('trustSourceRoute')
+          : state.storeSource === 'legacy-compat-path'
+            ? t('trustSourceLegacy')
+            : undefined
       /**
        * **立即、原地**显示失败：面板级 `notice` + 逐条 `failures`，一次写进 store。
        * 只针对一条时，整段原文也贴到那一条上（宿主不一定逐行带路径）。
@@ -1754,6 +2020,14 @@ window.__ModuleLoader__.load({
                 t('baselineStale'),
               ),
           ),
+          // 缺陷②（F5b）：**逐行**说清是哪种漂移（"真实文件在暂存后出现"等）。
+          // 只靠一个"基线已过期"徽标，用户看不出磁盘上已经有一份内容而批准会覆盖它。
+          file.baselineStale === true &&
+            h(
+              'div',
+              { ...DR, 'data-winstage-baseline-stale-note': '1', style: styles.staleNote },
+              baselineStaleReasonText(t, file) ?? t('baselineStaleDrifted'),
+            ),
           risk !== 'normal' && h('div', { style: styles.riskReason }, file.riskReason ? t('riskReason', { reason: file.riskReason }) : t('riskReasonUnknown')),
           !actionable && h('div', { style: styles.frozenReason, ...DR }, frozenText),
           // 失败原因**原地**贴在这一条下面（store 里的逐条映射；不在视野内的问题随之消失）
@@ -1768,7 +2042,7 @@ window.__ModuleLoader__.load({
       }
 
       // S3i：标题条与 chip **同一口径** —— 都走 `levelCounts()` + `levelSegments()`（**不另算一套**）。
-      const levels = levelCounts(files, snapshot?.riskCounts)
+      const levels = levelCounts(files, snapshot?.riskCounts, snapshot?.truncated, snapshot?.counts?.totalFiles ?? snapshot?.counts?.files)
       const summaryText = t('reviewLevels', {
         files: `${levels.total}${levels.truncated ? '+' : ''}`,
         levels: levelSegments(levels, t).join(' · '),
@@ -1875,6 +2149,30 @@ window.__ModuleLoader__.load({
                 h('div', { style: styles.alertHint }, alert.hint ? String(alert.hint) : t('alertHint')),
               ),
             h('div', { style: { fontSize: '12px', opacity: 0.6, wordBreak: 'break-all' } }, snapshot?.workspaceRoot ?? ''),
+            // ── WP3：可信性状态卡（**用户侧**；AI 侧零注入 —— 命令 stdout/stderr 不含它）──
+            trust &&
+              h(
+                'div',
+                {
+                  ...DR,
+                  'data-winstage-trust': trust.level,
+                  role: 'status',
+                  style: {
+                    fontSize: '12px',
+                    marginTop: '2px',
+                    color: trust.ok ? 'inherit' : 'var(--dsw-alias-state-error-primary, #b3261e)',
+                    opacity: trust.ok ? 0.85 : 1,
+                  },
+                },
+                h('span', { style: { fontWeight: 600 } }, `${t('trustLabel')}：`),
+                h('span', null, trust.text),
+                h('div', { style: { opacity: 0.75, marginTop: '2px' } }, trust.detail),
+                storeSourceText ? h('div', { style: { opacity: 0.6, marginTop: '2px' }, 'data-winstage-store-source': state.storeSource }, storeSourceText) : null,
+              ),
+            // 兜底读法（路由不可用）即使没拿到卡片也必须可见：否则用户只会看到"没有待审"
+            !trust && storeSourceText
+              ? h('div', { style: { fontSize: '12px', opacity: 0.6 }, 'data-winstage-store-source': state.storeSource }, storeSourceText)
+              : null,
             // D1：把"N 项里有多少项是不可批准的存档行"直接说清 —— 否则用户会以为
             // 计数里的每一条都能勾、都能批。
             (snapshot?.counts?.frozenOnly ?? 0) > 0 &&
@@ -1951,30 +2249,44 @@ window.__ModuleLoader__.load({
                 { type: 'button', style: { ...styles.button, ...styles.primary }, disabled: busy, onClick: approveSelected },
                 t('approveSelected'),
               ),
-            (snapshot?.counts?.staleBaseline ?? 0) > 0 &&
+            /**
+             * 缺陷②（F5b）：**基线已过期**时，拒绝文案给出的出路必须在面板上**可点**。
+             *
+             * 背景：旧设计删掉了「重新对齐基线」按钮，理由是"每次修改都自动对齐"——
+             * 而"自动对齐"正是缺陷②要拿掉的那条丢数据路径。现在有损漂移不会被自动对准、
+             * 批准会被 `STALE_BASELINE` 拒绝，如果面板上再没有按钮，用户就被卡在
+             * "点批准失败 → 让你 rebase → 没有按钮"里。
+             *
+             * 只对**已勾选**的项出现，并且走 `authorizedPaths()` 同一份可写集合
+             * （不比普通「批准所选」多覆盖任何一个文件，只是先把它们对齐到真实文件）；
+             * 命令面是既有的 `/winstage approve --rebase`，不是新流程。
+             */
+            selected.size > 0 &&
+              files.some((file) => selected.has(file.path) && file.baselineStale === true && isActionable(file)) &&
               h(
                 'button',
                 {
-                  ...DR, type: 'button', style: styles.button, disabled: busy,
-                  title: t('baselineStaleTitle'), onClick: () => act('/winstage rebase'),
+                  ...DR,
+                  type: 'button',
+                  'data-winstage-rebase-selected': '1',
+                  style: styles.button,
+                  disabled: busy,
+                  title: t('baselineStaleTitle'),
+                  onClick: rebaseAndApprove,
                 },
-                t('rebaseAll'),
+                t('rebaseAndApprove'),
               ),
+            // ★ 不再有「重新对齐基线」**全局**按钮（用户要求）：全局对齐会把**没有勾选**的
+            //   条目也一起对齐，而"对齐"对**有损**漂移来说就是"把外部写入变成可批准"。
+            //   缺陷②（F5b）之后：无损漂移仍会自动对准；有损漂移必须在面板上**显式**处理 ⇒
+            //   上面那个「重新对齐并批准所选」（只对已勾选、且只走 authorizedPaths 的可写集合）
+            //   就是唯一入口，终端仍有 `/winstage rebase`。
             h(
               'button',
               {
                 ...DR, type: 'button', style: { ...styles.button, ...styles.primary }, disabled: busy, onClick: approveAll },
               t('approveAll'),
             ),
-            (snapshot?.counts?.staleBaseline ?? 0) > 0 &&
-              h(
-                'button',
-                {
-                  ...DR, type: 'button', style: { ...styles.button, ...styles.primary }, disabled: busy,
-                  onClick: rebaseAndApprove,
-                },
-                t('rebaseAndApprove'),
-              ),
             // 内联文案说清「批准全部」的范围（**不用弹窗拦截**）
             h('div', { style: styles.actionHint }, t('approveAllScope')),
             // G1：档位变化导致授权失效时，用**内联**文案说明（不弹窗、不阻断其它操作）
@@ -2091,16 +2403,8 @@ window.__ModuleLoader__.load({
                   },
                   t('permRefresh'),
                 ),
-            stale > 0 &&
-              h(
-                'button',
-                {
-                  ...DR, type: 'button', role: 'menuitem', style: styles.permItem,
-                  disabled: busy,
-                  onClick: () => { setOpen(false); run('/winstage rebase'); openPanel() },
-                },
-                t('permRebase', { files: stale }),
-              ),
+            // 「重新对齐基线」菜单项已删除（与卡片按钮同一决定：对齐是自动的，
+            //  见审阅卡片处注释）。要立刻处理时终端仍有 `/winstage rebase`。
             h(
               'button',
               {
@@ -2146,7 +2450,7 @@ window.__ModuleLoader__.load({
       const collapsed = isCollapsedNow(snapshot)
       if (!pending || !collapsed) return null
       // S3h：分级计数走纯函数（可离线断言），数据优先用宿主的 `riskCounts`（G3 的 max 加固在里面）
-      const levels = levelCounts(snapshot.files, snapshot.riskCounts)
+      const levels = levelCounts(snapshot.files, snapshot.riskCounts, snapshot.truncated, snapshot.counts?.totalFiles ?? snapshot.counts?.files)
       const segments = levelSegments(levels, t).join(' · ')
       // 兜底：万一所有档位都是 0（理论上被 pending 条件挡住），退回只显示总数，绝不渲染空括号
       // 截断标记直接并进数字里（`10+` = "至少 10 个"，同 G3 的"不静默少报"）
@@ -2286,6 +2590,27 @@ window.__ModuleLoader__.load({
     return {
       /** settings 通道（configForms）+ 槽位 + 本地化 + 只读文件/命令 Remote */
       inject: ['slots', 'locale', 'configForms', 'remote', 'remote.workspaceFiles', 'remote.commands'],
+
+      /**
+       * ★ WP3-B：**离线断言的接缝**（不是新契约、不参与 DSH 装配）。
+       *
+       * 为什么必须开这个口：上面那些函数都在 factory 闭包里，外部只能通过"跑轮询 + 桩 ctx"
+       * 才能间接打到它们。把真正决定"读哪一份快照"的三个入口亮出来，断言就能直接问
+       * 三个问题（顺序即优先级）：
+       *   ① `readReviewViaRoute()` 走的是宿主路由吗？
+       *   ② 路由不可用时才落到 `readReviewViaLegacyPath()`（兼容旧布局）吗？
+       *   ③ 返回的 `source` 如实标出来源了吗？
+       */
+      __winstageTestHooks: {
+        PANEL_SNAPSHOT_ROUTE,
+        PANEL_TRUST_ROUTE,
+        readReview,
+        readReviewViaRoute,
+        readReviewViaLegacyPath,
+        readTrustCard,
+        trustLine,
+        storeSourceOf: () => store.state.storeSource,
+      },
 
       apply(ctx) {
         ctx.effect(() => ctx.locale.register(LOCALE_NS, dicts), 'winstage-sandbox: dictionaries')
@@ -2451,8 +2776,11 @@ window.__ModuleLoader__.load({
 
         // ── 访问模式控件：WinStage 开启时**替换**平台的权限预设选择器 ──────────────
         // 槽位是 single（平台条目 priority 0）⇒ 本插件注册 -10 遮蔽它（"最低 priority 渲染"）；
-        // 关闭开关时撤销注册 ⇒ 平台控件原样回来。注册/撤销由 store.state.enabled 驱动，
+        // 关闭开关时撤销注册 ⇒ 平台控件与它的预设弹窗原样回来。注册/撤销由开关真值驱动，
         // 因此设置页一关，composer 上的按钮立刻换回平台的访问模式选择器。
+        // ★ **未知 ≠ 开**：只有 readSwitch()==='on'（快照 ready 且 enabled===true）才遮蔽。
+        //   'loading'/'unavailable'/没有表单一律不注册 —— 沙箱没装或读不到时，
+        //   平台控件与弹窗必须原样保留（见 readSwitch 的注释）。
         const permissionEntry = {
           name: 'conversation.input.permission',
           priority: PERMISSION_PRIORITY,
@@ -2467,19 +2795,17 @@ window.__ModuleLoader__.load({
           ctx.slots.inject('conversation.input.permission', () => {
             let dispose = null
             /**
-             * 开关真值：**优先读 configForms 的表单快照**（设置页的写入会立刻 fold 回快照），
-             * 读不到再退回轮询器发布的 `store.state.enabled`。
+             * 开关真值：`readSwitch()`（唯一实现）—— 快照 `ready` 且 `enabled === true`
+             * 才返回 'on'。这里保留 `form.subscribe`，因为设置页的写入会立刻 fold 回快照，
+             * 于是"关掉沙箱必须**立即**恢复平台控件"（元素与逻辑一起：dispose 注册 ⇒
+             * 平台条目重新成为该 single 槽位的唯一赢家，见 dsh-client-ui-slots 的
+             * entriesOfSlot）。`store.subscribe` 只作兜底（表单读不到时靠轮询发布的值）。
              *
-             * 为什么不用轮询器当主信号：那要等一个轮询周期（1.5 s）才恢复平台控件。
-             * 关掉沙箱必须**立即**恢复 —— 元素与逻辑一起（dispose 注册 ⇒ 平台条目重新
-             * 成为该 single 槽位的唯一赢家，见 dsh-client-ui-slots 的 entriesOfSlot）。
+             * 与旧写法的关键差别：旧实现把"读不到开关"当成"开"（`enabled !== false`），
+             * 于是命名空间 unavailable（宿主插件根本没装）时**永久**盖住平台控件；
+             * 现在未知一律不接管。
              */
-            const readEnabled = () => {
-              const snapshot = form && typeof form.getSnapshot === 'function' ? form.getSnapshot() : undefined
-              const value = snapshot && snapshot.value ? snapshot.value : undefined
-              if (value && typeof value.enabled === 'boolean') return value.enabled
-              return store.state.enabled !== false
-            }
+            const readEnabled = () => readSwitch(form) === 'on'
             const sync = () => {
               const on = readEnabled()
               if (on && !dispose) dispose = ctx.slots.register(permissionEntry, WinStagePermission)
@@ -2488,7 +2814,7 @@ window.__ModuleLoader__.load({
                 dispose = null
               }
             }
-            sync() // 初始：Config 还没读到时按"开"（与 bundle 默认 enabled:true 一致），快照/轮询会纠正
+            sync() // 初始：Config 还是 loading ⇒ 'unknown' ⇒ **不接管**（平台控件在场；ready 后按真值接管）
             const offForm = form && typeof form.subscribe === 'function' ? form.subscribe(sync) : () => {}
             const offStore = store.subscribe(sync)
             return () => {

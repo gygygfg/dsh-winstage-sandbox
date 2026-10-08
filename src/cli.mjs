@@ -24,6 +24,7 @@
 
 import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { resolveStageRoot } from './stage-guard.mjs'
 import { Workspace } from './workspace.mjs'
 import { ToolSurface, renderCandidateDiff } from './tools.mjs'
 import { WindowsStageExecutor } from './executor.mjs'
@@ -99,10 +100,15 @@ async function main() {
 
   const workspaceRoot = canonical(resolve(flags.workspace || process.cwd()))
 
+  // WP11（2026-10-05）：探针缓存**不再落工作区** `<ws>\.dshstage\cache`。
+  // owner 已决定工作区不再出现 `.dshstage`，暂存/缓存一律在 Windows 缓存面（`resolveStageRoot()`）。
+  // `--no-cache` 仍然完全关闭缓存（传 `undefined`）。
+  const probeCacheDir = () => resolve(resolveStageRoot({ workspaceRoot, sessionKey: flags.session }), 'probe-cache')
+
   if (command === 'probe') {
     const report = probe({
       root: workspaceRoot,
-      cacheDir: flags['no-cache'] ? undefined : resolve(workspaceRoot, '.dshstage', 'cache'),
+      cacheDir: flags['no-cache'] ? undefined : probeCacheDir(),
       useCache: flags['use-cache'] === true,
     })
     if (flags.json) out(report, flags)
@@ -116,7 +122,7 @@ async function main() {
     case 'init': {
       const report = probe({
         root: workspaceRoot,
-        cacheDir: resolve(workspaceRoot, '.dshstage', 'cache'),
+        cacheDir: probeCacheDir(),
         useCache: flags['use-cache'] === true,
       })
       const payload = {
@@ -125,12 +131,14 @@ async function main() {
         sessionId: workspace.sessionId,
         tier: report.tier,
         instanceChecks: report.instanceChecks,
+        // 缺陷③（Fix B）：本次 init 在暂存根上做的陈旧包 SID ACE 修复（机器可读面）
+        staleAppContainerAces: report.staleAppContainerAces,
         corruption: workspace.corruption,
         entryCount: Object.keys(workspace.manifest.entries).length,
       }
       if (flags.json) out(payload, flags)
       else {
-        process.stdout.write(`${formatReport(report)}\n\n`)
+        process.stdout.write(`${formatReport(report, { workspace: { staleAceRepair: report.staleAppContainerAces } })}\n\n`)
         process.stdout.write(`workspace   = ${payload.workspaceRoot}\n`)
         process.stdout.write(`store       = ${payload.storeDir}\n`)
         process.stdout.write(`session     = ${payload.sessionId}\n`)
@@ -187,6 +195,11 @@ async function main() {
       if (!argv.length) fail('USAGE', 'exec 需要命令，例如: exec -- pwsh -c "ni a.txt"')
       const executor = new WindowsStageExecutor({
         stagingRoot: workspace.store.stagedDir,
+        // 注册表覆盖层必须落在**会话存储根**，不能落在暂存树里 —— 否则
+        // "提取暂存树变化"会把 shim 自己的 `registry/overlay.<pid>.hive*` 当成用户改动
+        // 去摄取（本机实测 `EPERM ... overlay.<pid>.hive.LOG1`）。与 `dsh-plugin/
+        // shell-executor.mjs` 的同一处参数保持一字不差。
+        registryStageDir: workspace.store.dir,
         mode: flags['read-only'] === true ? 'read-only' : 'workspace-write',
         tier: flags.tier,
       })
