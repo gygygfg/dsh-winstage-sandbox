@@ -111,7 +111,6 @@ void ws_log_w(const wchar_t *tag, const wchar_t *detail)
 
 #define WS_TRACE_SLOTS        128
 #define WS_TRACE_PATH_CCH    1024
-#define WS_STUCK_POLL_MS     5000u
 #define WS_STUCK_THRESHOLD_MS 10000u
 
 void ws_lock_init(WsLock *l, const char *name)
@@ -170,81 +169,68 @@ typedef struct WsTraceSlot {
     volatile LONG active;
     volatile DWORD tid;
     volatile ULONG64 start;
+    volatile LONG reported;
     const char *name;
     wchar_t path[WS_TRACE_PATH_CCH];
 } WsTraceSlot;
 
 static WsTraceSlot g_trace[WS_TRACE_SLOTS];
-static DWORD g_traceTls = TLS_OUT_OF_INDEXES;
-static volatile LONG g_traceStarted = 0;
 
-static int ws_trace_slot_index(void)
+/* Find this thread's slot by thread id.
+ *
+ * ★ 为什么**不用 TLS、也不用守护线程**（Windows VM 实测）：
+ *   先前实现用 `TlsAlloc()` 取槽位、并起一个守护线程扫描。实测发现：只要
+ *   `TlsAlloc()` 在**被注入进程自身的启动早期**被执行，一个普通的
+ *   `node -e "..."` 就会以
+ *   `OpenSSL configuration error ... BIO_new_file:No error:c:\ws\deps\openssl\...`
+ *   退出（0/10，稳定复现）；把整个卡死子系统改成惰性/初始化时启动都同样触发，
+ *   而**完全不碰它**则 10/10 通过。因此这里改为**协作式上报**：不分配 TLS、
+ *   不起线程，改由"任意一次钩子进入"顺带扫描并上报超时槽位。
+ *   代价：整进程单线程且完全冻死时无人上报；但已观测到的两类挂住
+ *   （锁等待、注入等待）本身就在原地直接打 STUCK，不依赖本表。 */
+static int ws_trace_find_slot(void)
 {
-    if (g_traceTls == TLS_OUT_OF_INDEXES) {
-        return -1;
-    }
-    INT_PTR v = (INT_PTR)TlsGetValue(g_traceTls);
-    return v == 0 ? -1 : (int)(v - 1);
-}
-
-static DWORD WINAPI ws_trace_daemon(LPVOID param)
-{
-    (void)param;
-    for (;;) {
-        Sleep(WS_STUCK_POLL_MS);
-        ULONG64 now = GetTickCount64();
-        for (int i = 0; i < WS_TRACE_SLOTS; i++) {
-            if (!g_trace[i].active) {
-                continue;
-            }
-            ULONG64 start = g_trace[i].start;
-            if (start == 0) {
-                continue;
-            }
-            ULONG64 age = now - start;
-            if (age >= WS_STUCK_THRESHOLD_MS) {
-                ws_log("STUCK %llu ms in %s tid=%lu path=%ls",
-                       (unsigned long long)age, g_trace[i].name ? g_trace[i].name : "(unknown)",
-                       (unsigned long)g_trace[i].tid,
-                       g_trace[i].path[0] ? g_trace[i].path : L"(n/a)");
-            }
+    DWORD tid = GetCurrentThreadId();
+    for (int i = 0; i < WS_TRACE_SLOTS; i++) {
+        if (g_trace[i].active && g_trace[i].tid == tid) {
+            return i;
         }
     }
-    return 0;
+    return -1;
 }
 
-/* Started lazily from the first traced hook entry, never from DllMain: creating
- * a thread while the loader lock is held can deadlock. */
-void ws_stuck_start_daemon(void)
+/* Report any slot that has been inside one call longer than the threshold.
+ * Called on hook entry; each slot reports once per call (`reported` latch). */
+static void ws_stuck_scan(void)
 {
-    if (InterlockedCompareExchange(&g_traceStarted, 1, 0) != 0) {
-        return;
-    }
-    g_traceTls = TlsAlloc();
-    if (g_traceTls == TLS_OUT_OF_INDEXES) {
-        return;
-    }
-    HANDLE th = CreateThread(NULL, 0, ws_trace_daemon, NULL, 0, NULL);
-    if (th) {
-        CloseHandle(th); /* detached: the daemon lives for the process life */
+    ULONG64 now = GetTickCount64();
+    for (int i = 0; i < WS_TRACE_SLOTS; i++) {
+        if (!g_trace[i].active) {
+            continue;
+        }
+        ULONG64 start = g_trace[i].start;
+        if (start == 0) {
+            continue;
+        }
+        ULONG64 age = now - start;
+        if (age >= WS_STUCK_THRESHOLD_MS && !g_trace[i].reported) {
+            g_trace[i].reported = 1;
+            ws_log("STUCK %llu ms in %s tid=%lu path=%ls",
+                   (unsigned long long)age, g_trace[i].name ? g_trace[i].name : "(unknown)",
+                   (unsigned long)g_trace[i].tid,
+                   g_trace[i].path[0] ? g_trace[i].path : L"(n/a)");
+        }
     }
 }
 
 void ws_stuck_enter(const char *name)
 {
-    ws_stuck_start_daemon();
-    if (g_traceTls == TLS_OUT_OF_INDEXES) {
-        return;
-    }
-    int idx = ws_trace_slot_index();
+    DWORD tid = GetCurrentThreadId();
+    int idx = ws_trace_find_slot();
     if (idx < 0) {
         for (int i = 0; i < WS_TRACE_SLOTS; i++) {
             if (InterlockedCompareExchange(&g_trace[i].active, 1, 0) == 0) {
-                g_trace[i].tid = GetCurrentThreadId();
-                g_trace[i].start = GetTickCount64();
-                g_trace[i].name = name;
-                g_trace[i].path[0] = 0;
-                TlsSetValue(g_traceTls, (LPVOID)(INT_PTR)(i + 1));
+                g_trace[i].tid = tid;
                 idx = i;
                 break;
             }
@@ -252,16 +238,17 @@ void ws_stuck_enter(const char *name)
         if (idx < 0) {
             return; /* registry full: this thread is simply untraced */
         }
-    } else {
-        g_trace[idx].name = name;
-        g_trace[idx].start = GetTickCount64();
-        g_trace[idx].path[0] = 0;
     }
+    g_trace[idx].start = GetTickCount64();
+    g_trace[idx].reported = 0;
+    g_trace[idx].name = name;
+    g_trace[idx].path[0] = 0;
+    ws_stuck_scan();
 }
 
 void ws_stuck_path(const wchar_t *path)
 {
-    int idx = ws_trace_slot_index();
+    int idx = ws_trace_find_slot();
     if (idx < 0 || !path) {
         return;
     }
@@ -270,12 +257,11 @@ void ws_stuck_path(const wchar_t *path)
 
 void ws_stuck_leave(void)
 {
-    int idx = ws_trace_slot_index();
+    int idx = ws_trace_find_slot();
     if (idx < 0) {
         return;
     }
     InterlockedExchange(&g_trace[idx].active, 0);
-    TlsSetValue(g_traceTls, NULL);
 }
 
 /* --------------------------------------------------------------- strings */

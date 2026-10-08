@@ -155,7 +155,6 @@ void ws_lock_leave(WsLock *l);
 void ws_stuck_enter(const char *name);
 void ws_stuck_path(const wchar_t *path);
 void ws_stuck_leave(void);
-void ws_stuck_start_daemon(void);
 
 /* Scope guard: `WS_STUCK("CreateFileW");` at the top of a hook registers the
  * call for its whole scope and clears it on *every* return path (compiler
