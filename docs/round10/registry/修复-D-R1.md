@@ -235,6 +235,15 @@ RESULT readseeded key_resolve=0 key_open=0 key_exists=1 value_get=0
 2. **我的写路径在候选里是通的** —— `arm-13c` 那次唯一被注入的 `reg add` 成功写进了 journal
    （`rec1 CREATE_KEY` + `rec2 SET_VALUE`，170 B，`problems=0`），只是随后的读进程都没被注入。
 
+**本修复的正面外部读数（`exe` 独立记录）**：候选 `out-r2` 下 **`registry-unstaged-wow64` 由 6 bad 改善到 `36/0`**
+（原始见 `docs/round10/shim/evidence/D47-2-window3-verdict.md`）。
+⇒ 说明 D-R1 的改动**确实**修好了一部分真实用例；唯一残留是 D-R10 的钩子层缺陷。
+
+**环境阻塞（与本次结论无关，但会挡住任何后续验证）**：`exe` 通报
+**`src/stage-guard.mjs:209` 存在 Git 冲突标记 `<<<<<<< HEAD`**，24 个受封印文件漂移、`baseline --check` exit 4
+⇒ **所有套件当前都跑不起来**。该文件**不在本任务写范围**（我在 5.2 的对照里也是"窗口内四回合"而非套件）。
+⇒ **冲突解决前不得开新窗口**；我已同步 `exe`/Lead，不自行动他人的文件。
+
 **仍未闭合的唯一断言**：`replayedBytes>0` 的 attach 行。等候选真的进 `shim/out` 后再取。
 
 ### 5.3 环境事件（影响取证，不影响源码）

@@ -301,6 +301,18 @@ this process's read-back view; the durable cross-process truth is the SHARED jou
 写 `HKCU\Console` 的探针值，断言 **"要么成功且能读回、要么 WAL 里留下带真实 LSTATUS 的记录"**。
 当前两者皆无。
 
+### 后续线索（`推断，未取证` ⇒ 供 `ws_reg.c` owner 参考，**不得当结论**）
+
+D-R10 定因之后，本条的"写被拒 + WAL 零记录"有一个**自洽的候选解释**：
+`ws_reg.c` 的伪句柄读/写路径在 `canServe == false` 时会**把伪句柄转给真实 API**（`:967-969`）。
+对**已存在**的键（`HKCU\Console`/`Run`），钩子层可能因 `canServe` 判定失败而"不接手"，
+于是调用落到真实 API、再由**受限令牌**拒绝 —— 返回 5/SecurityException，**而因为从未进入 provider，WAL 自然没有记录**。
+这能同时解释 D-R2 的两个表征（"拒绝" + "零记录"）。
+
+**为什么只标推断**：本条的原始读数来自 Phase 1（`tier=TS` 正常态），当时**没有**采集 `ws_reg_read_ctx`/`canServe` 的运行时值；
+要证实需要一次专门探针（在 `:958` 打点 + 对已存在键做写探针）。`not-run`。
+⇒ **建议 `ws_reg.c` 修复后重跑本条的"建议最小红检查"**，若同时转绿，则 D-R2 与 D-R10 同源。
+
 ---
 
 ## D-R3【中】新建键的 `SET_VALUE` **无法冻结进候选**（16/16 丢失），候选退化成"只有 mkdir"
