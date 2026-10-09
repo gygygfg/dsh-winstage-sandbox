@@ -189,3 +189,24 @@ restricted-token（T1）**，而**暂存面（暂存树/候选）照常工作** 
 | F-ACL | `tests/executor-stub.mjs` | 在 `err.message` 里找 `OpenProcessToken`；契约把诊断放 `.detail`/`.steps` | `stageGrantError` 注释 + `err.code==='STAGE_GRANT_FAILED'` 实测 |
 | F-C4D | `tests/file-cow-dispositions.mjs` | 前提"目录打不开"不成立：未注入主机同样 `openOk=true`（libuv BACKUP_SEMANTICS） | `evidence/D10-c4d-uninjected-control.txt` 两侧对照 |
 | F-STAGE | `tests/registry-conformance.mjs` | 记录文件固定先读 evidence-latest ⇒ 陈旧优先 | 见 D-COUPLE-1 |
+
+---
+
+## D-FIXTURE-STAGEROOT（中 · 测试夹具假红，2026-10-09 新增）
+
+**现象**：`registry-guard` / `registry-conformance` 在**任何** DLL 上各报 2 条红：
+`✗ A.2 记录里的数据字节 = 探针写入的 UTF-16LE 内容`、`✗ A.3 完整 apply 后真实 hive 只出现这一个值且数据逐字节一致`；
+连带整仓 `autotest` 假红为 `32 通过 / 1 失败 · 2067 ok / 2 bad`。
+
+**机制**：`tests/registry-conformance.mjs:170` 的 `findStageRoot()` 按 mtime 选记录，**只要求该 `stageRoot` 下真的有 journal**，
+未要求"该 journal 含本次探针写入/属本次运行" ⇒ 旧的 `--keep-stage` 保留树稳定胜出，套件永远读那份不含探针写入的 WAL。
+
+**单变量实测（`exe`，在用 DLL 全程 `02C7418F…` 未换件）**：闭环带 `--keep-stage` 重跑使最新记录指向本次
+`run-2026-10-09T14-36-32…` 后 ⇒ `registry-conformance 58/0 bad`、`registry-guard exit 0 (378/0)`、
+整仓 `autotest exit 0 · PASS 33/0/0 · 2069 ok/0 bad`。⇒ **冻结基线确为 33/0，旧读数是夹具假红**。
+
+**修法候选**：① `findStageRoot()` 拒绝不含本次探针写入的树；② 强制显式 `DSH_CONFORMANCE_STAGE_ROOT`；
+③ 闭环默认 `--keep-stage` 并保留其 WAL。**在修好前，任何窗口/门禁都必须先做一次带 `--keep-stage` 的闭环重跑**，
+否则会在任何 DLL 上误报 2 条红（本轮已实际误导过一次，`D47-2 §9`→§10 撤回）。
+
+**证据**：`docs/round10/shim/evidence/D47-2-window3-verdict.md` §9（撤回）/ §10（采信）、`.t/round10/verify/d47-*`。
