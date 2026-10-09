@@ -48,10 +48,31 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { basename, dirname, isAbsolute, join, normalize, sep } from 'node:path'
+// ── Phase 1 / WP0：工作根搬到 Windows 缓存，并用句柄共享语义钉住 ────────────────────
+// 契约与机制全在 `stage-guard.mjs` 文件头。这里只做三件事：
+//   ① 默认根**不再**是工作区里的 `.dshstage`，而是 `resolveStageRoot(...)`（缓存路径）；
+//   ② 根属于缓存面时**自动**建立守护（`acquireStageGuard`）；
+//   ③ 每一次往暂存面写入**之前**先 `assertAlive()` —— 根没了就抛 `STAGE_ROOT_LOST`，
+//      **绝不静默重建、绝不静默回退写真实盘**。
+import { STAGE_ROOT_LOST, acquireStageGuard, resolveStageRoot, stageBaseDir, verifyStageRootAlive } from './stage-guard.mjs'
+// ── 三轮接线：暂存配额（磁盘上限）──────────────────────────────────────────────────
+// `store.mjs` 是 blob 的**唯一落盘路径**，因此配额闸门必须落在这里（`limits.mjs` 文件末的
+// "接线契约①"点名了本文件）。默认配额 = `DEFAULT_LIMITS.stagingBytes`（64 GiB，对齐上游
+// NeoAI 默认值），对既有调用方**无感**；`stagingQuotaBytes: null` 是唯一的显式关闭方式。
+import { DEFAULT_LIMITS, checkStagingQuota, measureTree } from './limits.mjs'
 
 export const MANIFEST_VERSION = 1
 export const CANDIDATE_VERSION = 1
+/** 旧布局的工作区目录名（Phase 1 起**只用于识别/迁移**，不再是默认根） */
 export const STORE_DIR = '.dshstage'
+/** 便利再导出：WP2/WP4 可以只 import `store.mjs` 就拿到稳定错误码 */
+export { STAGE_ROOT_LOST }
+/** 本 store 的存储面是不是"缓存工作根"（决定是否默认挂守护） */
+function isStageCacheDir(dir, env) {
+  const base = stageBaseDir(env).toLowerCase()
+  const target = normalize(String(dir)).toLowerCase()
+  return target === base || target.startsWith(`${base}${sep}`)
+}
 
 /** 逻辑状态（手册 3.1 表） */
 export const STATE = {
@@ -176,14 +197,39 @@ export class Store {
   constructor(workspaceRoot, options = {}) {
     this.workspaceRoot = workspaceRoot
     /**
-     * 存储根：默认 `<workspaceRoot>/.dshstage`。
+     * 存储根（Phase 1 / WP0）。
      *
-     * `options.storeDir` 用于**按会话隔离**：`getReviewService({ sessionId })` 把它指到
-     * `<workspaceRoot>/.dshstage/sessions/<key>`，于是每个会话各有一份
-     * manifest/queue/blobs/staged/candidates —— 审批内容天然隔离。
-     * 不传该选项时逐字保持升级前的布局（离线自测 / agentless 调用）。
+     * 默认**不再**是 `<workspaceRoot>/.dshstage`，而是 `resolveStageRoot(...)`：
+     *   `<stageBaseDir>\<会话键>`，默认 `%LOCALAPPDATA%\Temp\winstage-stage\<会话键>`。
+     * 显式覆盖有三条路，优先级：`storeDir` > `stageRoot` > 默认。
+     *
+     * `options.storeDir` 仍是**按会话隔离**的注入缝：`getReviewService({ sessionId })`
+     * 现在应当传 `resolveStageRoot({ sessionKey, workspaceRoot })`（WP2/WP4 接线）；
+     * 传别的路径也照旧工作（旧布局 `<root>/.dshstage/sessions/<key>` 仍能跑，
+     * 只是不挂句柄守护）。
      */
-    this.dir = options.storeDir ? String(options.storeDir) : join(workspaceRoot, STORE_DIR)
+    this.stageRootOverride = options.stageRoot !== undefined ? String(options.stageRoot) : undefined
+    this.stageEnv = options.env
+    this.dir = options.storeDir
+      ? String(options.storeDir)
+      : resolveStageRoot({
+          sessionKey: options.sessionKey || options.sessionId,
+          workspaceRoot,
+          env: options.env,
+          override: this.stageRootOverride,
+        })
+    /** 是否挂句柄守护：`false` 关、`true` 开、对象=直接用、缺省=缓存面才自动开 */
+    if (options.stageGuard === false) this.stageGuardMode = 'off'
+    else if (options.stageGuard === true) this.stageGuardMode = 'on'
+    else if (options.stageGuard && typeof options.stageGuard === 'object') this.stageGuardMode = 'given'
+    else this.stageGuardMode = 'auto'
+    this.givenGuard = this.stageGuardMode === 'given' ? options.stageGuard : undefined
+    this.guard = undefined
+    /** 这个 store 的存储面是否受句柄守护（也决定写入前是否做"丢失即显形"断言） */
+    this.stageGuarded =
+      this.stageGuardMode === 'on' ||
+      this.stageGuardMode === 'given' ||
+      (this.stageGuardMode === 'auto' && isStageCacheDir(this.dir, this.stageEnv))
     this.manifestPath = join(this.dir, 'manifest.json')
     this.queuePath = join(this.dir, 'queue.json')
     this.blobDir = join(this.dir, 'blobs')
@@ -195,9 +241,80 @@ export class Store {
     this.privateDir = join(this.dir, 'private')
     this.cacheDir = join(this.dir, 'cache')
     this.ownerToken = options.ownerToken || randomUUID()
+    /**
+     * ── 三轮接线：暂存配额 ──────────────────────────────────────────────────────
+     * `stagingQuotaBytes`：暂存树允许占用的字节数。
+     *   · 缺省 = `DEFAULT_LIMITS.stagingBytes`（64 GiB，`[官方]` 对齐上游 NeoAI 的
+     *     `disk_bytes`）——**默认就生效**，但对既有小规模测试/会话无感；
+     *   · `null` = 显式关闭（唯一关闭方式；写在代码里才看得见，不做隐式回落）。
+     * `measureStaging`：统计实现的注入缝（默认 `limits.mjs::measureTree`）。
+     *   生产路径**不传**；离线测试用它确定性地复现"统计截断 / 条目不可读"这类
+     *   难复现故障（fail-closed 分支必须能被测到）。
+     */
+    this.stagingQuotaBytes = options.stagingQuotaBytes === undefined ? DEFAULT_LIMITS.stagingBytes : options.stagingQuotaBytes
+    this.measureStaging = typeof options.measureStaging === 'function' ? options.measureStaging : measureTree
+  }
+
+  /**
+   * 建立/取得守护（幂等）。返回 `undefined` 表示本 store 不挂句柄守护
+   * （例如调用方显式 `stageGuard: false`，或存储面是旧布局 `<root>/.dshstage`）。
+   *
+   * ── 接线须知（WP2/WP4 + 离线测试，**实测**）────────────────────────────────────
+   * `%LOCALAPPDATA%\Temp\winstage-stage` 对**被沙箱收窄的命令行子进程**是**只读**的：
+   * 连 `mkdir` 都返回 `EPERM`（本机实测，pwsh 与 node 结果一致）。
+   * 而**宿主进程**（DSH 插件所在进程，即 `write` 工具那条通道）可以创建并写入它。
+   * 因此：
+   *   · 生产路径（插件 = 宿主进程）**不需要**任何额外配置，默认根就是可用的；
+   *   · 任何跑在**受限档**里的离线测试/脚本，必须显式把根指到可写处：
+   *     `new Store(root, { stageRoot: <可写临时目录>, stageGuard: true })`，
+   *     或 `new Store(root, { storeDir: <可写目录> })`（后者不挂守护）。
+   * 建不出根时这里 **fail-closed**：抛 `STAGE_GUARD_UNAVAILABLE`，
+   * **绝不静默回落**到工作区、也绝不"无守护地继续暂存"（那会让抗外部清理悄悄变成假）。
+   */
+  guardStageRoot() {
+    if (!this.stageGuarded) return undefined
+    if (this.guard) return this.guard
+    this.guard = this.givenGuard || acquireStageGuard(this.dir, { env: this.stageEnv })
+    return this.guard
+  }
+
+  /**
+   * "丢失即显形"的唯一闸门：**每一次**往暂存面写之前都要过这一关。
+   *
+   * 判据交给 `stage-guard.mjs::assertAlive()`（根在 + 标记在 + 哨兵未被篡改 + 守护存活）。
+   * 任一失效 ⇒ 抛 `StageRootLostError`（`code === STAGE_ROOT_LOST`）。
+   *
+   * ⚠ 这里**不做任何重建**：根被外部清掉之后"顺手再建一个"正是必须避免的静默行为 ——
+   * 那会把"暂存面被抹掉"伪装成什么都没发生，并且让后续写入落到一个**不再受守护**的目录里。
+   */
+  assertStageAvailable() {
+    if (!this.stageGuarded) return { alive: true, reason: 'unguarded' }
+    return this.guardStageRoot().assertAlive()
+  }
+
+  /** 只看不建：当前存储面的存活状态（供审批面/自检报告根因） */
+  stageStatus() {
+    if (!this.stageGuarded) return { alive: true, reason: 'unguarded', root: this.dir }
+    const status = verifyStageRootAlive(this.dir)
+    return { ...status, guarded: true }
+  }
+
+  /**
+   * 正常释放（退出清理的调用点）：守护释放句柄并清空该根。
+   * 宿主进程退出时会话根由守护自动清理；这里给"知道自己在收尾"的调用方一个确定性的出口。
+   */
+  releaseStageGuard(options = {}) {
+    if (!this.guard) {
+      return { root: this.dir, removed: !existsSync(this.dir), alreadyReleased: true }
+    }
+    const report = this.guard.release(options)
+    this.guard = undefined
+    return report
   }
 
   ensureLayout() {
+    // 守护必须先于布局建立：根从第一次落盘起就被钉住，而不是"建完再补个锁"。
+    this.assertStageAvailable()
     for (const dir of [this.dir, this.blobDir, this.stagedDir, this.stagedExtDir, this.candidateDir, this.realDir, this.privateDir, this.cacheDir]) {
       mkdirSync(dir, { recursive: true })
     }
@@ -219,10 +336,64 @@ export class Store {
     const hash = sha256Buffer(buffer)
     const path = this.blobPath(hash)
     if (!existsSync(path)) {
+      // ── Phase 1 / WP0：「丢失即显形」的闸门必须在**写入之前** ─────────────────
+      // 根被外部清掉时，这里的 `existsSync(path)` 也是 false —— 如果不先断言，
+      // 下面 `mkdirSync(dirname(path))` 就会把根**静默重建**成一个没有守护的普通目录。
+      this.assertStageAvailable()
+      // ── 三轮接线：配额闸门放在**写入之前**（写完再量只能事后发现超了，磁盘已经占了）──
+      // 内容寻址：hash 已存在时直接返回，不重复写、也不消耗配额（去重语义逐字不变）。
+      this.assertStagingQuota(buffer.length)
       mkdirSync(dirname(path), { recursive: true })
       writeFileSync(path, buffer)
     }
     return hash
+  }
+
+  /**
+   * 暂存配额闸门（fail-closed，两条判据）。
+   *
+   * `limits.mjs::checkStagingQuota()` 的入参是数字，它**看不到** `measureTree` 的
+   * `errors[]/truncated`；其文件末"接线契约①"明确要求调用方在统计不完整时按
+   * "已用 = 无上限"处理。本方法就是那个调用方：
+   *   1. `measure.complete === false`（截断或条目出错）⇒ `STAGING_QUOTA_MEASUREMENT_INCOMPLETE`；
+   *      **统计不了的树等于配额的洞**，宁可拒绝写入；
+   *   2. `allowed === false`（used + incoming > quota）⇒ `STAGING_QUOTA_EXCEEDED`。
+   *     `limits.mjs` 的口径是"恰好用满"放行（零余量），本方法不额外收紧。
+   *
+   * 抛的是带 `code` 的类型化错误（与 `BLOB_MISSING` 同风格），并把完整判定挂在 `error.quota`
+   * 上，便于审批面解释根因（used/quota/headroom/reason 一个都不丢）。
+   */
+  assertStagingQuota(incomingBytes = 0) {
+    if (this.stagingQuotaBytes === null) {
+      this.assertStageAvailable()
+      return { allowed: true, reason: 'staging quota explicitly disabled (stagingQuotaBytes:null)' }
+    }
+    this.assertStageAvailable()
+    // 根不存在不是"统计不完整"，而是"空树"：先建出来，免得把 ENOENT 读成配额洞。
+    if (!existsSync(this.dir)) mkdirSync(this.dir, { recursive: true })
+    const decision = checkStagingQuota({
+      root: this.dir,
+      quotaBytes: this.stagingQuotaBytes,
+      incomingBytes,
+      measure: this.measureStaging,
+    })
+    if (decision.measure && decision.measure.complete === false) {
+      const error = new Error(
+        `STAGING_QUOTA_MEASUREMENT_INCOMPLETE: 暂存树统计不完整（truncated=${decision.measure.truncated}, ` +
+          `errors=${decision.measure.errors}, skipped=${decision.measure.skipped}），拒绝写入 ${incomingBytes} 字节 —— ` +
+          `${decision.reason}`,
+      )
+      error.code = 'STAGING_QUOTA_MEASUREMENT_INCOMPLETE'
+      error.quota = decision
+      throw error
+    }
+    if (!decision.allowed) {
+      const error = new Error(`STAGING_QUOTA_EXCEEDED: 暂存配额不足，拒绝写入 ${incomingBytes} 字节 —— ${decision.reason}`)
+      error.code = 'STAGING_QUOTA_EXCEEDED'
+      error.quota = decision
+      throw error
+    }
+    return decision
   }
 
   /** 把已有文件内容落成 blob（用于冻结 base/after） */
@@ -273,6 +444,7 @@ export class Store {
   }
 
   saveManifest(manifest) {
+    this.assertStageAvailable()
     writeJson(this.manifestPath, manifest)
   }
 
@@ -351,6 +523,7 @@ export class Store {
   }
 
   saveQueue(queue) {
+    this.assertStageAvailable()
     writeJson(this.queuePath, queue)
   }
 
@@ -365,6 +538,7 @@ export class Store {
   }
 
   saveCandidate(candidate) {
+    this.assertStageAvailable()
     writeJson(this.candidatePath(candidateIdOf(candidate)), candidate)
   }
 

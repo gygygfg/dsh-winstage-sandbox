@@ -1,0 +1,201 @@
+{
+  "schema": 1,
+  "kind": "dsh-harness-patch-kit",
+  "harness": {
+    "package": "@deepseek-ai/dsh",
+    "version": "0.2.0-rc.2",
+    "note": "npx 缓存安装树（编译产物 lib/*.js，无源码、无构建工具）；本清单里的 target 均相对 harness 根。",
+    "knownRoot": "C:\\Users\\Administrator\\AppData\\Local\\npm-cache\\_npx\\1e7f6d9597241db0"
+  },
+  "confirmations": {
+    "pristineFrom": "安装树原件逐字节副本（只读复制，未写入 harness 根）",
+    "rule": "每个 entry = 一个文件；一个逻辑修复若动多个文件，则拆成同 group 的多条 entry。"
+  },
+  "patches": [
+    {
+      "id": "P1-escalation-policy-denied",
+      "group": "P1",
+      "title": "H1：never 档位下自动拒绝的升级被说成\"用户拒绝了\"",
+      "titleEn": "H1 — auto-rejected escalation under approval:never blames the user",
+      "rationale": "approval:never 时 dsh-user-approval 直接返回 rejected（根本没问用户），dsh-sandbox 却把每个 rejected 都渲染成\"用户拒绝\"。",
+      "status": "verified",
+      "target": "node_modules/@deepseek-ai/dsh-sandbox/lib/index.js",
+      "upstream": {
+        "package": "@deepseek-ai/dsh-sandbox",
+        "version": "0.2.0-rc.2",
+        "repository": "git+https://github.com/deepseek-ai/deepseek-harness.git",
+        "directory": "packages/sandbox/sandbox"
+      },
+      "upstreamSource": "packages/sandbox/sandbox/src/types/escalation.ts",
+      "upstreamSourceEvidence": "[推断] 编译产物的 region 注释为 `lib/types/escalation.js`（lib/index.js:6），故源码同名为 types/escalation.ts；repository.directory 来自 package.json（[官方]）。",
+      "pristine": "patches/dsh/pristine/P1-escalation-policy-denied/index.js",
+      "beforeLines": "L118",
+      "beforeSha256": "b56373befbfcfe281c17c8892e9a4b2cdcb96851290b3ed0ff56b08915e2f743",
+      "afterSha256": "e02f058148502a0954cff67d86558b1a387902acdd005cd98273878e57aa638f",
+      "before": "\t\tcase \"rejected\": throw new Error(`the user rejected escalating this ${subject} to \"${mode}\"; it stays denied, so stop and explain instead of working around it`);",
+      "after": "\t\tcase \"rejected\": {\n\t\t\t// H1: a \"never\" approval policy makes the approval service return \"rejected\"\n\t\t\t// WITHOUT dispatching the waterfall (nobody was asked), so blaming the user is\n\t\t\t// wrong. Attribute it to the session policy instead. Computing this message must\n\t\t\t// never throw: a failure here would replace the denial with noise.\n\t\t\tlet policy;\n\t\t\ttry {\n\t\t\t\tpolicy = approval.approver.effectivePolicy?.(approval.agent.session);\n\t\t\t} catch {\n\t\t\t\tpolicy = void 0;\n\t\t\t}\n\t\t\tif (policy === \"never\") {\n\t\t\t\tconst error = new Error(`sandbox escalation to \"${mode}\" is denied by this session's approval policy (\"never\"), so the ${subject} was not executed; approval prompts are disabled for this session — report the blocked step to the user instead of retrying with sandbox_permissions`);\n\t\t\t\terror.code = \"ESCALATION_POLICY_DENIED\";\n\t\t\t\tthrow error;\n\t\t\t}\n\t\t\tthrow new Error(`the user rejected escalating this ${subject} to \"${mode}\"; it stays denied, so stop and explain instead of working around it`);\n\t\t}",
+      "anchors": [
+        "`case \"rejected\"` 位于 lib/index.js:118（`switch (outcome)` 内，`approveEscalation` 函数体）",
+        "`case \"rejected\"` 在整个文件里只出现一次",
+        "`@deepseek-ai/dsh-user-approval/lib/index.js:175` 在 `effectivePolicy(session) === \"never\"` 时直接 `return \"rejected\"`，**不派发 waterfall**（即没有问过任何人）",
+        "`ApprovalService` 把 `effectivePolicy(session)` / `overrideOf(session)` 定义在原型上（dsh-user-approval/lib/index.js:152-165），且以 `super(ctx, \"approval\")` 注册服务 —— 因此 `EscalationApproval.approver`（调用方传的是 `ctx.get(\"approval\")`）在运行期确实暴露这两个方法",
+        "`approveEscalation` 的 **6** 个调用点（dsh-tool-bash:364 / dsh-tool-fs:1128 / dsh-tool-pwsh:335 / dsh-tools:1194 / dsh-tools/lib/types/ptc:308 / dsh-plugin-manager/lib/types/tools:32）共用这一处 switch，因此本改动一次覆盖 6 个家族（`approver: ctx.get(\"approval\")` 的供给行见 verified 第 5 条）"
+      ],
+      "changeSummary": "`case \"rejected\"` 先询问策略（`approval.approver.effectivePolicy?.(approval.agent.session)`，整段 try/catch 包住），为 `\"never\"` 时抛 `error.code = \"ESCALATION_POLICY_DENIED\"` 的**不甩锅**错误；其它情况保留原文案。",
+      "verified": [
+        "before/after 片段与文件逐字节一致（生成器断言 before 恰好出现一次）",
+        "`approval.approver.effectivePolicy` 在运行期存在（ApprovalService 原型方法 + `ctx.get(\"approval\")` 返回服务实例）[官方：读 dsh-user-approval/lib/index.js:128-165、dsh-tool-pwsh/lib/index.js:341]",
+        "策略为 never 时 `ApproviceService.request()` 返回 \"rejected\" 且不派发 waterfall，因此该分支是本缺陷的**唯一**入口 [官方：dsh-user-approval/lib/index.js:172-176]",
+        "计算 message 的路径不会抛：`effectivePolicy` 调用包在 try/catch 内，失败即回落原文案",
+        "该 switch 覆盖 **6** 个调用家族（都走同一个 `approveEscalation`）：dsh-tool-bash:364、dsh-tool-fs:1128、dsh-tool-pwsh:335、dsh-tools:1194、dsh-tools/lib/types/ptc:308、dsh-plugin-manager/lib/types/tools:32 [实测：本机 grep `approveEscalation` 命中这 6 处调用；`approver: ctx.get(\"approval\")` 的供给行分别是 :370 / :1134 / :341 / :1200 / :314 / :35。注：dsh-tool-bash:354 是 `{@link approveEscalation}` 的 JSDoc 引用、不是调用点]"
+      ],
+      "unverified": [
+        "[未实测] 未在运行期真正触发一次 never 档位的升级请求（需要未打补丁/已打补丁的真实 pwsh 工具调用 + 打补丁后的 harness 重启）；本条目只做静态锚点与语义验证",
+        "[未实测] 上游 TS 源码里 `EscalationApproval.approver` 的结构类型当前只声明了 `request()`；移植回上游时该类型需同步放宽（否则 TS 编译失败）。此处改的是编译产物（JS），不受影响"
+      ],
+      "residuals": [
+        "若 `ctx.get(\"approval\")` 在某个组合里返回的不是 ApprovalService（自定义替身只实现 request()），`effectivePolicy` 缺失 ⇒ 回落原文案（不退化、不抛错）"
+      ]
+    },
+    {
+      "id": "P2-escalation-advertisement-gate",
+      "group": "P2",
+      "title": "H2：系统提示禁止升级，工具却仍然登广告",
+      "titleEn": "H2 — the model is told not to escalate while the tool advertises escalation",
+      "rationale": "组合层审批默认策略为 never 时，pwsh 工具仍注册 sandbox_permissions/justification、仍走带升级措辞的 description、仍附加升级提示。",
+      "status": "draft",
+      "target": "node_modules/@deepseek-ai/dsh-tool-pwsh/lib/index.js",
+      "upstream": {
+        "package": "@deepseek-ai/dsh-tool-pwsh",
+        "version": "0.2.0-rc.2",
+        "repository": "git+https://github.com/deepseek-ai/deepseek-harness.git",
+        "directory": "packages/shell/tool-pwsh"
+      },
+      "upstreamSource": "packages/shell/tool-pwsh/src/index.ts",
+      "upstreamSourceEvidence": "[推断] 编译产物单文件 lib/index.js 内含 region 注释 lib/types/index.js；repository.directory 来自 package.json（[官方]）。",
+      "pristine": "patches/dsh/pristine/P2-escalation-advertisement-gate/index.js",
+      "beforeLines": "L314-L315",
+      "beforeSha256": "1a49cd8de831423a4ae0a2c57a4674a64cec538f64ae603aaa2c388d78aec790",
+      "afterSha256": "e5e9dd0ada958e0aa2c59721d880911fe0f224219076318426c6f4f160a04352",
+      "before": "\tconst defaultMode = ctx.shell.sandboxMode;\n\tconst escalationModes = defaultMode === void 0 ? [] : ESCALATION_TARGETS;",
+      "after": "\tconst defaultMode = ctx.shell.sandboxMode;\n\t// H2: under the deterministic \"never\" approval policy the runtime context forbids\n\t// escalation, so advertising sandbox_permissions/justification contradicts it. Gate on the\n\t// COMPOSED approval policy. `ctx.get` is strict (returns undefined unless the approval\n\t// fibre is active), so an unreachable policy keeps today's behaviour instead of guessing.\n\t// Residual: this is computed once per fibre, so a PER-SESSION override to \"never\" still\n\t// advertises (the execute-time path stays fail-closed through approveEscalation).\n\tconst composedApprovalPolicy = ctx.get(\"approval\")?.config?.policy;\n\tconst escalationModes = defaultMode === void 0 || composedApprovalPolicy === \"never\" ? [] : ESCALATION_TARGETS;\n\tif (escalationModes.length === 0 && defaultMode !== void 0 && composedApprovalPolicy === \"never\") ctx.logger.warn(\"tool-pwsh: sandbox escalation is not advertised because the composed approval policy is \\\"never\\\" (approval prompts are rejected automatically)\");",
+      "anchors": [
+        "`const escalationModes` 只在 apply() 里算一次（lib/index.js:315），`defineTool({... parameters ...})` 在 :457-494 用它决定是否注册 `sandbox_permissions`/`justification`（:483-493）",
+        "`description: pwshDescription(escalationModes.length > 0)`（:459）按同一个标志切换描述分支（`pwshDescription` 见 :254-258）",
+        "三处升级提示都读同一个闭包：`sandboxNotes`（:22-30，后台作业结局）、`renderPwshResult`（:155-176，前台渲染）、`renderPwshJobRead`（:202-212）",
+        "执行期兜底：`approvePwshEscalation` 在 `escalationModes.length === 0` 时抛 \"sandbox_permissions is not available in this composition\"（:333）",
+        "系统提示的另一半：dsh-user-approval/lib/index.js:39 的 `NEVER_SENTENCE` 明确禁止升级",
+        "`ctx.get(name, strict=true)` 只在服务 fiber 处于 ACTIVE（state 2）时返回实例（cordis/lib/index.js:763-769）",
+        "组合默认策略来自 ApprovalService 的 config（dsh-user-approval/lib/index.js:74 `z.union([\"ask\",\"never\"]).default(\"ask\")`；dsh-base/cordis.patch.yml:248 用 `DSH_PERMISSION_MODE` 决定）"
+      ],
+      "changeSummary": "`escalationModes` 额外与**组合层审批默认策略**相与：`ctx.get(\"approval\")?.config?.policy === \"never\"` ⇒ 空数组（参数、描述分支、三处提示同时消失），并 `ctx.logger.warn` 出声。",
+      "verified": [
+        "before/after 片段与文件逐字节一致；上述每个消费者都按行号读过（[官方]：本机文件内容）",
+        "`escalationModes.length > 0` 是参数注册、描述分支、三处提示的**唯一**开关，因此置空即同时消失",
+        "执行期不因此漏放行：字段被隐藏后若模型仍硬塞 `sandbox_permissions`，`approvePwshEscalation` 直接抛错（fail-closed）",
+        "组合层策略在标准装配里由 `dsh-base/cordis.patch.yml:248` 的 `!!js` 表达式给出（[官方]）"
+      ],
+      "unverified": [
+        "[未实测] 未在真实装配里验证 `ctx.get(\"approval\")` 在 tool-pwsh 的 apply() 时刻**一定**非空：cordis 的 loader 用 `Promise.allSettled` **并发**启动各 entry（cordis-plugin-loader/lib/index.js:143-158），fibre 激活顺序不是清单顺序的硬保证。因此本改动是**防御性**的：拿不到策略就保持现状（不误伤），拿到了才收紧",
+        "[未实测] 未实测\"参数/描述真的从模型可见的工具清单里消失\"（需要重启 harness 并观察工具 schema）；只做了静态等价性论证",
+        "[未验证] 本机当前会话的 never **不是**组合层默认（`DSH_PERMISSION_MODE` 未设 ⇒ 组合层是 ask；profile 的 defaultPreset 是 workspace-write），而是**子代理会话级覆写**，所以在本机**打上本补丁也看不到任何变化** —— 这属于下面的残余，不是本补丁失效"
+      ],
+      "residuals": [
+        "`escalationModes` 每个 fibre 只算一次：**会话级**覆写为 never（`/permission` 切换、或委托子代理把 approval 钉成 never）依旧登广告。要彻底解决必须把\"sandbox_permissions 是否出现\"变成按会话求值（上游需要把工具 schema 与会话策略挂钩，或由审批服务自己声明可用性）",
+        "工具 schema 是注册期（进程级）事实，本改动只能反映**组合层**策略；这是本补丁的能力上界"
+      ]
+    },
+    {
+      "id": "P3-permission-custom-default-host",
+      "group": "P3",
+      "title": "H3（宿主半）：未钉住的 custom 默认值让 permission 行整块消失",
+      "titleEn": "H3 (host) — an unpinned custom default throws the whole permission row off the screen",
+      "rationale": "装配期 `derive(EMPTY_KNOBS) === \"custom\"` 时构造函数直接抛错 ⇒ 投影单元 `permissions` 根本不注册 ⇒ 客户端拿不到 selection。",
+      "status": "verified",
+      "target": "node_modules/@deepseek-ai/dsh-permission-presets/lib/index.js",
+      "upstream": {
+        "package": "@deepseek-ai/dsh-permission-presets",
+        "version": "0.2.0-rc.2",
+        "repository": "git+https://github.com/deepseek-ai/deepseek-harness.git",
+        "directory": "packages/interaction/permission-presets"
+      },
+      "upstreamSource": "packages/interaction/permission-presets/src/index.ts",
+      "upstreamSourceEvidence": "[官方] lib/typert.host.js:35 记录 `\"file\":\"packages/interaction/permission-presets/src/index.ts\"`（typert 生成器写下的真实源位置）。",
+      "pristine": "patches/dsh/pristine/P3-permission-custom-default/index.js",
+      "beforeLines": "L178-L186",
+      "beforeSha256": "4f23c620145098d611d04d8363bc6716f49b26930c9141a21dc9a8df2b72ba63",
+      "afterSha256": "eb1c3909cd9aec1de0d9730144904b2b86495a1e71c35c9d81128a6d92f86070",
+      "before": "\t\t\tconst inferredDefault = this.derive(EMPTY_KNOBS);\n\t\t\tconst defaultPreset = config.defaultPreset.get() ?? inferredDefault;\n\t\t\tif (defaultPreset === \"custom\") throw new Error(\"permission: composed sandbox and approval defaults match no preset; configure defaultPreset explicitly\");\n\t\t\tthis.resolve(defaultPreset);\n\t\t\tthis.defaultSettings = () => {\n\t\t\t\tconst defaultPreset = config.defaultPreset.get() ?? inferredDefault;\n\t\t\t\tif (!Object.hasOwn(this.presets, defaultPreset)) throw new Error(`permission: unknown default preset \"${defaultPreset}\"`);\n\t\t\t\treturn { defaultPreset };\n\t\t\t};",
+      "after": "\t\t\tconst inferredDefault = this.derive(EMPTY_KNOBS);\n\t\t\tconst namedDefault = config.defaultPreset.get();\n\t\t\t// H3: a genuinely unknown *named* default stays a hard misconfiguration error ...\n\t\t\tif (namedDefault !== void 0) this.resolve(namedDefault);\n\t\t\tconst pinnedDefault = namedDefault ?? (inferredDefault === \"custom\" ? this.names[0] : inferredDefault);\n\t\t\tif (pinnedDefault === void 0) throw new Error(\"permission: composed sandbox and approval defaults match no preset and no preset is configured; configure presets and defaultPreset explicitly\");\n\t\t\tif (inferredDefault === \"custom\") ctx.logger.warn(`permission: composed sandbox (\"${ctx.shell.sandboxMode}\") and approval (\"${ctx.approval.config.policy ?? \"ask\"}\") defaults match no preset; the \"permissions\" projection reports \"${CUSTOM_PRESET}\" for such sessions while the new-session default stays pinned to the real preset \"${pinnedDefault}\" (returning \"${CUSTOM_PRESET}\" from defaultSettings() would make the client default-settings row throw \"permission catalog does not advertise its current default\")`);\n\t\t\tthis.defaultSettings = () => {\n\t\t\t\tconst named = config.defaultPreset.get();\n\t\t\t\tif (named === void 0) return { defaultPreset: pinnedDefault };\n\t\t\t\tif (!Object.hasOwn(this.presets, named)) throw new Error(`permission: unknown default preset \"${named}\"`);\n\t\t\t\treturn { defaultPreset: named };\n\t\t\t};",
+      "anchors": [
+        "抛错点 lib/index.js:180（`defaultPreset === \"custom\"`）；`this.resolve(defaultPreset)` 在 :181；`this.defaultSettings` 在 :182-186",
+        "`CUSTOM_PRESET = \"custom\"`（:50）是**派生**出来的\"不是任何预设\"状态，`optionOf(\"custom\")` 存在（:325-330）但 `names`（:238-240）**不包含** custom ⇒ catalog.options 里没有 custom 项",
+        "投影单元在 :188-201 注册，`wire.view: (state) => ({ currentValue: this.derive(state) })` —— **projection 本来就报 custom**；构造函数抛错时它压根没注册",
+        "`defaultSettings()` 的两个消费者：`catalog().defaultPreset`（:249）与 getter `defaultPreset`（:274-276）",
+        "客人端 `permissionDefaultOf`（dsh-client-ui-permission-presets/lib/client.js:570-581）要求 `currentValue` 必须出现在 `catalog.defaultOptions` 里，否则抛 \"permission catalog does not advertise its current default\" ⇒ **defaultSettings() 绝不能返回 \"custom\"**（这就是为什么设置面钉在真实预设、而只有投影面报 custom）",
+        "`pinInitialPermission`（:370-389）对 `preset === null && !seeded` 的新会话会 `this.resolve(this.defaultPreset)` ⇒ 返回 \"custom\" 会抛错 ⇒ 同样要求钉在真实预设"
+      ],
+      "changeSummary": "派生为 custom 时不再抛：显式**命名**的未知默认值仍然抛（`resolve`），否则把新会话默认**钉在第一个已配置预设**，并 `ctx.logger.warn` 说明\"投影面报 custom、设置面钉真实预设\"的理由；一个预设都没配且派生 custom 时才抛（真·无解配置）。",
+      "verified": [
+        "before/after 片段与文件逐字节一致；上述每个消费者都读过",
+        "返回 `{defaultPreset:\"custom\"}` 会在客户端抛错（client.js:576）—— 因此本补丁**刻意**把 defaultSettings() 钉在真实预设，只有投影面（`derive`）报 custom；这是任务书要求的\"若下游校验会被打破，就钉设置面\"分支",
+        "`this.names[0]` 在构造期等于 `Object.keys(this.presets)[0]`（`autoAdmit` 尚未注册，:239）⇒ 一定是 `catalog.defaultOptions` 里的真实预设",
+        "`ctx.approval` / `ctx.shell` 在构造期可用（`static inject = [\"shell\",\"approval\",\"sessions\",\"sessionProjections\"]`，:160-165；文中的 `ctx.approval.config.policy` 在 :297 已有同样用法）"
+      ],
+      "unverified": [
+        "[未实测] 未在真实装配里制造\"派生为 custom\"的部署（需要 `DSH_PERMISSION_MODE` 与 profile 预设不匹配，且 profile 不带显式 defaultPreset）；本机 profile 带显式 `defaultPreset: workspace-write`，所以走不到该分支",
+        "[未实测] 未在浏览器里验证\"permission 行仍然挂载 + 显示 Custom\"（需要重启 3080 并截图）"
+      ],
+      "residuals": [
+        "同包 `lib/types/index.js`（:150-215）是同一实现的**另一份编译副本**，带同样的抛错；它不在 package.json `exports` 映射内（`.` → `lib/index.js`），全仓无任何 import 指向它 ⇒ 运行期不可达，本补丁**刻意不动它**（改了也不会被加载）",
+        "钉在\"第一个已配置预设\"是策略选择：它让新会话的默认成为确定值；若部署真的想让新会话停在 custom，需要上游给 defaultSettings 一个\"未设置\"表达（本补丁不发明新值）"
+      ]
+    },
+    {
+      "id": "P3-permission-custom-default-client",
+      "group": "P3",
+      "title": "H3（客户端半）：selection 缺失时整块控件返回 null",
+      "titleEn": "H3 (client) — a missing projection selection returns null instead of a control",
+      "rationale": "`selection === void 0`（投影缺失）直接 return null ⇒ 访问模式控件整块消失，用户看不到任何解释。",
+      "status": "verified",
+      "target": "node_modules/@deepseek-ai/dsh-client-ui-permission-presets/lib/client.js",
+      "upstream": {
+        "package": "@deepseek-ai/dsh-client-ui-permission-presets",
+        "version": "0.2.0-rc.2",
+        "repository": "git+https://github.com/deepseek-ai/deepseek-harness.git",
+        "directory": "packages/client/ui-permission-presets"
+      },
+      "upstreamSource": "packages/client/ui-permission-presets/src/client/PermissionSelect.tsx",
+      "upstreamSourceEvidence": "[推断] 编译产物 region 注释为 `lib/types/client/PermissionSelect.js`（client.js:285）；repository.directory 来自 package.json（[官方]）。",
+      "pristine": "patches/dsh/pristine/P3-permission-custom-default/client.js",
+      "beforeLines": "L324",
+      "beforeSha256": "7f89170dd32aff34961cc86d388eb8f800fbfdab87b88894c991d28ee0f92c4f",
+      "afterSha256": "8282fcba579b630a700fd868ffddc3ad1616c41e69964ff6282a27cdbbd89426",
+      "before": "\t\t\tif (selection === void 0 || catalog === null) return null;",
+      "after": "\t\t\tif (catalog === null) return null;\n\t\t\t// H3: a missing projection selection (the host did not register the \"permissions\" unit,\n\t\t\t// or it has not arrived yet) must not take the whole access-mode control off the screen.\n\t\t\t// Keep a disabled bilingual Custom control so the row stays visible and explained.\n\t\t\tif (selection === void 0) return (0, react_jsx_runtime.jsx)(\"button\", {\n\t\t\t\ttype: \"button\",\n\t\t\t\tclassName: PermissionSelect_module_css_default.trigger,\n\t\t\t\t\"aria-label\": t(\"mode\", { name: \"Custom / 自定义\" }),\n\t\t\t\tdisabled: true,\n\t\t\t\tchildren: (0, react_jsx_runtime.jsx)(\"span\", {\n\t\t\t\t\tclassName: PermissionSelect_module_css_default.triggerLabel,\n\t\t\t\t\tchildren: \"Custom / 自定义\"\n\t\t\t\t})\n\t\t\t});",
+      "anchors": [
+        "`if (selection === void 0 || catalog === null) return null;` 位于 client.js:324；全文件只出现一次",
+        "`selection = useProjection(\"permissions\")`（:307）在投影未注册时为 undefined；`catalog = usePermissionCatalog(...)`（:308）在远端目录读失败时为 null（:113/:127）",
+        "该 early return 位于**所有** hooks 之后（useState/useEffect 见 :309-323），其后到函数结束无任何 hook ⇒ 新增一个 early return 不改变 hook 顺序",
+        "所需的 `react_jsx_runtime`、`PermissionSelect_module_css_default`、`t` 都在同一作用域内（分别见 :1、:274、:306）",
+        "`t(\"mode\", {name})` 的键在 `permission.access` 两个字典里都存在（accessZh/accessEn，:190/:210）",
+        "同文件 `PermissionRow` 的另一条 `catalog === null` 分支（:706）与本条无关（那条在 settings controller 内）"
+      ],
+      "changeSummary": "把 `catalog === null` 与 `selection === void 0` 拆开：目录缺失仍然 return null（没有可选项可渲染），selection 缺失时渲染一个 **disabled** 的 \"Custom / 自定义\" 控件（访问模式行不再整块消失）。",
+      "verified": [
+        "before/after 片段与文件逐字节一致；`before` 在文件里恰好出现一次",
+        "所有 hook 都在 early return 之前 ⇒ 不会触发 \"rendered fewer hooks than expected\"",
+        "disabled 按钮复用现有 trigger 样式类，且 `disabled` 时 `.trigger:disabled` 已有样式（:265 的 CSS 片段含 `:disabled{color:...;cursor:default}`）",
+        "不引入新的 i18n 键：标签写成中英双语字面量，避免动 locale 字典（zh 是键集权威、en 要与它逐键对齐）"
+      ],
+      "unverified": [
+        "[未实测] 未在浏览器里渲染该分支（需要构造\"目录有值、投影缺失\"的客户端状态并截图）",
+        "[未实测] 未验证 `selection === void 0` 在本机 GUI 里真的出现过（本机 profile 有显式 defaultPreset，投影单元正常注册）"
+      ],
+      "residuals": [
+        "\"Custom / 自定义\"是编译产物里的双语字面量，不是 i18n 键：后续上游若新增 `custom` 键应替换为 `t(\"custom\")`",
+        "投影在首次加载到达前也是 undefined ⇒ 加载瞬间会短暂显示 disabled 的 Custom 而不是空白（行为变化，已记录）"
+      ]
+    }
+  ]
+}

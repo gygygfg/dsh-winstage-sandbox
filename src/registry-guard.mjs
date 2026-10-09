@@ -117,14 +117,28 @@ const REG_TYPE_NAMES = Object.freeze(
   Object.fromEntries(Object.entries(REG_TYPES).map(([name, value]) => [value, name])),
 )
 
-/** `[官方]` `RegOpenKeyExW` 返回码语义（**必须区分**：不是同一种"没拿到"） */
+/**
+ * `[官方]` `RegOpenKeyExW` 返回码语义（**必须区分**：不是同一种"没拿到"）。
+ *
+ * 阶段 T3 追加的两个码（暂存层需要它们才能**如实**表达两种不同的失败）：
+ *   `ERROR_SHARING_VIOLATION` (32)   —— `RegLoadAppKeyW` 带 `REG_PROCESS_APPKEY` 时，
+ *                                     同一进程重复加载同一覆盖 hive 的返回码；
+ *                                     暂存层必须把它与"权限不足"分开报。
+ *   `ERROR_KEY_HAS_CHILDREN` (1020) —— `RegDeleteKeyExW` 删除**仍有子键**的键时的返回码
+ *                                     （winerror.h `0x3FC`）。丢弃"键已删"是错的：
+ *                                     真实 hive 里它还在，子键也还在。
+ * 数值来源：winerror.h（`ERROR_KEY_HAS_CHILDREN = 0x3FC = 1020`）。
+ */
 export const REG_STATUS = Object.freeze({
   ERROR_SUCCESS: 0,
   ERROR_FILE_NOT_FOUND: 2,
   ERROR_PATH_NOT_FOUND: 3,
   ERROR_ACCESS_DENIED: 5,
+  ERROR_SHARING_VIOLATION: 32,
+  ERROR_INVALID_PARAMETER: 87,
   ERROR_MORE_DATA: 234,
   ERROR_NO_MORE_ITEMS: 259,
+  ERROR_KEY_HAS_CHILDREN: 1020,
 })
 
 /** `[官方]` 注册表访问权（`RegSetKeySecurity` 需要 `WRITE_DAC`） */
@@ -239,8 +253,17 @@ const HEX_ONLY = /^[0-9a-fA-F]*$/
  */
 const HEX_PREFIXED_TYPES = new Set(['REG_DWORD', 'REG_DWORD_BIG_ENDIAN', 'REG_QWORD'])
 
-/** 允许空 `data` 的类型：`REG_BINARY` 的编码器对空 Buffer 就产出 `''`（见上） */
-const EMPTY_DATA_ALLOWED = new Set(['REG_BINARY'])
+/**
+ * 允许空 `data` 的类型。
+ *
+ * `REG_BINARY` 与 `REG_NONE` 的编码器对空 Buffer 都产出 `''`
+ * （`Buffer.from([]).toString('hex') === ''`，`REG_NONE` 走 `String(value)` 分支时
+ * 也可能得到空串）。**零长度 `REG_NONE` 是合法值**（winreg.h 里 `REG_NONE` 就是
+ * "无类型数据"，长度可以为零），因此 T3 的注册表暂存层必须能把它写进覆盖层。
+ * 这是**窄口径**的一次补齐：其余类型（REG_SZ/EXPAND_SZ/MULTI_SZ/DWORD/QWORD）
+ * 的编码产物**必非空**，空串在它们那里仍然非法。
+ */
+const EMPTY_DATA_ALLOWED = new Set(['REG_BINARY', 'REG_NONE'])
 
 /**
  * 校验 `data` 的形状（**不**解码、**不**触碰注册表）。
@@ -275,7 +298,7 @@ function assertShape(valueName, typeName, data) {
     reject(`has odd-length hexadecimal data (${body.length} hex chars); hex must encode whole bytes`)
   }
   if (body.length === 0 && !EMPTY_DATA_ALLOWED.has(typeName)) {
-    reject('has empty data; only REG_BINARY may legitimately serialise to the empty string')
+    reject('has empty data; only REG_BINARY and REG_NONE may legitimately serialise to the empty string')
   }
 }
 
@@ -326,6 +349,100 @@ function guardedDecoder(valueName, typeName, decoder) {
 
 function stripTrailingNul(text) {
   return text.endsWith('\u0000') ? text.slice(0, -1) : text
+}
+
+// ───────────── 值编解码的对外出口（T3 注册表暂存层复用，不另写一套）─────────────
+//
+// 为什么要把这两个函数**导出**而不是在 `registry-stage.mjs` 里再写一份：
+// 暂存层需要"把调用方给的**类型化值**编码成快照里的十六进制文本"，也需要
+// "把快照里的十六进制文本解码回类型化值好让 `RegQueryValueExW` 的替身读回自己写的值"。
+// 若暂存层自己写一份编解码，两处口径必然漂移 —— 而漂移的表现是
+// "覆盖层写进去、diff 快照读出来"的值不一样（幻影差异），或更糟：
+// 一份宽松、一份严格，于是"严格的能拒非法输入、宽松的静默接受"。
+// 因此这里**只做导出**：实现仍是 `VALUE_ENCODERS` / `VALUE_DECODERS` + `assertShape`。
+//
+// 错误码分工（供暂存层映射成"硬拒"）：
+//   `REG_TYPE_UNKNOWN`     —— 类型既不是 `winreg.h` 数值、也不是 `REG_*` 名字（调用方给错了）
+//   `REG_TYPE_UNSUPPORTED` —— 类型**合法**但本模块没有编解码器（`REG_LINK`/`REG_RESOURCE_LIST`/
+//                            `REG_FULL_RESOURCE_DESCRIPTOR`/`REG_RESOURCE_REQUIREMENTS_LIST`）。
+//                            这类**必须硬拒**：静默当成 REG_BINARY 会把语义改掉。
+//   `REG_SNAPSHOT_INVALID` —— 值形状坏（沿用既有口径，不新增第二套）
+
+/**
+ * 类型 → 规范类型名（`REG_SZ` 形式）。
+ *
+ * 接受 `'REG_SZ'`（名字，**大小写不敏感**）或 `1`（`winreg.h` 数值）。
+ * 刻意不接受 `'sz'` / `'REG_SZ '` 之类的"猜"：注册表 API 的调用方拿到的就是 winreg.h 的常量，
+ * 放宽只会让"传错了却被接受"变成静默故障。
+ *
+ * @param {string|number} type
+ * @returns {string} 规范名（`REG_TYPES` 的键之一）
+ * @throws {Error} `code = 'REG_TYPE_UNKNOWN'`
+ */
+export function registryTypeName(type) {
+  const reject = (why) => {
+    const error = new Error(`registryTypeName: ${why}`)
+    error.code = 'REG_TYPE_UNKNOWN'
+    throw error
+  }
+  if (typeof type === 'number') {
+    const name = REG_TYPE_NAMES[type]
+    if (name === undefined) reject(`unknown numeric registry type ${type} (winreg.h REG_* values are 0..11)`)
+    return name
+  }
+  if (typeof type === 'string') {
+    const upper = type.toUpperCase()
+    if (upper in REG_TYPES) return upper
+    reject(`unknown registry type ${JSON.stringify(type)}; expected a REG_* name or a winreg.h numeric value`)
+  }
+  reject(`registry type must be a string or number, got ${typeof type} ${JSON.stringify(type)}`)
+  return undefined
+}
+
+/**
+ * 类型化值 → 快照 `data`（十六进制文本）。**与 `normalizeSnapshot` 逐字同源。**
+ * @throws {Error} `REG_TYPE_UNKNOWN` / `REG_TYPE_UNSUPPORTED` / `REG_SNAPSHOT_INVALID`
+ */
+export function encodeRegistryValue(type, value) {
+  const name = registryTypeName(type)
+  const encoder = VALUE_ENCODERS[name]
+  if (typeof encoder !== 'function') {
+    const error = new Error(
+      `encodeRegistryValue: ${name} has no codec in this module; it cannot be staged faithfully ` +
+        '(refusing instead of silently reinterpreting the value)',
+    )
+    error.code = 'REG_TYPE_UNSUPPORTED'
+    throw error
+  }
+  try {
+    return encoder(value)
+  } catch (error) {
+    const wrapped = new Error(`encodeRegistryValue: (${name}) ${error.message}`)
+    wrapped.code = error.code === 'REG_TYPE_UNSUPPORTED' ? error.code : 'REG_SNAPSHOT_INVALID'
+    throw wrapped
+  }
+}
+
+/**
+ * 快照 `data`（十六进制文本）→ 类型化值。
+ * 形状校验走 `assertShape`（F8 的口径），解码走 `guardedDecoder`（与 `deserializeSnapshot` 同一个）。
+ * @param {string|number} type
+ * @param {string} data
+ * @param {string} [valueName] 只用于错误消息
+ * @throws {Error} `REG_TYPE_UNKNOWN` / `REG_TYPE_UNSUPPORTED` / `REG_SNAPSHOT_INVALID`
+ */
+export function decodeRegistryValue(type, data, valueName = '(value)') {
+  const name = registryTypeName(type)
+  const decoder = VALUE_DECODERS[name]
+  if (typeof decoder !== 'function') {
+    const error = new Error(
+      `decodeRegistryValue: ${name} has no codec in this module; it cannot be read back faithfully ` +
+        '(refusing instead of silently reinterpreting the value)',
+    )
+    error.code = 'REG_TYPE_UNSUPPORTED'
+    throw error
+  }
+  return guardedDecoder(valueName, name, decoder)(data)
 }
 
 // ─────────────────────────── 注册表路径解析（纯函数）───────────────────────────

@@ -321,4 +321,168 @@ export function isAvailable(koffi) {
   return probeAppContainerAvailability(koffi).available
 }
 
+// ─────────────────── 陈旧包 SID ACE 的检测与修复（缺陷③）─────────────────────
+
+/**
+ * `[官方]` AppContainer 包 SID 的形状：`S-1-15-2-<段1>-…-<段7>`，
+ * 即前缀之后还有 **7** 个十进制段（`[实测]` 与真实包 SID 逐段核对过：
+ * `S-1-15-2-2541843839-1445201769-316974988-186645399-2929155336-2163906706-1690789193`
+ * 的 `rest.split('-').length === 7`）。
+ * `S-1-15-3-*` 是**能力** SID，不属于包身份，因此不在此列。
+ *
+ * ⚠ 本函数第一版把段数写成 `{7}`（= 8 段），于是**真实包 SID 一律被判成"不是包 SID"**，
+ * 修复路径因此在真机上一条 ACE 都摘不到 —— 而离线用例当时也没覆盖，
+ * 是本套件的 A1 段把这条 off-by-one 抓出来的（这正是"判据必须有断言"的理由）。
+ */
+export const APPCONTAINER_PACKAGE_SID_PREFIX = 'S-1-15-2-'
+
+/** `[官方]` `ACE_HEADER.AceType`：`ACCESS_ALLOWED_ACE_TYPE` = 0 */
+const ACCESS_ALLOWED_ACE_TYPE = 0
+/** `[官方]` `ACE_HEADER.AceFlags`：`INHERITED_ACE` = 0x10（继承来的不算"被谁写进去的"） */
+const INHERITED_ACE_FLAG = 0x10
+
+/** 一个 SID 字符串是否形如 AppContainer 包 SID（只做字符串判据，不查系统） */
+export function isAppContainerPackageSid(sid) {
+  if (typeof sid !== 'string') return false
+  if (!sid.startsWith(APPCONTAINER_PACKAGE_SID_PREFIX)) return false
+  const rest = sid.slice(APPCONTAINER_PACKAGE_SID_PREFIX.length)
+  // 前缀之后 7 个十进制段：首段 + 再 6 段
+  return /^[0-9]+(-[0-9]+){6}$/.test(rest)
+}
+
+/**
+ * 把 `icacls <dir> /save` 风格的 SDDL 里的 ACE 段拆成结构化列表。
+ *
+ * 为什么自己拆而不用 `Get-Acl`：`[实测]` 本仓库的测试面**禁止子进程管道捕获**
+ * （残余边界 R10，`node child_process` 默认 `stdio:'pipe'` 在受限会话里 EPERM），
+ * 因此"解析"这一步必须是**纯函数**，这样离线套件可以直接喂合成 SDDL 给它。
+ *
+ * 解析规则（`[官方]` SDDL 语法）：
+ *   - `D:` 段里的 ACE 形如 `(AceType;AceFlags;Rights;ObjectGuid;InheritObjectGuid;AccountSid)`；
+ *   - 段内 `;` 不转义（本函数只处理 6 段形式，多余段一律判为不可解析并记 `unparsed`）；
+ *   - `D:AI(...)…` 的 `AI`、`D:P` 的 `P` 是 DACL 控制位，不是 ACE。
+ *
+ * @returns {{aces: Array<{type:number,flags:number,rights:string,sid:string,inherited:boolean,source:string}>, unparsed: string[]}}
+ */
+/**
+ * `[官方]` `ACE_HEADER.AceType` 的 mnemonic 映射（SDDL 里是字母，不是数字）。
+ * ⚠ 踩过的坑：第一版直接 `Number.parseInt(parts[0], 16)`，
+ * 于是 `'A'`→10 侥幸对、"OICI" 这种**flag** 却变成 `NaN` 被当成"不可解析"丢掉 ——
+ * 结果是**真机上一条陈旧 ACE 都摘不到**。见本文件 `isAppContainerPackageSid()` 的同族注释。
+ */
+const ACE_TYPE_BY_MNEMONIC = Object.freeze({
+  A: 0x00, // ACCESS_ALLOWED
+  D: 0x01, // ACCESS_DENIED
+  OA: 0x05, // ACCESS_ALLOWED_OBJECT
+  OD: 0x06, // ACCESS_DENIED_OBJECT
+  AU: 0x09, // SYSTEM_AUDIT
+  AL: 0x11, // SYSTEM_ALARM
+  OAII: 0x05,
+})
+/** `[官方]` `ACE_HEADER.AceFlags` 的 mnemonic 映射 */
+const ACE_FLAG_BITS = Object.freeze({
+  OI: 0x01, // OBJECT_INHERIT
+  CI: 0x02, // CONTAINER_INHERIT
+  NP: 0x04, // NO_PROPAGATE_INHERIT
+  IO: 0x08, // INHERIT_ONLY
+  ID: 0x10, // INHERITED
+  SA: 0x40, // SUCCESSFUL_ACCESS
+  FA: 0x80, // FAILED_ACCESS
+})
+
+function aceTypeOf(token) {
+  const text = String(token ?? '').toUpperCase()
+  if (text in ACE_TYPE_BY_MNEMONIC) return ACE_TYPE_BY_MNEMONIC[text]
+  const numeric = Number.parseInt(text, 16)
+  return Number.isFinite(numeric) ? numeric : NaN
+}
+
+function aceFlagsOf(token) {
+  const text = String(token ?? '').toUpperCase()
+  if (text.length === 0) return 0
+  if (/^[0-9A-F]+$/.test(text) && /[0-9]/.test(text)) {
+    const numeric = Number.parseInt(text, 16)
+    if (Number.isFinite(numeric)) return numeric
+  }
+  let bits = 0
+  for (let i = 0; i < text.length; i += 2) {
+    const pair = text.slice(i, i + 2)
+    if (!(pair in ACE_FLAG_BITS)) return NaN
+    bits |= ACE_FLAG_BITS[pair]
+  }
+  return bits
+}
+
+export function parseSddlDaclAces(sddl) {
+  const text = String(sddl ?? '')
+  const marker = text.indexOf('D:')
+  if (marker < 0) return { aces: [], unparsed: [] }
+  const body = text.slice(marker + 2)
+  const aces = []
+  const unparsed = []
+  for (const raw of body.split('(')) {
+    const end = raw.indexOf(')')
+    if (end < 0) continue
+    const inner = raw.slice(0, end)
+    if (inner.length === 0) continue
+    const parts = inner.split(';')
+    if (parts.length !== 6) {
+      unparsed.push(`(${inner})`)
+      continue
+    }
+    const type = aceTypeOf(parts[0])
+    const flags = aceFlagsOf(parts[1])
+    if (!Number.isFinite(type) || !Number.isFinite(flags)) {
+      unparsed.push(`(${inner})`)
+      continue
+    }
+    aces.push({
+      type,
+      flags,
+      rights: parts[2],
+      sid: parts[5],
+      inherited: (flags & INHERITED_ACE_FLAG) !== 0,
+      source: `(${inner})`,
+    })
+  }
+  return { aces, unparsed }
+}
+
+/**
+ * 找出"被显式写进 DACL 的 AppContainer 包 SID 允许 ACE"。
+ *
+ * ── 为什么这些 ACE 必须被清掉（缺陷③的根因）──────────────────────────────────
+ * `[实测]` 本会话可控三步实验（`.t\fix3-repro\`，见
+ * `docs\边界缺陷修复-③T0污染与静默降级.md`）：
+ *   1. 新工作区 `--tier T1` 写暂存根 → `t1_inside=OK`（DACL 里没有任何 `S-1-15-2-*`）
+ *   2. 只跑**一次** `--tier T0` → 暂存根顶部被插入
+ *      `S-1-15-2-…:(OI)(CI)(M)`（`icacls <staged> /grant *<sid>:(OI)(CI)M`）
+ *   3. 同一工作区再用 `--tier T1` 写 → `Access is denied.`
+ *   A/B 翻转实验：删掉**这一条** ACE ⇒ `OK`；把**同一条** ACE 加回 ⇒ 再次 `denied`。
+ *   对照实验排除了"巧合"：把同样权限 `(M)` 授予一个**非** `S-1-15-2-*` 的
+ *   不存在 SID ⇒ T1 仍然 `OK`。
+ *
+ * ⇒ 判据是"**非继承** + `ACCESS_ALLOWED` + 受托者是 AppContainer 包 SID"。
+ *   继承来的包 SID ACE（例如上层目录本来就有的）不动 —— 那不属于本次污染，
+ *   而且删了会改到调用方没让我们碰的祖先目录。
+ */
+export function findStaleAppContainerAces(sddl) {
+  const { aces, unparsed } = parseSddlDaclAces(sddl)
+  const stale = aces.filter(
+    (ace) => !ace.inherited && ace.type === ACCESS_ALLOWED_ACE_TYPE && isAppContainerPackageSid(ace.sid),
+  )
+  return { stale, unparsed, total: aces.length }
+}
+
+/**
+ * 从 SDDL 里抽出**全部**出现过的 AppContainer 包 SID（含继承 ACE）。
+ * 用于"报告里如实写出这个目录树被哪个包 SID 标记过"。
+ */
+export function listAppContainerSids(sddl) {
+  const { aces } = parseSddlDaclAces(sddl)
+  const seen = new Set()
+  for (const ace of aces) if (isAppContainerPackageSid(ace.sid)) seen.add(ace.sid)
+  return [...seen]
+}
+
 export const __internal = { writePointer }

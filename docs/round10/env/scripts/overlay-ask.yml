@@ -1,0 +1,37 @@
+# --patch overlay: workspace-write + ask (NO approver in a nested headless thread).
+#
+# Purpose: measure what happens when the nested thread is put in the default
+# platform posture (workspace-write fence + ask approvals) with nobody able to
+# answer. Use it as:
+#
+#   set SBX_PATCH=<abs path to this file>
+#   docs\round10\env\scripts\sbx-thread.cmd <ws> <prompt> <out> winstage
+#
+# Config values are REPLACED wholesale by a non-insert patch entry, so every
+# key a row needs must be restated.
+
+- id: permission
+  name: "@deepseek-ai/dsh-permission-presets"
+  config:
+    presets:
+      read-only:
+        sandbox: read-only
+        approval: ask
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: never
+    defaultPreset: workspace-write
+
+- id: approval
+  name: "@deepseek-ai/dsh-user-approval"
+  config:
+    policy: ask
+
+- id: sandbox-policy
+  name: "@deepseek-ai/dsh-sandbox-policy"
+  config:
+    mode: workspace-write
+    workspaceRoot: !!js process.env.WINSTAGE_SBX_WORKSPACE

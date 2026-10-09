@@ -261,7 +261,8 @@ PROOF same scope list session-B dir -> workspace-file/outside-workspace   ← �
 | 事实 | 后果 |
 |---|---|
 | 本机 Chromium 在本 Agent 沙箱内**起不来**：Mojo IPC 需命名管道 → `FATAL platform_channel.cc:187 Check failed: Access denied`（`--single-process`/`--no-sandbox`/两种 headless 全试过） | 想做浏览器验收，**必须在沙箱外的终端启动浏览器**，再用 CDP 从会话内操作。Runbook 见 [.t/dsh2/S5-浏览器Runbook.md](../.t/dsh2/S5-浏览器Runbook.md) |
-| 受限令牌**不允许建目录符号链接**（EPERM）⇒ `pnpm link:` 落成 junction，而 Node 的 JS 层**不跟随** junction（`readlink`→EINVAL、`realpathSync` 返回自身） | 插件只能**物理复制**部署 ⇒ **部署即快照**：改源码后必须"同步 + 重启"才生效 |
+| 受限令牌**不允许建目录符号链接**（EPERM）⇒ `pnpm link:` 落成 junction（`cmd /c dir /AL` 实测：`<JUNCTION> dsh-winstage-sandbox [C:\...\dsh-plugin]`） | 曾据此得出"插件只能物理复制部署" |
+| ⚠ **上一条的"Node 不跟随 junction"在 Node v24 上已不成立**（2026-09-30 复测，见 §12.6）：`fs.readlinkSync(junction)` 正常返回目标、`fs.realpathSync` 解析到工作区、读文件逐字节一致（`client.js` 两边同为 132140 B / 同一 sha256） | 当前部署**就是** link：改工作区源码 = 改 profile 模块路径，**不需要 install_bundle**（在线 install 会回 `changed:false` + `ambiguous-install`）。但"改了就生效"仍**不成立**：打包态 HMR `root: []`（不 watch 产物），client 图启动时组合一次 ⇒ 改 **client 半**需要**重启宿主**（见 §12.6） |
 | 常驻进程必须挂在**不退出的监督进程**上（`detached+unref` 的进程在工具调用返回后即被回收） | 启动脚本要写成一个不退出的小进程，并以后台作业运行 |
 | 宿主里 `commands.list()` 是**按 agent 作用域**解析的；`ctx.inject(['commands'], cb)` 在根 ctx 上**足够**（平台自带插件同模式） | 命令"注册失败"时要先查**定义是否合法**，不要先怀疑接线层（本轮 B 就是这么错过的） |
 
@@ -374,8 +375,13 @@ PROOF same scope list session-B dir -> workspace-file/outside-workspace   ← �
 ### 10.4 证据（可重复跑）
 
 ```powershell
-node .t\toggle-selftest.mjs         # 20/20：关=平台面、开=暂存面、现读换面、命令面拒绝、基类断言
-node .t\default-on-selftest.mjs     # 13/13：默认开启的五层默认值 + 活动 profile 装配 + 设置页生效值（§20）
+# ★ 前 4 项为**本轮 C2 复核**（本机本会话，`cmd /c node …`）逐条实跑的口径，标注即当次运行；
+#   其余为主线上一轮时点口径，本轮未复跑 —— 引用时不要把两者混成同一天的数。
+node .t\toggle-selftest.mjs          # 20/20（本轮实测，exit 0）：关=平台面、开=暂存面、现读换面、命令面拒绝、基类断言
+node .t\default-on-selftest.mjs      # 11 PASS / 1 FAIL(L5b) / 2 PENDING-LIVE-FLIP（本轮实测，exit 1；见 §20.3）
+node .t\shell-selftest.mjs           # 120/120（本轮实测，exit 0）：sandboxMode 恒报最窄档 + fail-closed 把关顺序
+node .t\permission-slot-selftest.mjs # 45/45（本轮实测，exit 0；旧文写 14/14 是过期口径，见 §12.6）
+# 以下为**上一轮**口径，本轮未复跑：
 node .t\projection-selftest.mjs     # 14/14：批准后外部改动 ⇒ 读取必须回到真实磁盘（净 diff 口径）
 node .t\loader-toggle-harness.mjs   # 10/10：**真 cordis loader** 上改 config 不重挂 fs fiber 且即刻换面
 node .t\staging-fs-selftest.mjs     # 31/31（回归）
@@ -476,8 +482,22 @@ node .t\projection-selftest.mjs    # 14/14
 composer 工具行里那个按钮（`aria-label="访问模式，当前：工作区内修改"`，见
 `@deepseek-ai/dsh-client-ui-permission-presets`）让用户选 read-only / workspace-write /
 danger-full-access 与审批 ask/never。但 **WinStage 开启时，文件写入由暂存面接管**：
-不管选哪个预设，`write`/`edit` 都先进暂存、等批准；`sandboxMode` 也刻意报 `undefined`
-（不广告升权）。那个按钮因此**只描述了一件不再成立的事** —— 需要替换的是**元素和它的逻辑**。
+不管用户在平台控件里选哪个预设，`write`/`edit` 都先进暂存、等批准（预设对**文件面**的
+效果被暂存面拦截）。那个按钮因此**只描述了一件不再成立的事** —— 需要替换的是
+**元素和它的逻辑**。
+
+> **修订（勿改回）：`sandboxMode` 的正确口径。** 本执行器的 `get sandboxMode()`
+> （`dsh-plugin/shell-executor.mjs:783-785`）**报最窄可用档**（`return 'workspace-write'`），
+> 且**恒定不变**：它不读调用方 spec、不读会话档位、不读审批策略。
+> 这不是图省事，而是**实测挡下来**的 —— 本文件早期按"不广告升权"的思路把该值写成 `undefined`，
+> 结果 `@deepseek-ai/dsh-permission-presets`（`dsh-base` 里、默认必装）**在装配期直接拒绝
+> 装载 `permission` 行**（原始报错逐字见历史日志 `.t/e2e2.log:1-2`），`permissions` 投影随之
+> 缺失 ⇒ 客户端 `PermissionSelect` 返回 `null` ⇒ composer 上的**访问模式控件整块消失**。
+> 反过来，报一个模式并不会放大权限：本执行器**从不接受升权**
+> （`dsh-plugin/shell-executor.mjs:898-941`：更宽档位只记 error 级日志 + 返还注记，
+> 绝不改写语义）。两侧合起来才是现在的形态：**报最窄可用档 + 拒绝放大**。`[官方]`（读
+> `@deepseek-ai/dsh-permission-presets` 的装配路径）+ 历史原始日志 `.t/e2e2.log:1-2`；
+> 对应的源码级守门测试见 `tests/policy-never-consistency.mjs` 检查 2。
 
 ### 12.2 落点（读源码得到的槽位契约）
 
@@ -511,7 +531,7 @@ danger-full-access 与审批 ask/never。但 **WinStage 开启时，文件写入
 ### 12.4 证据
 
 ```powershell
-node .t\permission-slot-selftest.mjs   # 14/14
+node .t\permission-slot-selftest.mjs   # 45/45（本轮 C2 复核实测，exit 0；旧文写 14/14 是过期口径）
 ```
 
 该套件用**真的** `@deepseek-ai/dsh-client-ui-slots` 的 `SlotCore` 起一个声明了该槽位的
@@ -529,8 +549,137 @@ node .t\permission-slot-selftest.mjs   # 14/14
 - 这是一个 `replaceRisk: shadows-shipped-ui` 的槽位：平台若改槽位契约或优先级语义，
   本插件会在 `slots.register` 处抛错并只打一条日志（`permission-slot takeover failed`），
   不会让整个 client 半加载失败。
-- 开关初始未知时（Config 尚未读回）默认按"开"注册，最长一个轮询周期（1.5 s）后由
-  `enabled` 真值纠正 —— 会有一瞬间先显示 WinStage 按钮再切回平台控件。
+- 开关初始状态**未知**时（Config 还在 `loading`、或命名空间 `unavailable`）**不注册** ——
+  见下面的 §12.6。旧实现按"开"注册，最长一个轮询周期（1.5 s）后才纠正；那不只是"闪一下"：
+  若命名空间始终不可用（宿主插件没装 / 本页看不到），它会**永久**盖住平台控件。
+
+### 12.6 「关闭/未知沙箱不得覆盖原版审批弹窗」（用户诉求，2026-09-30）
+
+用户原话：**"原版审批的弹窗关闭沙箱时不要覆盖掉"**。
+
+#### 缺陷（结构性，不是时序抖动）
+`conversation.input.permission` 是 `replaceRisk: shadows-shipped-ui` 的 **single** 槽位，
+平台条目在 priority 0，WinStage 用 -10 遮蔽它（§12.2）。而旧的开关真值判定是：
+
+```js
+const readEnabled = () => {
+  const snapshot = form && typeof form.getSnapshot === 'function' ? form.getSnapshot() : undefined
+  const value = snapshot && snapshot.value ? snapshot.value : undefined
+  if (value && typeof value.enabled === 'boolean') return value.enabled
+  return store.state.enabled !== false     // ★ fail-open：读不到 = 当作"开"
+}
+```
+
+`ConfigFormSnapshot.status` 的第三个值是 **`unavailable`**（"该命名空间没有暴露给本客户端"，
+`config-form-types.d.ts:7-14`）。此时 `value` 为空 ⇒ 落到 `store.state.enabled !== false`
+⇒ `undefined !== false` ⇒ **true** ⇒ 注册 -10 遮蔽 ⇒ **平台控件与它的预设弹窗被永久盖住**，
+而沙箱其实根本没装/没生效。轮询器同样按"未知"继续读 `review.json` 并发布快照
+（`if (configValue.enabled === false)` 只拦"明确关闭"），于是 composer 上的 WinStage 审阅卡
+还可能顶掉平台自己的审批卡。
+
+#### 修法：唯一的三态真值 + 只有 `'on'` 才接管平台 UI
+`client.js` 新增唯一实现 `readSwitch(form)`：
+
+| 快照 | 判定 | 平台 UI |
+|---|---|---|
+| `status==='ready'` 且 `value.enabled===true` | `'on'` | WinStage 可接管（唯一允许遮蔽的状态） |
+| `status==='ready'` 且 `enabled` 非 true（false / 字段缺席） | `'off'` | 不接管，平台控件与弹窗原样 |
+| `status==='loading'` / `'unavailable'` / 没有表单 | `'unknown'` | **不接管**（旧实现正是在这里 fail-open） |
+
+三处一起收口，防止判据漂移：
+
+1. 权限槽位：`readEnabled = () => readSwitch(form) === 'on'`（**严格等于 `'on'`** ——
+   `'unknown'` 是真值字符串，少写这个比较就又变成 fail-open）；关闭/未知 ⇒ `dispose()`，
+   平台条目立刻重新成为该 single 槽位的唯一赢家。仍由 `form.subscribe` 驱动 ⇒ **立即**恢复。
+2. composer 审阅卡：`winstageElection()` 开头加 `if (store.state.enabled !== true) return null`。
+3. 轮询器：`if (readSwitch(configForm) !== 'on')` ⇒ 不读 `review.json`、不发快照、`enabled:false`
+   （因此常驻 chip 也不会渲染：它本来就要求 `pending && collapsed`）。
+
+代价只有一个：Config 读回前不再"抢先"接管，晚一拍（`ready` 后立刻接管）。
+方向选择是刻意的：**宁可晚一拍，也不覆盖平台 UI** —— "沙箱没生效"绝不能表现成"平台弹窗不见了"。
+
+#### 证据（离线，真代码真槽位）
+
+```powershell
+node .t\permission-slot-selftest.mjs    # 45/45（含三态真值表 + 变异自证；本轮 C2 复核实测，exit 0）
+node .t\permission-tristate-apply.mjs   # 19/19（把 client.js 的 factory/apply 真跑起来）
+```
+
+`permission-tristate-apply.mjs` 把 `dsh-plugin/client.js` 的 `factory(require)`/`apply(ctx)`
+真的执行（stub `window.__ModuleLoader__` / `require('react')` / cordis ctx / `configForms`），
+槽位账本用**真的** `@deepseek-ai/dsh-client-ui-slots` 的 `SlotCore`，逐状态断言赢家：
+
+```
+初始 loading（未知）⇒ 平台控件是赢家
+ready + enabled=false（关闭）⇒ 平台控件是赢家
+ready + enabled=true（开启）⇒ WinStage 接管
+关闭 ⇒ 立即恢复平台控件（form.subscribe 驱动）
+unavailable（宿主插件没装）⇒ 平台控件是赢家     ← 旧 fail-open 会永久遮蔽
+非 on 状态下一次都没有读过 review.json
+卸载（插件停用/热卸载）后平台控件原样回来 + 不再轮询
+```
+
+`permission-slot-selftest.mjs` §F 另做**变异自证**：把旧规则（读不到就当开）跑一遍，
+断言它在 `unavailable` 下**确实会**遮蔽平台控件（红），再用新规则对同一输入撤销遮蔽（绿）——
+两行成对，证明这组断言不是空转。
+
+#### 生效方式与**已完成的实机验证**（2026-09-30 补测）
+
+本 profile 的依赖是 **`link:`**，不是拷贝：
+
+```json
+// C:\Users\Administrator\.dsh\profiles\web\package.json
+"@local/dsh-winstage-sandbox": "link:C:/Users/Administrator/Desktop/WinStageSandbox/dsh-plugin"
+```
+
+实测 `node_modules/@local/dsh-winstage-sandbox` 是**符号链接**：`realpath` 与工作区相同，
+`client.js` 两边 sha256/大小逐字节一致（`132140 B`）。
+⇒ **不需要 `install_bundle`**（这正是在线 `install_bundle` 返回 `changed:false` +
+`ambiguous-install` 的原因：包已经以 link 形式在场，无物可装）。改工作区即改 profile 的模块路径。
+
+实机（运行中的宿主 + 已连接的页面）两条证据：
+
+```
+cordis_inspect_query  platform=client  provider=Slots  root=conversation.input.permission
+  kind=single  replaceRisk=shadows-shipped-ui
+  occupants = [ { registrant: "mf", priority: 0, active: true } ]      ← 只有平台条目
+  ⇒ 沙箱关闭时 WinStage 的 -10 条目**不在账本里**，平台控件与它的预设弹窗原样在场
+
+cordis_inspect_query  platform=host  provider=Config  name=@local/dsh-winstage-sandbox
+  entries = [ { id: "include:winstage-sandbox", status: "schema" } ]   ← 行已装配且带 schema
+  ⇒ 客户端表单快照是 ready + enabled=false（与本插件三态判定的输入一致）
+```
+
+client-modules 的图是**启动时组合一次**的（`client-modules/lib/index.js:541` `this.composed = this.compose()`），
+之后只有两条路径会重读产物：HMR 的 `rebuilt(id)`（`:601-602`「the HMR watch's registration hook —
+the only entry point through which build changes reach the graph」）或 loader 重新激活
+（`internal/plugin` → `dirty` → `flush()`）。而本 profile 走的是**打包态**，base bundle 把 HMR 配成：
+
+```yaml
+- id: hmr
+  name: '@deepseek-ai/dsh-hmr'
+  disabled: !!js "!ctx.get('profileContext')"
+  config:
+    root: []          # ← 空 = 不 watch 任何产物（dsh-base/cordis.patch.yml）
+```
+
+空 root ⇒ watcher 不 watch（`dsh-hmr/lib/index.js:439` `root.length === 0 ? "resolved"`），
+`rebuilt()` 永远不会被调用 ⇒ 图的 rev 停在启动那一刻；`bundleResource` 又按
+`pathname+search`（含 rev）缓存响应（`:958-972`），**第一次 GET 之后那份字节就冻住了**。
+
+⇒ **只刷新页面不够，必须重启宿主**（重启时才 `flush()` 重新 stat/读取，得到新的 rev 与新字节）。
+本页首次修正稿曾写"刷新即可、不必为它重启"，**那是错的**：那一条把 HMR 当成了常开。
+重启后 `enabled: true` 那个开关也正好一起生效，顺序建议：
+① 改 profile 第 45 行 `enabled: false → true`；② 重启 DSH；③ 页面重新打开；
+④ 在设置里把开关关掉一次，观察 composer 上的控件立刻换回**平台**的访问模式控件（本诉求的端到端验证）。
+
+**尚未做**：浏览器 daemon 未连接（`browser-use --doctor`：daemon not alive、0 连接），
+本地直接 `fetch` 又需要 `dsh web` 打印的那个带鉴权的 URL（否则 401），所以**没有截图**。
+两个零成本的自查：`.t/check-served-client.mjs "<dsh web 打印的完整 URL>"`（宿主现在发的是
+工作区当前字节还是旧字节；脚本**不会**回显该 URL），以及上面第 ④ 步的人工观察。
+
+
+
 
 
 ---
@@ -906,11 +1055,23 @@ L6 是历史上真正出错的那一层，也是最容易被静默回退的一�
 ### 20.3 回归门
 
 ```powershell
-node .t\default-on-selftest.mjs                    # 13/13（含 1 条元断言）
+node .t\default-on-selftest.mjs                    # 本轮 C2 复核实测：11 PASS / 1 FAIL(L5b) / 2 PENDING-LIVE-FLIP，exit 1
 node .t\default-on-selftest.mjs --profile web      # 指定要核对的活动 profile
 ```
 
-把 L1–L6e 逐层钉死，并**用变异体证明它不是"永远绿"**（基线 13/13 / exit 0，每种植入只有对应项 FAIL、退出码 1）：
+**本轮（C2 复核）实测口径，如实记录、不粉饰**：`断言 11/12 PASS，2 PENDING-LIVE-FLIP，0 SKIP`，
+退出码 **1**（旧文写 `13/13`，是过期口径）：
+
+- `[FAIL] L5b client：只认显式 false 才算关（enabled 缺失时不判关）` —— 报"没找到'只认显式 false'
+  的判据"，即该源码级断言与现行 `dsh-plugin/client.js` 文本对不上。**本轮未修**：该文件不在本轮
+  授权改动范围内（本轮只动文档 + 新增守门测试）。
+- `[PENDING-LIVE-FLIP] L6b / L6e profile web`：活动 profile 里 `winstage-sandbox` 仍是
+  **显式 `enabled: false`**（`~/.dsh/profiles/web/cordis.patch.yml:46-51`，开发期有意保持关），
+  因此"期望 `enabled=true`"的两项以 PENDING 记录；待 Lead 翻转后自动转 PASS。
+- 上述 1 FAIL + 2 PENDING 都只读源码文本 / profile 文本，**与审批策略变化无关**，也不是本轮引入的。
+
+把 L1–L6e 逐层钉死，并**用变异体证明它不是"永远绿"**（基线以**本轮实测**为准：11 PASS，
+另有 1 FAIL(L5b) + 2 PENDING-LIVE-FLIP；下表口径来自上一轮，本轮未复跑）：
 
 | 植入 | 命中项 |
 |---|---|

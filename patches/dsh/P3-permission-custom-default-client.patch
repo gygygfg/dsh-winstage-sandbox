@@ -1,0 +1,33 @@
+# P3-permission-custom-default-client — H3（客户端半）：selection 缺失时整块控件返回 null
+# target (相对 harness 根): node_modules/@deepseek-ai/dsh-client-ui-permission-presets/lib/client.js
+# upstream: @deepseek-ai/dsh-client-ui-permission-presets@0.2.0-rc.2 (packages/client/ui-permission-presets)
+# status: verified
+# rationale: `selection === void 0`（投影缺失）直接 return null ⇒ 访问模式控件整块消失，用户看不到任何解释。
+# 本文件由 tools/dsh-patches.mjs --emit-patches 从 patches/dsh/manifest.json 派生，请勿手工编辑。
+# 应用方式（在 harness 根下）: git apply -p1 <本文件>  或  node tools\dsh-patches.mjs --apply
+diff --git a/node_modules/@deepseek-ai/dsh-client-ui-permission-presets/lib/client.js b/node_modules/@deepseek-ai/dsh-client-ui-permission-presets/lib/client.js
+index 89f8178..eaf941e 100644
+--- a/node_modules/@deepseek-ai/dsh-client-ui-permission-presets/lib/client.js
++++ b/node_modules/@deepseek-ai/dsh-client-ui-permission-presets/lib/client.js
+@@ -321,7 +321,20 @@ window.__ModuleLoader__.load({
+ 				locked,
+ 				selection
+ 			]);
+-			if (selection === void 0 || catalog === null) return null;
++			if (catalog === null) return null;
++			// H3: a missing projection selection (the host did not register the "permissions" unit,
++			// or it has not arrived yet) must not take the whole access-mode control off the screen.
++			// Keep a disabled bilingual Custom control so the row stays visible and explained.
++			if (selection === void 0) return (0, react_jsx_runtime.jsx)("button", {
++				type: "button",
++				className: PermissionSelect_module_css_default.trigger,
++				"aria-label": t("mode", { name: "Custom / 自定义" }),
++				disabled: true,
++				children: (0, react_jsx_runtime.jsx)("span", {
++					className: PermissionSelect_module_css_default.triggerLabel,
++					children: "Custom / 自定义"
++				})
++			});
+ 			const currentValue = pick !== null && catalog.options.some((option) => option.value === pick) ? pick : selection.currentValue;
+ 			const current = catalog.options.find((option) => option.value === currentValue);
+ 			const currentLabel = current === void 0 ? permissionLabel(currentValue, currentValue, t) : permissionLabel(current.value, current.name, t);

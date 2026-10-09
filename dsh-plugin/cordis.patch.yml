@@ -19,7 +19,7 @@
 #
 # ── 装配（按依赖顺序）────────────────────────────────────────────────────────────
 #   1. `winstage-sandbox`（host-plugin.mjs）：设置开关、审阅快照、/winstage 命令面。
-#      用**裸包名** `@local/dsh-winstage-sandbox`：`package.json` 的 `exports["."]` =
+#      用**裸包名** `dsh-winstage-sandbox`：`package.json` 的 `exports["."]` =
 #      `./host-plugin.mjs`，与子路径 `.../host-plugin` 是**同一个模块 URL**（不会二次 apply）。
 #      理由（实测源码，行号取自 dsh-client-modules/lib/index.js）：
 #        `:82-88 exactPackageSpecifier()` 对 `@scope/name/sub` 三段 specifier 返回 undefined
@@ -40,28 +40,50 @@
 # 会被静默丢弃（含它携带的 config）。3081 的
 # `.t\dsh2\home\profiles\dsh2\cordis.patch.yml` 就是这个形态，必须与本文件同步改名。
 #
-# ── C-8：两个"根"结构性同源 ─────────────────────────────────────────────────────
+# ── C-8：两个"根"结构性同源（本轮加了一道**运行期**守卫）────────────────────────
 # host 行用 `config.workspaceRoot`、fs 行用 `config.cwd` 表达同一个暂存根。两者一旦漂移，
 # `getReviewService()`（review-service.mjs，按 canonical 根做**进程内单例**）会产生两个
 # 单例 ⇒「暂存写到 A、快照发布在 B」，面板永远看不到改动。因此这里用 YAML 锚点把两者
 # 绑成**同一个字面值**：改一处即两处同改。fs 行额外带一个 `workspaceRoot`，供
 # `staging-fs.mjs` 的 fail-closed 自校验使用（两键都给了且不一致 → 直接 throw）。
+#
+# ★ **shell 半边的根不再猜 `process.cwd()`**（那正是"两个根"的成因，实测见
+#   `docs/dsh2-越界与注册表-实测诊断.md` §1）：`shell-executor.mjs` 的
+#   `effectiveWorkspaceRoot()` 现读 loader 行表，取 **fs 行的 `cwd`** 作为权威根
+#   （它才是 fs 半边建 Store 用的那个值），并与 shell 行的 `workspaceRoot` 交叉校验；
+#   两处不一致 ⇒ error 级日志 + 以 fs 根为准（绝不按两个根分叉出两个单例）。
+#   缺失显式配置 ⇒ 抛 `WINSTAGE_SHELL_NO_WORKSPACE_ROOT`（绝不回退 cwd）。
+#   ⚠ 推论：**profile 覆盖层若覆盖 `winstage-shell` 行，必须重述 `workspaceRoot`**；
+#     覆盖 `winstage-fs` 行则必须重述 `cwd` 与 `workspaceRoot`（config 是整体替换）。
 
 - id: fs-sandbox
   name: '@deepseek-ai/dsh-fs-sandbox'
   disabled: true
 
-# ── shell 执行面：**按开关择一装载**（本轮的装配层修复）──────────────────────────
+# ── shell 执行面：**按开关择一装载**（装配层；本轮"修复②"改了门控口径）──────────
 # 目标：**恰好一个** shell 提供方启用，且跟随设置页那个开关 ——
 #   开关**开** ⇒ 平台 `pwsh-sandbox` 让位、`winstage-shell` 接管（命令在沙箱内跑、产出进暂存）；
-#   开关**关** ⇒ Windows shell 让位、平台 `pwsh-sandbox` 接管（完全恢复原生 shell 行为）。
+#   开关**关** ⇒ 平台 `pwsh-sandbox` 接管（完全恢复原生 shell 行为）。
 #
 # 为什么需要这条（实测出来的结构性缺口）：
 #   `ctx.shell` 是**单例服务名**，两个提供方不能共存；而被禁用的那一行**根本不提供**服务。
-#   历史做法只用一个**环境变量** `WINSTAGE_SHELL` 做门控，一旦某个 profile 用**字面量**
-#   `disabled` 覆盖这两行（3080 的 web profile 正是如此），门控就被**静默绕过** ⇒
-#   WinStage 永远占着 `ctx.shell`，哪怕开关是关的。后果实测：档位为 `danger-full-access`
-#   时**每一条 pwsh 都被拒**（"关了沙箱 shell 全废"）。
+#
+# ── 修复②（本轮）：门控从"进程环境变量"改为"profile 开关"─────────────────────────
+# 旧口径 = `WINSTAGE_SHELL=1` **且** profile 开关未关。实测代价（两处独立证据）：
+#   1. `docs/DSH沙箱边界-实例侧实测.md` §5.1/§5.2、`docs/T7-暂存键重开与逐载体注入报告.md` §4.1：
+#      第二实例从未设过 `WINSTAGE_SHELL` ⇒ `winstage-shell` 行**永远不装载**，
+#      `ctx.shell` 一直是平台 `pwsh-sandbox` ⇒ "本实例的 shell 既没有暂存、
+#      **也没有注册表暂存**、也没有读遮蔽"。这正是用户报障"**注册表更改没有走暂存审批、
+#      而是直接失败**"的直接成因：没有 shim 就没有覆盖层，注册表写只剩受限令牌的内核硬拒。
+#   2. 该门控是**进程级**的（改它必须重启宿主），而"开关"却在设置页里随时可切
+#      ⇒ 用户看到的开关与真实生效的 shell 面**经常不一致**（开关开了、shell 仍是平台的）。
+# 新口径：**profile 开关是唯一权威**，环境变量降级为显式逃生口：
+#   · `WINSTAGE_SHELL=0` ⇒ 强制交还平台 shell（诊断用，优先级最高）；
+#   · `WINSTAGE_SHELL=1` ⇒ 强制 WinStage 接管（诊断用，可越过"开关关"）；
+#   · 否则 ⇒ 读 profile 开关：开（或读不出）＝接管，关＝交还。
+#   注意：**行级 `disabled` 只在加载期求值一次** ⇒ 改开关要重启宿主才换 shell 提供方；
+#   而 `ctx.fs` 的暂存面是运行期现读 `config.enabled`（见 `staging-fs.mjs`），因此
+#   "开关一开、文件面立刻变、shell 面要重启"这条差异是**已知且如实记录**的。
 #
 # 为什么能读到开关：开关的值落在 profile 覆盖层
 #   `<DSH_HOME>/profiles/<DSH_PROFILE>/cordis.patch.yml` 的 `id: winstage-sandbox`
@@ -77,6 +99,10 @@
 #
 # ★ 与 `dsh-plugin/assembly-toggle.mjs` 的 `winStageEnabledInProfileText()` **逻辑必须一致**：
 #   那边是 host 侧（直接 import），这边是装配侧（只能内联）。改一处必须同步另一处。
+#   （`assembly-toggle.mjs` 的纯函数部分由 `tests/assembly-toggle-selftest.mjs` 覆盖。）
+#
+# ★ 两个表达式**必须逐字成对取反**：否则会"两个都禁用"（`ctx.shell` 服务缺失 ⇒
+#   所有 shell 命令不可用）或"两个都启用"（cordis 服务重复注册 ⇒ 加载即失败）。
 #
 # 注意：`name` 在非 insert 补丁里是**断言**，不匹配时**整条补丁（连 config）一起被跳过**
 # （cordis-plugin-include/lib/index.js:95-98 `warn(...); continue;`；且 :99-102 的 overrides
@@ -86,16 +112,22 @@
 # `.t\dsh2\home\profiles\dsh2\cordis.patch.yml` 就是这个形态，必须与本文件同步改名。
 - id: pwsh-sandbox
   name: '@deepseek-ai/dsh-pwsh-sandbox'
-  # 平台 shell 让位 = 显式要求 WinStage 接管（`WINSTAGE_SHELL=1`）**且** profile 开关未关
-  disabled: !!js (process.env.WINSTAGE_SHELL === '1') && (() => { try { const p = process.env.DSH_HOME + '/profiles/' + process.env.DSH_PROFILE + '/cordis.patch.yml'; const fs = process.getBuiltinModule('node:fs'); if (!fs.existsSync(p)) return true; const m = /id:\s*winstage-sandbox\b([\s\S]*?)(?=\s*-\s*id:|\s*$)/.exec(fs.readFileSync(p, 'utf8')); if (!m) return true; const e = /enabled:\s*(true|false)\b/.exec(m[1]); return !e || e[1] !== 'false'; } catch { return true } })()
+  # 让位条件 = WinStage 接管（开关开 或 `WINSTAGE_SHELL=1`）且未被 `WINSTAGE_SHELL=0` 强制交还。
+  # 与下面 `winstage-shell` 行**逐字成对取反**（见文件头"修复②"）。
+  #
+  # ⚠ 表达式里**不得出现 `: `（冒号+空格）**：YAML 会把它当成映射键分隔符，于是整条
+  #   `disabled` 变成 `{'[object Object]': …}` 而不是布尔 —— 行照旧"启用"，
+  #   但**两个 shell 提供方都不让位**（实测 dump：`disabled:\n  '[object Object]': >-`）。
+  #   本机因此踩过一次；回归门 `tests/assembly-toggle-selftest.mjs` A6 钉住。
+  disabled: !!js (process.env.WINSTAGE_SHELL !== '0') && ((process.env.WINSTAGE_SHELL === '1') || (() => { try { const p = process.env.DSH_HOME + '/profiles/' + process.env.DSH_PROFILE + '/cordis.patch.yml'; const fs = process.getBuiltinModule('node:fs'); if (!fs.existsSync(p)) return true; const m = /id:\s*winstage-sandbox\b([\s\S]*?)(?=\s*-\s*id:|\s*$)/.exec(fs.readFileSync(p, 'utf8')); if (!m) return true; const e = /enabled:\s*(true|false)\b/.exec(m[1]); return !e || e[1] !== 'false'; } catch { return true } })())
 
 - insert:
     - id: winstage-sandbox
       # 裸包名（**不要**改回子路径 specifier —— 见文件头的源码依据）。
-      name: '@local/dsh-winstage-sandbox'
+      name: 'dsh-winstage-sandbox'
       config:
         enabled: true
-        workspaceRoot: &winstageRoot C:\Users\Administrator\Desktop\WinStageSandbox
+        workspaceRoot: &winstageRoot C:\Users\Administrator\Desktop\dsh-winstage-sandbox
         probeOnStart: true
 
     - id: winstage-fs
@@ -103,7 +135,7 @@
       #   a) 裸名解析到 `exports["."]` = host-plugin.mjs，会把 host-plugin **apply 两次**
       #      （命令 definitionId 冲突）；
       #   b) 改名会让 profile 覆盖层（断言 `.../fs`）整条被跳过，丢掉 `cwd` 隔离配置。
-      name: '@local/dsh-winstage-sandbox/fs'
+      name: 'dsh-winstage-sandbox/fs'
       config:
         # `cwd` 同时是暂存工作区根：`ctx.fs` 的解析基准与暂存树的根必须是同一个目录。
         # 与 host 行的 `workspaceRoot` 共用同一个锚点（C-8：结构性同源）。
@@ -113,10 +145,16 @@
 
     - id: winstage-shell
       # 子路径 specifier（与 fs 行同理：裸名会把 host-plugin 装第二遍）。
-      name: '@local/dsh-winstage-sandbox/shell'
-      # 不激活 = 未显式要求接管（`WINSTAGE_SHELL !== '1'`）**或** profile 开关已关。
-      # 与上面 `pwsh-sandbox` 行**共用同一对条件**，保证"恰好一个启用"。
-      disabled: !!js process.env.WINSTAGE_SHELL !== '1' || !(() => { try { const p = process.env.DSH_HOME + '/profiles/' + process.env.DSH_PROFILE + '/cordis.patch.yml'; const fs = process.getBuiltinModule('node:fs'); if (!fs.existsSync(p)) return true; const m = /id:\s*winstage-sandbox\b([\s\S]*?)(?=\s*-\s*id:|\s*$)/.exec(fs.readFileSync(p, 'utf8')); if (!m) return true; const e = /enabled:\s*(true|false)\b/.exec(m[1]); return !e || e[1] !== 'false'; } catch { return true } })()
+      name: 'dsh-winstage-sandbox/shell'
+      # 不激活 = WinStage 未接管（开关关 且 未被 `WINSTAGE_SHELL=1` 强制）
+      # 或已被 `WINSTAGE_SHELL=0` 强制交还。与上面 `pwsh-sandbox` 行**共用同一对条件**，
+      # 保证"恰好一个启用"（服务名单例：两个都禁用 ⇒ shell 不可用；两个都启用 ⇒ 加载失败）。
+      #
+      # ⚠ 同样**不得出现 `: `（冒号+空格）**：会被 YAML 当成映射键分隔符（见上面
+      #   `pwsh-sandbox` 行的实测说明）。因此这里用 `!== '0' && (…)` 而不是三目。
+      disabled: !!js (() => { const on = (process.env.WINSTAGE_SHELL !== '0') && ((process.env.WINSTAGE_SHELL === '1') || (() => { try { const p = process.env.DSH_HOME + '/profiles/' + process.env.DSH_PROFILE + '/cordis.patch.yml'; const fs = process.getBuiltinModule('node:fs'); if (!fs.existsSync(p)) return true; const m = /id:\s*winstage-sandbox\b([\s\S]*?)(?=\s*-\s*id:|\s*$)/.exec(fs.readFileSync(p, 'utf8')); if (!m) return true; const e = /enabled:\s*(true|false)\b/.exec(m[1]); return !e || e[1] !== 'false'; } catch { return true } })()); return !on })()
       config:
         # 与 fs/host 两行共用同一个暂存根锚点（C-8：结构性同源）。
+        # `shell-executor.mjs` 的 `effectiveWorkspaceRoot()` 以 **fs 行的 `cwd`** 为权威、
+        # 与这里的值交叉校验；漂移 ⇒ error 级日志 + 以 fs 根为准（绝不两个根各建一个单例）。
         workspaceRoot: *winstageRoot

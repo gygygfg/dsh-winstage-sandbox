@@ -1,0 +1,17 @@
+# 发布到 npm 时排除的开发/测试/重型内容（`package.json` 的 `files` 白名单已限定收录面，
+# 这里是第二道保险：防止某个白名单目录里混进构建产物或凭据）。
+.t/
+.dshstage/
+tests/
+tools/toolchain/
+shim/out/
+shim/.stage/
+**/zig-cache/
+esc/
+filemod/
+*.token
+token.txt
+.env
+.env.*
+credentials.json
+npm-debug.log*

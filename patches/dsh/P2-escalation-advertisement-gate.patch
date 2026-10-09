@@ -1,0 +1,28 @@
+# P2-escalation-advertisement-gate — H2：系统提示禁止升级，工具却仍然登广告
+# target (相对 harness 根): node_modules/@deepseek-ai/dsh-tool-pwsh/lib/index.js
+# upstream: @deepseek-ai/dsh-tool-pwsh@0.2.0-rc.2 (packages/shell/tool-pwsh)
+# status: draft
+# rationale: 组合层审批默认策略为 never 时，pwsh 工具仍注册 sandbox_permissions/justification、仍走带升级措辞的 description、仍附加升级提示。
+# 本文件由 tools/dsh-patches.mjs --emit-patches 从 patches/dsh/manifest.json 派生，请勿手工编辑。
+# 应用方式（在 harness 根下）: git apply -p1 <本文件>  或  node tools\dsh-patches.mjs --apply
+diff --git a/node_modules/@deepseek-ai/dsh-tool-pwsh/lib/index.js b/node_modules/@deepseek-ai/dsh-tool-pwsh/lib/index.js
+index 1cf5128..45f61b1 100644
+--- a/node_modules/@deepseek-ai/dsh-tool-pwsh/lib/index.js
++++ b/node_modules/@deepseek-ai/dsh-tool-pwsh/lib/index.js
+@@ -312,7 +312,15 @@ function apply(ctx, config = {}) {
+ 	const backgroundEnabled = config.enableRunInBackground ?? true;
+ 	const promoteOnTimeout = (config.promoteOnTimeout ?? true) && backgroundEnabled;
+ 	const defaultMode = ctx.shell.sandboxMode;
+-	const escalationModes = defaultMode === void 0 ? [] : ESCALATION_TARGETS;
++	// H2: under the deterministic "never" approval policy the runtime context forbids
++	// escalation, so advertising sandbox_permissions/justification contradicts it. Gate on the
++	// COMPOSED approval policy. `ctx.get` is strict (returns undefined unless the approval
++	// fibre is active), so an unreachable policy keeps today's behaviour instead of guessing.
++	// Residual: this is computed once per fibre, so a PER-SESSION override to "never" still
++	// advertises (the execute-time path stays fail-closed through approveEscalation).
++	const composedApprovalPolicy = ctx.get("approval")?.config?.policy;
++	const escalationModes = defaultMode === void 0 || composedApprovalPolicy === "never" ? [] : ESCALATION_TARGETS;
++	if (escalationModes.length === 0 && defaultMode !== void 0 && composedApprovalPolicy === "never") ctx.logger.warn("tool-pwsh: sandbox escalation is not advertised because the composed approval policy is \"never\" (approval prompts are rejected automatically)");
+ 	const sandboxPolicy = defaultMode === void 0 ? void 0 : ctx.get("sandboxPolicy");
+ 	if (defaultMode !== void 0 && sandboxPolicy === void 0) throw new Error("tool-pwsh: the mounted bash executor confines but ctx.sandboxPolicy is missing");
+ 	/** Resolve the complete standing policy for this call when a confining executor is mounted. */

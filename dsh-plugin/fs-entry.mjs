@@ -16,8 +16,12 @@
  * 或重挂任何 loader 行**；`fs` 服务名在运行中始终只有一个提供方（行级热切换会崩的
  * 原因见 `staging-fs.mjs` 顶部说明）。
  *
- * 只有显式设置 `WINSTAGE_STAGE_OUTSIDE=direct` 才在开关**开**时直通真实磁盘
- * （逃生口，默认关闭）。任何其它值（含历史上的 `'deny'`）都归一为 `'stage'`。
+ * `WINSTAGE_STAGE_OUTSIDE` 三态，**逐字透传**给 `staging-fs.mjs` 的 `stageOutside`：
+ *   · 未设 / 其它值 → `'stage'`（默认：工作区外写入进暂存、等批准）；
+ *   · `deny`        → `'deny'`（工作区外写入**显式拒绝**，真实盘与暂存都不动）；
+ *   · `direct`      → `'direct'`（逃生口，直通真实磁盘）。
+ * 这里的归一与 `staging-fs.mjs` 的归一**同一口径**（未知值 fail-safe 到 `'stage'`），
+ * 两处都写死会让"env 设了 deny 却没生效"这类静默失效无从察觉，故本文件只做白名单透传。
  */
 
 import { createStagingFileSystem, SandboxedFileSystem } from './staging-fs.mjs'
@@ -32,8 +36,15 @@ if (!SandboxedFileSystem) {
   )
 }
 
+/** `WINSTAGE_STAGE_OUTSIDE` → `stageOutside`（白名单三态；未知值 → `'stage'`） */
+const STAGE_OUTSIDE_VALUES = new Set(['stage', 'deny', 'direct'])
+const stageOutsideFromEnv = (() => {
+  const raw = process.env.WINSTAGE_STAGE_OUTSIDE
+  return typeof raw === 'string' && STAGE_OUTSIDE_VALUES.has(raw) ? raw : 'stage'
+})()
+
 const StagingFileSystem = createStagingFileSystem({
-  stageOutside: process.env.WINSTAGE_STAGE_OUTSIDE === 'direct' ? 'direct' : 'stage',
+  stageOutside: stageOutsideFromEnv,
   base: SandboxedFileSystem,
 })
 

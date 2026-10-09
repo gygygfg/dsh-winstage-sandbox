@@ -103,6 +103,17 @@ import {
   SECURITY_CAPABILITIES_SIZE,
   buildCreationFlags,
 } from './appcontainer.mjs'
+// ── 三轮接线：进程缓解策略（`PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY`）────────────
+// 只取本模块真正要用的东西：属性号/尺寸/槽位数/注入函数/构造函数。
+// `0x00020010`、8 字节、档位表**不在本模块重复定义** —— 与 `SECURITY_CAPABILITIES`
+// 同一取舍（两处定义必然漂移，而漂移的那一处不会报错，只会静默失效）。
+import {
+  MITIGATION_POLICY_ATTRIBUTE,
+  MITIGATION_POLICY_VALUE_SIZE,
+  MITIGATION_ATTRIBUTE_LIST_COUNT,
+  applyMitigationPolicy,
+  buildMitigationPolicy,
+} from './mitigations.mjs'
 
 // ─────────────────────────── 常量 ───────────────────────────
 
@@ -405,6 +416,44 @@ export function allocateAttributeList(bindings, attributeCount) {
   return { size, buffer }
 }
 
+/**
+ * 把"策略"归一成"要不要占一个属性槽位 + 用哪一份 buffer"。
+ *
+ * 三种输入都接受（与 `src/mitigations.mjs` 的公开契约一致）：
+ *   · `null` / `undefined`      → `null`（不占槽位，一次 API 都不调）；
+ *   · 档位名 / `{profile,...}`  → 本函数**就地构造**（返回的对象由调用方持有 ⇒ buffer 活到
+ *     属性列表销毁为止；`[官方]`：属性值指针必须存活到属性列表被销毁）；
+ *   · `buildMitigationPolicy()` 的产物 → 原样使用（同一 flags、同一 buffer）。
+ *
+ * `flags === 0n`（= `none` 档）在语义上就是"无事可做"，归一成 `null`：
+ * 于是"槽位数"与"是否调用 `UpdateProcThreadAttribute`"**永远由同一个判据决定**，
+ * 不会出现"算 2 个槽位却只写 1 条"（`ERROR_INSUFFICIENT_BUFFER(122)` 的成因）。
+ */
+function resolveMitigationPolicy(policy) {
+  if (policy === null || policy === undefined) return null
+  const built =
+    typeof policy === 'object' && typeof policy.flags === 'bigint' && Buffer.isBuffer(policy.buffer) && Array.isArray(policy.names)
+      ? policy
+      : buildMitigationPolicy(policy)
+  return built.flags === 0n ? null : built
+}
+
+/**
+ * `InitializeProcThreadAttributeList` 的 `dwAttributeCount`。
+ *
+ * `[官方]` 该计数必须 ≥ 实际 `UpdateProcThreadAttribute` 次数，否则更新返回
+ * `ERROR_INSUFFICIENT_BUFFER(122)`（`src/mitigations.mjs` 文件头已留档）。
+ *   · 无缓解策略 / `none` ⇒ **1**（只有 `SECURITY_CAPABILITIES`）—— 与接线前逐字一致；
+ *   · 非 no-op 策略       ⇒ **2**（`SECURITY_CAPABILITIES` + `MITIGATION_POLICY`）。
+ *
+ * 导出是为了让集成方与离线测试能**读同一个判据**，而不是各自数数。
+ * `[未实测]` 本机没有真实跑过 `0x00020010` 的写入（无 SDK、未做真实 CreateProcess）：
+ * 该属性号目前只有"winnt.h 宏规则 + 同规则已实测的 0x00020009"这一条证据链。
+ */
+export function attributeListCountFor(mitigationPolicy) {
+  return resolveMitigationPolicy(mitigationPolicy) === null ? 1 : 1 + MITIGATION_ATTRIBUTE_LIST_COUNT
+}
+
 // ─────────────────────────── 启动原语（可注入）───────────────────────────
 
 /**
@@ -446,7 +495,8 @@ export function allocateAttributeList(bindings, attributeCount) {
  * 要么失败在一个说不清的地方，要么**成功但静默忽略属性列表**（=进程根本不在 AppContainer 里）。
  * 后者正是本项目最想避免的失败模式。
  *
- * @returns {{pid: number, process: unknown, thread: unknown, attributeList: Buffer, startupInfo: Buffer}}
+ * @returns {{pid: number, process: unknown, thread: unknown, attributeList: Buffer, startupInfo: Buffer,
+ *            attributeCount: number, mitigationPolicy: object|null}}
  */
 export function spawnSuspendedAppContainer(bindings, options = {}) {
   const {
@@ -463,6 +513,8 @@ export function spawnSuspendedAppContainer(bindings, options = {}) {
     // 文件式 stdio：调用方打开的原生句柄地址（`{stdInput,stdOutput,stdError}`）。
     // 只有 `inheritHandles=true` 时才有意义 —— 句柄要能被继承。
     startupInfoStdio = null,
+    // 三轮接线：进程缓解策略。`null`/`undefined`/`none` ⇒ 行为与接线前**逐字一致**。
+    mitigationPolicy = null,
   } = options
 
   for (const required of ['initializeProcThreadAttributeList', 'updateProcThreadAttribute', 'createProcessW', 'resumeThread', 'getLastError']) {
@@ -477,7 +529,10 @@ export function spawnSuspendedAppContainer(bindings, options = {}) {
     throw runtimeError('APPCONTAINER_COMMAND_MISSING', 'commandLine must be a non-empty string')
   }
 
-  const attributeCount = 1
+  // ── 属性列表容量（三轮接线：缓解策略占第 2 个槽位）──────────────────────────
+  // 无策略 / `none` ⇒ 仍是 1，与接线前逐字一致；非 no-op ⇒ 2。
+  const mitigation = resolveMitigationPolicy(mitigationPolicy)
+  const attributeCount = mitigation === null ? 1 : 1 + MITIGATION_ATTRIBUTE_LIST_COUNT
   const { buffer: attributeList } = allocateAttributeList(bindings, attributeCount)
   const capabilityArray = buildSidAndAttributesArray(capabilities)
 
@@ -553,6 +608,37 @@ export function spawnSuspendedAppContainer(bindings, options = {}) {
         `修复阶段已把 src/appcontainer.mjs 的常量改成 24；若这里仍看到 87，说明失败原因不是 cbSize。`,
       { win32Code: code },
     )
+  }
+
+  // ── 进程缓解策略（三轮接线；默认 `null` ⇒ 这一整段不执行）──────────────────────
+  // 顺序与官方样例一致：先 `SECURITY_CAPABILITIES`，再 `MITIGATION_POLICY`。
+  // `applyMitigationPolicy()` **绝不吞失败**：属性没写进列表就抛
+  // `MITIGATION_ATTRIBUTE_UPDATE_FAILED`（带 `win32Code`）。这里把它改写成与上面
+  // SECURITY_CAPABILITIES 失败**同一风格**的 `APPCONTAINER_ATTRIBUTE_UPDATE_FAILED`，
+  // 并保留底层 code + win32Code —— 让启动中止（fail-closed），
+  // 而不是得到一个"看起来被加固、实际裸奔"的子进程。
+  if (mitigation !== null) {
+    try {
+      applyMitigationPolicy({ api: bindings, attrList: attributeList, policy: mitigation, pin })
+    } catch (error) {
+      const win32Code = error?.win32Code ?? null
+      throw runtimeError(
+        'APPCONTAINER_ATTRIBUTE_UPDATE_FAILED',
+        `UpdateProcThreadAttribute(PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY) failed with ${win32Code ?? '(no GetLastError)'}. ` +
+          `Attr id=0x${MITIGATION_POLICY_ATTRIBUTE.toString(16)}, value size=${MITIGATION_POLICY_VALUE_SIZE}, ` +
+          `profile=${mitigation.profile}, flags=0x${mitigation.flags.toString(16).padStart(16, '0')}, ` +
+          `win32Code=${win32Code ?? 'null'}, mitigationCode=${error?.code ?? 'MITIGATION_ATTRIBUTE_UPDATE_FAILED'}. ` +
+          'The attribute list was NOT written, so the child would silently run WITHOUT these mitigations; ' +
+          `aborting the launch (fail-closed). 底层错误：${error?.message ?? String(error)}`,
+        {
+          win32Code,
+          mitigationCode: error?.code ?? null,
+          attribute: MITIGATION_POLICY_ATTRIBUTE,
+          size: MITIGATION_POLICY_VALUE_SIZE,
+          profile: mitigation.profile,
+        },
+      )
+    }
   }
 
   const startupInfo = buildStartupInfoExBuffer(
@@ -641,6 +727,10 @@ export function spawnSuspendedAppContainer(bindings, options = {}) {
     capabilityArray: capabilityArray.buffer,
     capabilityArrayPointer: resolvedCapabilityPointer,
     attributeListPointer,
+    // 三轮接线：属性列表实际按几个槽位初始化，以及那份**必须活到列表销毁**的
+    // 缓解策略对象（调用方持有它 = 持有 `buffer`；`[官方]` 属性值指针的生命周期要求）。
+    attributeCount,
+    mitigationPolicy: mitigation,
   }
 }
 
@@ -927,6 +1017,13 @@ export class AppContainerRuntime {
     this.attributeList = null
     this.disposed = false
     this.retainPointer = typeof options.retainPointer === 'function' ? options.retainPointer : () => {}
+    /**
+     * 三轮接线：实例级进程缓解策略（`null` = 不注入，行为与接线前逐字一致）。
+     *
+     * 归一化放在构造期：坏档位名/坏 flags 在这里就抛（fail-closed），而不是等到
+     * `spawn()` 改了一半状态才发现策略构造不出来。`spawn()` 仍允许按次覆盖。
+     */
+    this.mitigationPolicy = resolveMitigationPolicy(options.mitigationPolicy ?? null)
     // 内嵌指针的来源：options.pin 优先，其次 bindings.pin（createKoffiAppContainerBindings 已内置 koffi.address）。
     // 两者都没有时**不报错**——只在"真的声明了能力 SID"时才会需要它（见 spawnSuspendedAppContainer）。
     this.pin = typeof options.pin === 'function' ? options.pin : typeof bindings.pin === 'function' ? bindings.pin : null
@@ -1029,7 +1126,10 @@ export class AppContainerRuntime {
     }
 
     // 3) 属性列表（提前建好，便于 dispose 逆序释放）
-    this.attributeList = allocateAttributeList(b, 1).buffer
+    // ⚠ 容量必须与 `spawnSuspendedAppContainer()` 里那次真正的分配**同一判据**
+    //   （`attributeListCountFor`）：这里算 1、那里算 2 就会让上报的
+    //   `attributeListSize` 与真实启动用的容量不一致（那是"报告与执行漂移"）。
+    this.attributeList = allocateAttributeList(b, attributeListCountFor(this.mitigationPolicy)).buffer
     this.order = planCombinationOrder({ jobAvailable: this.options.jobAvailable === true })
     return {
       profileName: this.profileName,
@@ -1038,6 +1138,10 @@ export class AppContainerRuntime {
       capabilities: this.capabilities.map((c) => c.name),
       attributeListSize: this.attributeList.length,
       order: this.order,
+      // 三轮接线：报告里如实给出"策略档位 + 16 个十六进制标志位 + 是否 no-op"，
+      // 免得只写一句"已启用缓解策略"（`mitigations.mjs` 的摘要口径）。
+      mitigation: this.mitigationPolicy === null ? null : { profile: this.mitigationPolicy.profile, flags: this.mitigationPolicy.hex, names: [...this.mitigationPolicy.names] },
+      attributeCount: attributeListCountFor(this.mitigationPolicy),
     }
   }
 
@@ -1047,6 +1151,9 @@ export class AppContainerRuntime {
     if (!this.attributeList) throw runtimeError('APPCONTAINER_NOT_INITIALIZED', 'call init() before spawn()')
     const child = spawnSuspendedAppContainer(this.bindings, {
       pin: this.pin,
+      // 实例级策略（`null` ⇒ spawnSuspendedAppContainer 完全不碰该属性）。
+      // 刻意放在 `...options` **之前**：单次启动可以覆盖它，但默认继承实例配置。
+      mitigationPolicy: this.mitigationPolicy,
       ...options,
       appContainerSid: this.sid,
       capabilities: this.capabilities,
@@ -1054,6 +1161,9 @@ export class AppContainerRuntime {
     this.retainPointer('appcontainer', child.attributeList)
     this.retainPointer('appcontainer', child.securityCapabilities)
     this.retainPointer('appcontainer', child.capabilityArray)
+    // 策略 buffer 也必须活到属性列表销毁（`[官方]` 属性值指针的生命周期要求）：
+    // 调用方拿到 child 就等于拿到了这份引用，这里把它一并登记进 retainPointer 容器。
+    if (child.mitigationPolicy) this.retainPointer('appcontainer', child.mitigationPolicy.buffer)
     return child
   }
 

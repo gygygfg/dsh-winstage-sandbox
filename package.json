@@ -1,0 +1,64 @@
+{
+  "name": "dsh-winstage-sandbox",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness (DSH) plugin: WinStage staging–candidate–selective-commit sandbox for Windows. AI changes land in a staging tree (files + registry); a review panel shows the diff and only approved changes are written to the real workspace.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gygygfg/dsh-winstage-sandbox.git"
+  },
+  "homepage": "https://github.com/gygygfg/dsh-winstage-sandbox",
+  "bugs": {
+    "url": "https://github.com/gygygfg/dsh-winstage-sandbox/issues"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "sandbox",
+    "windows",
+    "staging",
+    "approval",
+    "agent"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": "./dsh-plugin/host-plugin.mjs",
+    "./host-plugin": "./dsh-plugin/host-plugin.mjs",
+    "./fs": "./dsh-plugin/fs-entry.mjs",
+    "./shell": "./dsh-plugin/shell-entry.mjs",
+    "./client": "./dsh-plugin/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./dsh-plugin/cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-ui-settings"]
+    }
+  },
+  "meta": {
+    "title": "WinStage Sandbox",
+    "description": "Staging–candidate–selective-commit sandbox (Windows restricted token + ACL + Job Object). Toggleable in Settings; when off, the platform's original shell and file tools are left in place."
+  },
+  "files": [
+    "dsh-plugin/",
+    "src/",
+    "shim/src/",
+    "shim/include/",
+    "shim/injector/",
+    "shim/probe/",
+    "tools/build-shim.mjs",
+    "tools/pe-exports.mjs",
+    "tools/fetch-toolchain.mjs",
+    "tools/sandbox-audit.mjs",
+    "README.md",
+    "LICENSE",
+    "PUBLISHING.md"
+  ]
+}
