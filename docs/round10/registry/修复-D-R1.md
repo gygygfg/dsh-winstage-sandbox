@@ -190,14 +190,43 @@ C3 追加的两条记录逐字段合规：
 `UNSTAGED` 缺失）与 `registry-guard`/`registry-conformance` 的 A.2/A.5 新鲜度红，**均由这条缺陷解释**
 （后者是证据链被打断，前者见独立缺陷 [`defects.md` D-R8](./defects.md)：**载体无钩子运行 = fail-open**）。
 
-#### 5.2.3 结论（三选一）
+#### 5.2.3 结论（三选一）—— **受控窗口 #3 已给出终局读数：仍未修（已定因到 `ws_reg.c`）**
 
-- 对 **BEFORE 候选（`out-r1`/`out-cur`/`out-13c`）**：**仍失**，且已定因为**候选自身缺陷**（非"方向错"）。
-- 对 **AFTER 候选（`out-r2`）**：离线三态对照已证明缺陷消失；**但注入态端到端尚未取得读数**
-  ⇒ 仍记 **无法判定**，等下一次受控窗口（届时必须查 `replayedBytes>0` 且读 `exit=0`）。
-**指不到子进程**。所以"用候选指路即可拿到注入态端到端"这条路径**不成立**——
-决定性验证必须在候选**真的位于 `shim/out`** 时做（即 `out-14` 走正式采纳、或 env-harness
-临时换上），而 `shim/out/**` 在我本任务的写范围之外。
+**窗口 #3**（2026-10-09 21:51:55 起；候选 `out-r2` `C642B6AF…` 换入 `shim/out`，`exe` 执行并复核"在盘整件哈希 = 交付声明"，无交付漂移）：
+
+| 项 | 读数 |
+|---|---|
+| 钉哈希 | 跑前/跑后均 `C642B6AF546B66E9441F9C51E31FB5A9977299D2B6CA320575E6A224008FF684`（脚本两次钉哈希一致） |
+| `self=` | `…\shim\out\winstage-shim.dll` ⇒ 确为候选 |
+| **`replayedBytes>0`** | ✅ `t3_replay_journal: applied=3 auditSkipped=0 bytes=282 rc=0`（多进程一致；`viewIncomplete=0` 全部；tier 1/2/3 均在用） |
+| `query-key-exit` | **0**（键可见）——但 `step2a` 输出**为空**（0 个值） |
+| **`query-value-exit` / `query2-value-exit`** | **1**，`ERROR: The handle is invalid.`（四回合逐字相同） |
+| **结论** | **仍未修**（值读回 4/4 失败） |
+
+**判据纪律（我此前"`query-*-exit=0`"的表述含糊，已修正）**：
+- ✅ **唯一权威判据 = `query-value-exit` / `query2-value-exit`**；
+- ❌ `query-key-exit` **不等价** —— 只证明"**键**在覆盖层里可见"（键在而值空也算 0）；
+- ❌ `r1-repro.cmd` 的外层 `EXIT=0` **不是判据** —— 只是批处理脚本退出码（实测 `stdout.ndjson` 里 `EXIT=0` 与 `query-value-exit=1` 同时出现）。
+
+**定因（离线判据：链接真实源码的 harness + 本次窗口原始 journal 4576 B / 28 条）**：
+```
+t3_replay_journal: applied=28 auditSkipped=0 bytes=4576 rc=0
+key_resolve=0 flags=17 key_open=0   (STAGED=1 EXISTS=16 REAL=4)
+value_get(V) status=0 type=1 bytes=26 hex=7700720069007400740065006e002d00620079002d0041000000 text="written-by-A"
+RESULT readseeded key_resolve=0 key_open=0 key_exists=1 value_get=0
+```
+⇒ **回放把值正确写进了 app hive、provider 逐字节读回成功** ⇒ 失败**不在回放**，而在**钩子层的伪句柄读路径**：
+`shim/src/ws_reg.c:958` 的 `canServe` 为假时，`:967-969` **把伪句柄直通 `g_orig.RegQueryValueExW`** ⇒ `ERROR_INVALID_HANDLE(6)`
+（`:963-966` 的注释**逐字预言**了该错误码；伪句柄在 `:568/:600/:687` 由 `ws_pseudo_key_make` 产生）。
+**已单列为 [`defects.md` D-R10](./defects.md)（高；归属 `ws_reg.c`；Lead 已派 owner `env-harness`）。**
+
+**归因纪律**：这是**既有**缺陷、由本修复**首次暴露** —— 修复前该键在覆盖层里不存在（`query-key-exit=1`「找不到」），根本走不到 `:958`；
+修复后键可见，才撞上它。所以 `out-r2` 判"仍未修"**准确**，但**待修对象不是我的文件**。`ws_reg.c` 我一行未动。
+
+**对 BEFORE 候选（`out-r1`/`out-cur`/`out-13c`）**：**仍失**，且已定因为**候选自身缺陷**（见 §5.2.2，非"方向错"）。
+
+**下一轮**：候选由 `env-harness` 出（`ws_reg.c` 修复 + 我的 D-R1 源码合并；建议命名 `out-r3` 并记录 `.text` 代码身份）。
+我只需在窗口内跑四回合 `r1-repro`，判据 **`query-value-exit=0` 且 `replayedBytes>0`**，**不需要**重建候选。
 
 **顺带排除的两件事（有价值）**：
 1. **不是我的 `out-r1` 构建坏了** —— env-harness 的 13c 表现**逐字相同**（宿主 ok=1 / 子进程 15 次失败），
