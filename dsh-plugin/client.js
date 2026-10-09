@@ -610,8 +610,13 @@ window.__ModuleLoader__.load({
       if (lowered.includes('__psscriptpolicytest_')) return true
       if (lowered.includes('dsh-stage-temp')) return true
       const base = lowered.split(/[\\/]/).pop() ?? ''
-      // 只认**顶层**的垫片产物（避免把用户自己在子目录里放的同名文件误判）
-      if ((base === 'shim.log' || base === 'winstage-shim.config.json') && !lowered.includes('\\fs\\') && !lowered.includes('/fs/')) return true
+      // 只认**顶层**的垫片产物（避免把用户自己在子目录里放的同名文件误判）。
+      // 判据 = 统一分隔符并去掉结尾分隔符之后，路径里**不再含任何分隔符**。
+      // 旧写法用"含不含 `\fs\`"当代理判据，既放过 `docs\shim.log`、又误杀 `fs\C\…\shim.log`
+      // —— 这两条正是被 `.t/round10/gui/noise-selftest.mjs` 抓出来的。
+      const normalized = lowered.replace(/[\\/]+/g, '/').replace(/\/+$/, '')
+      const topLevel = !normalized.includes('/')
+      if (topLevel && (base === 'shim.log' || base === 'winstage-shim.config.json')) return true
       return false
     }
 
