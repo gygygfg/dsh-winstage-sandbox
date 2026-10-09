@@ -957,6 +957,19 @@ static LONG ws_query_value_ex(HKEY hKey, LPCWSTR nameW, LPCSTR nameA, LPDWORD lp
     int isPseudo = 0, isBareRoot = 0;
     int canServe = ws_reg_read_ctx(hKey, NULL, 0, hive, 64, canonical, WS_PATH_MAX, &isPseudo, &isBareRoot) &&
                    !isBareRoot;
+    /* ★ task-17（D-R1 读回缺失的正因）：伪句柄不是内核句柄，`ws_reg_read_ctx` 在它上面
+     * 可能返回 0（此时 `isPseudo` 已由 `ws_rstore_canonical` 置 1），于是本函数会落到下面的
+     * `!canServe` 分支、把**伪句柄**直通 advapi32 ⇒ 必然 `ERROR_INVALID_HANDLE(6)`：
+     * 这正是"覆盖层里键/值都在（`flags=STAGED|EXISTS`）却 `query-value-exit=1`"的成因。
+     * 伪句柄的 hive/canonical 本来就存在伪句柄表里（`ws_pseudo_key_path`），取回来即可由
+     * 覆盖层直接服务 —— 既不直通假句柄，也不丢值。 */
+    if (!canServe && isPseudo) {
+        int pseudo = 0;
+        if (ws_pseudo_key_path(hKey, hive, 64, canonical, WS_PATH_MAX, &pseudo) && pseudo) {
+            isPseudo = 1;
+            canServe = 1;
+        }
+    }
     if (canServe && !isPseudo && !ws_reg_overlay_has_key(canonical)) {
         canServe = 0; /* nothing staged under this key: the real API is authoritative */
     }
@@ -965,6 +978,10 @@ static LONG ws_query_value_ex(HKEY hKey, LPCWSTR nameW, LPCSTR nameA, LPDWORD lp
      * "reg add" broke (the key is materialized lazily, so the overlay may not
      * have it yet at query time). */
     if (!canServe) {
+        if (isPseudo) {
+            /* fail closed: never hand a pseudo handle to advapi32 (task-17) */
+            return ERROR_FILE_NOT_FOUND;
+        }
         return isAnsi ? g_orig.RegQueryValueExA(hKey, nameA, lpReserved, lpType, lpData, lpcbData)
                       : g_orig.RegQueryValueExW(hKey, nameW, lpReserved, lpType, lpData, lpcbData);
     }

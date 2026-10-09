@@ -10,6 +10,63 @@
 
 ---
 
+## D-R10【高 · 归属 `shim/src/ws_reg.c`（owner: `env-harness`）】伪句柄直通真实 API ⇒ 覆盖层里**已存在的键**读值时 `ERROR_INVALID_HANDLE(6)`
+
+**判定**：**未修复** · 本域只交付定因证据与代码路径；`ws_reg.c` **不在本任务写范围**，Lead 已派 owner。
+
+### 10.1 现象（受控窗口 #3，候选 `out-r2` `C642B6AF…`，正常态 `tier=TS`/`degraded=false`）
+
+`r1-repro` 四回合**逐字相同**（判据 = `query-value-exit`，见 §10.4）：
+
+```
+add-key-exit=0        add-value-exit=0
+query-key-exit=0      ← 键**可见**，但 step2a 输出为空（0 个值）
+query-value-exit=1    ERROR: The handle is invalid.
+query2-value-exit=1   ERROR: The handle is invalid.
+```
+
+对比修复前（无回放）：`query-key-exit=1`「找不到」⇒ **回放让键变可见了，从而首次走到伪句柄读路径并撞上这个既有缺陷**。
+
+### 10.2 定因（离线判据：链接真实源码的 harness + 本次窗口的原始 journal 4576 B / 28 条）
+
+```
+t3_replay_journal: applied=28 auditSkipped=0 bytes=4576 rc=0
+key_resolve=0 flags=17 key_open=0   (STAGED=1 EXISTS=16 REAL=4)
+value_get(V) status=0 type=1 bytes=26 hex=7700720069007400740065006e002d00620079002d0041000000 text="written-by-A"
+RESULT readseeded key_resolve=0 key_open=0 key_exists=1 value_get=0
+```
+⇒ **回放把值正确写进了 app hive，provider 也能逐字节读回**。所以失败**不在回放**，而在钩子层的伪句柄读路径。
+证据：`evidence/fix-r1/offline/readseeded-decisive-b.txt`（另存种子 `arm-window-journal-seed.journal`）
+
+### 10.3 代码路径（`shim/src/ws_reg.c`）
+
+| 位置 | 内容 |
+|---|---|
+| `:958` | `int canServe = ws_reg_read_ctx(hKey, NULL, 0, …) && !isBareRoot;` |
+| `:960-962` | `if (canServe && !isPseudo && !ws_reg_overlay_has_key(canonical)) canServe = 0;` |
+| `:967-969` | **`if (!canServe) return g_orig.RegQueryValueExW(hKey, …);`** ← `hKey` 若是伪句柄就必然 `ERROR_INVALID_HANDLE(6)` |
+| `:963-966` | 注释**逐字预言**了该错误码："A pseudo handle must NEVER reach a real API … the call would fail with ERROR_INVALID_HANDLE(6)" |
+| `:568` / `:600` / `:687` | 覆盖层键的打开路径在此造伪句柄 `ws_pseudo_key_make(hive, canonical)` |
+
+**待查点**：为什么对"覆盖层里确实存在"的键（`flags=STAGED|EXISTS`），`:958` 的 `ws_reg_read_ctx` 仍解析失败／`canServe` 仍为假。
+**建议最小单变量定位**：在 `:958` 前后各打一行，输出 `read_ctx` 返回值、`isPseudo`、`isBareRoot`、`canonical`。
+
+### 10.4 判据纪律（本轮踩过的坑，务必沿用）
+
+| 量 | 是不是"读回成功"的判据 | 理由 |
+|---|---|---|
+| **`query-value-exit` / `query2-value-exit`** | ✅ **是**（唯一权威判据） | 只有它证明"别人写的**值**能读回" |
+| `query-key-exit` | ❌ 不是 | 只证明"**键**在覆盖层里可见"；键在而值空也算 0 |
+| `r1-repro.cmd` 的外层 `EXIT=0` | ❌ 不是 | 那只是**批处理脚本**跑完的退出码（实测 `stdout.ndjson` 里 `EXIT=0` 与 `query-value-exit=1` 同时出现） |
+
+**影响面**：任何依赖"读回自己/他人写入的值"的上游（审批面板的 before 快照、`apply()` 前的校验、按值判定的白障/净变化）在覆盖层键上都会**拿到 `ERROR_INVALID_HANDLE(6)` 或读不到值**，而写入侧却报成功 —— 与 D-R1 同族的"账本与事实不一致"，但**责任方在钩子层**。
+
+**归因纪律**（Lead 已采纳）：这是**既有**缺陷，由 D-R1 的修复**首次暴露**；修复前该键不可见，走不到这段代码。因此 `out-r2` 判"仍未修"是准确的，但**待修对象是 `ws_reg.c`**。
+
+**交接物**：`evidence/fix-r1/offline/readseeded-decisive-b.txt` + `evidence/fix-r1/arm-window/{transcripts,logs,wal}`。
+
+---
+
 ## D-R9【信息 · 影响验证协议，非功能缺陷】`build-shim.mjs` **不是字节可复现** —— 但**代码可复现，不可复现的是元数据**
 
 **判定**：**未修复（不在本任务写范围内）** · 只报告，供集成/验证协议修正口径

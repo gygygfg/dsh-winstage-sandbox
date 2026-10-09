@@ -257,7 +257,7 @@ window.__ModuleLoader__.load({
         off: 'Disabled',
         unavailable: 'This setting is not exposed by the Host',
         error:
-          'The setting value did NOT take effect; the previous value was kept (this row\'s config is pinned by a profile overlay or an environment variable). Note: this interaction may still have re-serialized the profile file (formatting normalization only, no key/value change) — check the mtime and sha256 of %DSH_HOME%\\profiles\\<profile>\\cordis.patch.yml; if several hosts share that profile, avoid concurrent edits.',
+          'The setting value did NOT take effect; the previous value was kept (this row\'s config is pinned by a profile overlay or an environment variable). Note: this interaction may still have re-serialized the profile file (formatting normalization only, no key/value change) — check the mtime and sha256 of %DSH_HOME%\\profiles\\<profile>\\cordis.patch.yml; if several hosts share that profile, avoid concurrent edits. **This plugin cannot roll file bytes back**: the settings transport only carries key/values, so a "pre-write snapshot + rollback on failure" must be implemented by the host-side settings layer.',
         loading: 'Loading…',
         reviewTitle: 'WinStage staged changes',
         reviewWaiting: 'Nothing is written to the real workspace until you approve',
