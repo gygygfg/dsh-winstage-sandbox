@@ -141,3 +141,10 @@ credentials.json
 docs/round10/*/evidence/
 docs/round10/*/evidence-archive/
 docs/round10/LEAD-本线程污染-证据/
+# ★ 2026-10-10 更正（线程 #9，Lead 实测）：上面的 `*` **不跨目录分隔符**，因此
+#   `docs/round10/fileio/13d/<stage>/evidence/` 这类**两层以上**的证据目录并未被排除 ——
+#   实测 `git check-ignore -v docs/round10/fileio/13d/stage-nqifbn/evidence/shim.log`
+#   命中的是 `*.log`（第 95 行），即**只有日志被偶然挡住**，同目录的 `.txt`/`.json`/`.jsonl`
+#   仍会被 `git add -A` 扫进版本库。证据一律不入库，故用 `**` 覆盖任意深度。
+docs/round10/**/evidence/
+docs/round10/**/evidence-archive/

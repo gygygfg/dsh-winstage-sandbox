@@ -360,8 +360,15 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
         }
         break;
     case DLL_PROCESS_DETACH:
-        if (!lpvReserved && g_ws.initialized) {
-            ws_hook_remove();
+        if (g_ws.initialized) {
+            /* R11-D-13d (v2)：**两条路径都要 dump**。Win32 在"进程终止"时以
+             * lpvReserved != NULL 调用本分支，而短命探针进程走的正是这条路 ——
+             * v1 把它挡在 !lpvReserved 之外，导致计数永不落盘。
+             * 撤钩仍只在非终止路径做（保持既有语义）。 */
+            if (!lpvReserved) {
+                ws_hook_remove();
+            }
+            ws_count_dump();
             g_ws.initialized = 0;
         }
         break;

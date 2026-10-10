@@ -16,6 +16,11 @@
  */
 #include "winstage_internal.h"
 
+/* R11-D-13d-seq: shared per-process call ordinal, so log lines can be ordered and bound
+ * to probe actions (existsSync -> statSync -> lstatSync -> readFileSync). */
+static volatile LONG g_wsSeqN;
+static long ws_seq(void) { return (long)InterlockedIncrement(&g_wsSeqN); }
+
 /* Verbose file tracing (WINSTAGE_SHIM_VERBOSE=1). */
 #define WS_TRACE_FILE(...) do { if (g_ws.verbose) ws_log(__VA_ARGS__); } while (0)
 
@@ -314,6 +319,12 @@ static HANDLE ws_create_file_core(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWO
             h = g_orig.CreateFileW(mapped, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
                                    dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
             stagedErr = GetLastError();
+    { /* R11-D-13d-ovl: record the overlay open's own outcome (zero semantic change) */
+        DWORD ovl_se = GetLastError();
+        ws_log("ATTRDBG-CFW-OVL handle=%p valid=%d err=%lu path=%ls", (void *)h,
+               (h != INVALID_HANDLE_VALUE) ? 1 : 0, (unsigned long)stagedErr, lpFileName);
+        SetLastError(ovl_se);
+    }
             if (h == INVALID_HANDLE_VALUE && !destructive &&
                 ws_wcscmp_ci(mapped, norm) != 0 && ws_file_exists(norm)) {
                 ws_log_w(L"CreateFile overlay(read) miss -> read-through real", norm);
@@ -414,6 +425,14 @@ HANDLE WINAPI ws_CreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dw
                              LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition,
                              DWORD dwFlagsAndAttributes, HANDLE hTemplateFile)
 {
+    { /* R11-D-13d-cfw: open-form log, LastError-safe (zero semantic change) */
+        DWORD cfw_se = GetLastError();
+        ws_log("ATTRDBG-CFW seq=%ld desiredAccess=0x%lx share=0x%lx disposition=%lu flags=0x%lx path=%ls", /* R11-D-13d-seq */
+               ws_seq(), (unsigned long)dwDesiredAccess, (unsigned long)dwShareMode, (unsigned long)dwCreationDisposition,
+               (unsigned long)dwFlagsAndAttributes, lpFileName);
+        SetLastError(cfw_se);
+    }
+    ws_callhit_named("CreateFileW"); /* R11-D-13d */
     WS_STUCK("CreateFileW");
     ws_stuck_path(lpFileName);
     return ws_create_file_core(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
@@ -845,15 +864,48 @@ static int ws_stat_resolve(LPCWSTR lpFileName, wchar_t *mapped, DWORD cch, int *
     return 0;
 }
 
+/* R11-D-13d-attr: path-only logging for the attribute/open face. ZERO semantic change:
+ * no argument/return/LastError touch; the sole added work is one ws_log line, and a
+ * re-entrancy guard stops a log write from recursing back through our own hooks. */
+static volatile LONG g_attrLogBusy;
+static void ws_attr_log(const char *api, const wchar_t *path)
+{
+    if (InterlockedExchange(&g_attrLogBusy, 1) != 0) {
+        return;
+    }
+    if (path) {
+        ws_log("ATTRDBG seq=%ld api=%s path=%ls", ws_seq(), api, path); /* R11-D-13d-seq */
+    } else {
+        ws_log("ATTRDBG api=%s path=<null>", api);
+    }
+    InterlockedExchange(&g_attrLogBusy, 0);
+}
+static void ws_attr_log_nt(const char *api, const UNICODE_STRING *us)
+{
+    if (InterlockedExchange(&g_attrLogBusy, 1) != 0) {
+        return;
+    }
+    if (us && us->Buffer) {
+        ws_log("ATTRDBG api=%s path=%.*ls", api, (int)(us->Length / sizeof(wchar_t)), us->Buffer);
+    } else {
+        ws_log("ATTRDBG api=%s path=<null>", api);
+    }
+    InterlockedExchange(&g_attrLogBusy, 0);
+}
+
 DWORD WINAPI ws_GetFileAttributesW(LPCWSTR lpFileName)
 {
+    ws_attr_log("GetFileAttributesW", lpFileName); /* R11-D-13d-attr */
+    ws_callhit_named("GetFileAttributesW"); /* R11-D-13d */
     if (ws_stat_read_masked(lpFileName)) {
+        ws_log("ATTRDBG-W branch=masked in=%ls", lpFileName); /* R11-D-13d-w */
         SetLastError(ERROR_FILE_NOT_FOUND);
         return INVALID_FILE_ATTRIBUTES;
     }
     wchar_t mapped[WS_PATH_MAX];
     int isStaged = 0;
     if (ws_stat_resolve(lpFileName, mapped, WS_PATH_MAX, &isStaged)) {
+        ws_log("ATTRDBG-W branch=resolve-fail in=%ls", lpFileName); /* R11-D-13d-w */
         SetLastError(ERROR_FILE_NOT_FOUND);
         return INVALID_FILE_ATTRIBUTES;
     }
@@ -866,19 +918,24 @@ DWORD WINAPI ws_GetFileAttributesW(LPCWSTR lpFileName)
     DWORD lastErr = GetLastError();
     WS_TRACE_FILE("GetFileAttributesW mapped=%ls staged=%d -> attrs=0x%lx err=%lu",
                   mapped, isStaged, (unsigned long)attrs, (unsigned long)lastErr);
+    ws_log("ATTRDBG-W rc=0 in=%ls mapped=%ls staged=%d attrs=0x%lx err=%lu", lpFileName, mapped, isStaged, (unsigned long)attrs, (unsigned long)lastErr); /* R11-D-13d-w */
     SetLastError(lastErr);
     return attrs;
 }
 
 BOOL WINAPI ws_GetFileAttributesExW(LPCWSTR lpFileName, GET_FILEEX_INFO_LEVELS level, LPVOID info)
 {
+    ws_attr_log("GetFileAttributesExW", lpFileName); /* R11-D-13d-attr */
+    ws_callhit_named("GetFileAttributesExW"); /* R11-D-13d */
     if (ws_stat_read_masked(lpFileName)) {
+        ws_log("ATTRDBG-ExW branch=masked in=%ls", lpFileName); /* R11-D-13d-w */
         SetLastError(ERROR_FILE_NOT_FOUND);
         return FALSE;
     }
     wchar_t mapped[WS_PATH_MAX];
     int isStaged = 0;
     if (ws_stat_resolve(lpFileName, mapped, WS_PATH_MAX, &isStaged)) {
+        ws_log("ATTRDBG-ExW branch=resolve-fail in=%ls", lpFileName); /* R11-D-13d-w */
         SetLastError(ERROR_FILE_NOT_FOUND);
         return FALSE;
     }
@@ -886,14 +943,17 @@ BOOL WINAPI ws_GetFileAttributesExW(LPCWSTR lpFileName, GET_FILEEX_INFO_LEVELS l
     DWORD lastErr = GetLastError(); /* see ws_GetFileAttributesW: the trace clobbers it */
     WS_TRACE_FILE("GetFileAttributesExW mapped=%ls staged=%d -> ok=%d err=%lu",
                   mapped, isStaged, (int)ok, (unsigned long)lastErr);
+    ws_log("ATTRDBG-ExW rc=0 in=%ls mapped=%ls staged=%d ok=%d err=%lu", lpFileName, mapped, isStaged, (int)ok, (unsigned long)lastErr); /* R11-D-13d-w */
     SetLastError(lastErr);
     return ok;
 }
 
 DWORD WINAPI ws_GetFileAttributesA(LPCSTR lpFileName)
 {
+    ws_callhit_named("GetFileAttributesA"); /* R11-D-13d */
     wchar_t wide[WS_PATH_MAX];
     ws_a2w_buf(lpFileName, wide, WS_PATH_MAX);
+    ws_attr_log("GetFileAttributesA", wide); /* R11-D-13d-attr */
     if (!wide[0]) {
         return g_orig.GetFileAttributesA(lpFileName);
     }
@@ -902,112 +962,16 @@ DWORD WINAPI ws_GetFileAttributesA(LPCSTR lpFileName)
 
 BOOL WINAPI ws_GetFileAttributesExA(LPCSTR lpFileName, GET_FILEEX_INFO_LEVELS level, LPVOID info)
 {
+    ws_callhit_named("GetFileAttributesExA"); /* R11-D-13d */
     wchar_t wide[WS_PATH_MAX];
     ws_a2w_buf(lpFileName, wide, WS_PATH_MAX);
+    ws_attr_log("GetFileAttributesExA", wide); /* R11-D-13d-attr */
     if (!wide[0]) {
         return g_orig.GetFileAttributesExA(lpFileName, level, info);
     }
     return ws_GetFileAttributesExW(wide, level, info);
 }
 
-/* ── task-13 ②：ntdll 属性查询面（overlay-aware）──────────────────────────────────
- * 为什么需要（两轮沙箱实测，docs/round10/shim/evidence/D37-dirface、D38-dirface2）：
- *   同一个**工作区之外**的路径，`.NET Directory::Exists` / `Get-Item` / `File::Exists`
- *   都返回真（`GetFileAttributes*` 面已覆盖），而 **node `fs.existsSync`=false、
- *   `statSync`=ENOENT** ⇒ npm 的 `mkdir` 前检查因此 `ENOENT`（pkgs D-P1）；
- *   `cmd /c if exist` 同样为 NO。⇒ libuv/cmd 的存在性与属性查询走的是 **ntdll 的
- *   `NtQueryAttributesFile` / `NtQueryFullAttributesFile`**，而这两个没有被钩。
- *
- * 实现与 stat 族**同构**：先把调用方路径解析到 overlay 的真实落点（staged 路径），
- * 再把 `OBJECT_ATTRIBUTES.ObjectName` 指向那个路径、其余字段逐字保留，调用原始 API。
- * 结构体（FILE_BASIC_INFORMATION / FILE_NETWORK_OPEN_INFORMATION）由真实内核填写，
- * 我们**不手工构造**，因此不会出现"字段填错但看着像成功"的风险。
- *   · 未被接管 / 解析结果与入参相同 ⇒ 原样透传（零行为变化）；
- *   · whiteout ⇒ `STATUS_OBJECT_NAME_NOT_FOUND`（与"看起来不存在"一致）；
- *   · 解析失败或原始 API 缺失 ⇒ 透传，绝不猜。 */
-typedef struct WsObjectAttributes {
-    ULONG Length;
-    HANDLE RootDirectory;
-    UNICODE_STRING *ObjectName;
-    ULONG Attributes;
-    PVOID SecurityDescriptor;
-    PVOID SecurityQualityOfService;
-} WsObjectAttributes;
-
-static NTSTATUS ws_nt_query_attrs(const void *rawOa, PVOID info,
-                                  NTSTATUS(NTAPI *orig)(const void *, PVOID))
-{
-    if (!orig) {
-        return (NTSTATUS)0xC0000002; /* STATUS_NOT_IMPLEMENTED */
-    }
-    /* ── 重入守卫（13b 的回归就在这里）────────────────────────────────────────────
-     * 实测 13b（无守卫版）：把工作区外的 `mkdir` 从"成功进暂存"打成 **EPERM**、
-     * npm `rc=null`。原因是 ntdll 的写路径**内部**会调用
-     * `NtQueryAttributesFile`；我们的钩子若在这里再去跑一遍 overlay 解析
-     * （`ws_resolve_file` → `dp_file_resolve` → `ws_ensure_dirs`），就会在"写操作
-     * 进行中"的线程状态里重入暂存机，把正常写路径打成 fail-closed。
-     * `t_wsFileBusy` 是本文件既有的重入计数（`NtSetInformationFile` 等路径已在用）；
-     * 写/删/改正在进行时，属性查询一律**原样透传**。 */
-    if (t_wsFileBusy > 0) {
-        return orig(rawOa, info);
-    }
-    const WsObjectAttributes *oa = (const WsObjectAttributes *)rawOa;
-    if (!oa || !oa->ObjectName || !oa->ObjectName->Buffer || oa->ObjectName->Length == 0) {
-        return orig(rawOa, info);
-    }
-    int n = (int)(oa->ObjectName->Length / sizeof(wchar_t));
-    if (n <= 0 || n >= WS_PATH_MAX) {
-        return orig(rawOa, info);
-    }
-    wchar_t raw[WS_PATH_MAX];
-    for (int i = 0; i < n; i++) {
-        raw[i] = oa->ObjectName->Buffer[i];
-    }
-    raw[n] = 0;
-
-    wchar_t norm[WS_PATH_MAX];
-    if (!ws_should_intercept(raw, norm, WS_PATH_MAX)) {
-        return orig(rawOa, info);
-    }
-    wchar_t mapped[WS_PATH_MAX];
-    uint32_t flags = 0;
-    if (ws_resolve_file(norm, WINSTAGE_IO_READ, mapped, &flags) != 0) {
-        return orig(rawOa, info);
-    }
-    if (flags & WINSTAGE_RES_WHITEOUT) {
-        return (NTSTATUS)0xC0000034; /* STATUS_OBJECT_NAME_NOT_FOUND */
-    }
-    /* 只改写**判为 overlay 件**的路径；`RES_REAL` 一律透传 —— 13b 的教训是
-     * 不要对"本来就在真实盘上"的路径做任何替换。 */
-    if (!(flags & WINSTAGE_RES_STAGED)) {
-        return orig(rawOa, info);
-    }
-    if (ws_wcscmp_ci(mapped, norm) == 0) {
-        return orig(rawOa, info);
-    }
-    UNICODE_STRING us;
-    us.Length = (USHORT)(wcslen(mapped) * sizeof(wchar_t));
-    us.MaximumLength = (USHORT)(us.Length + sizeof(wchar_t));
-    us.Buffer = mapped;
-    WsObjectAttributes copy = *oa;
-    copy.ObjectName = &us;
-    /* `mapped` is absolute: a non-NULL RootDirectory (relative name) would make it
-     * relative again. Clearing it is required for the substitution to be correct. */
-    copy.RootDirectory = NULL;
-    return orig(&copy, info);
-}
-
-NTSTATUS NTAPI ws_NtQueryAttributesFile(const void *oa, PVOID info)
-{
-    WS_STUCK("NtQueryAttributesFile");
-    return ws_nt_query_attrs(oa, info, g_orig.NtQueryAttributesFile);
-}
-
-NTSTATUS NTAPI ws_NtQueryFullAttributesFile(const void *oa, PVOID info)
-{
-    WS_STUCK("NtQueryFullAttributesFile");
-    return ws_nt_query_attrs(oa, info, g_orig.NtQueryFullAttributesFile);
-}
 
 /* ======================================================================== *
  *  Deletion directives that never cross DeleteFileW / RemoveDirectoryW
@@ -1190,6 +1154,8 @@ static int ws_record_delete(const wchar_t *norm, int isDir)
 NTSTATUS NTAPI ws_NtOpenFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes,
                              PIO_STATUS_BLOCK IoStatusBlock, ULONG ShareAccess, ULONG OpenOptions)
 {
+    ws_attr_log_nt("NtOpenFile", ObjectAttributes ? ObjectAttributes->ObjectName : 0); /* R11-D-13d-attr */
+    ws_callhit_named("NtOpenFile"); /* R11-D-13d */
     if (t_wsFileBusy || !(OpenOptions & WS_NT_FILE_DELETE_ON_CLOSE) || !ObjectAttributes ||
         !ObjectAttributes->ObjectName || !ObjectAttributes->ObjectName->Buffer ||
         ObjectAttributes->RootDirectory) {
@@ -1243,6 +1209,7 @@ NTSTATUS NTAPI ws_NtOpenFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess, POBJ
 NTSTATUS NTAPI ws_NtSetInformationFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
                                        ULONG Length, FILE_INFORMATION_CLASS FileInformationClass)
 {
+    ws_callhit_named("NtSetInformationFile"); /* R11-D-13d */
     ULONG cls = (ULONG)FileInformationClass;
     int wantDelete = 0;
     if (!t_wsFileBusy && FileHandle && cls == WS_FID_DISPOSITION && FileInformation &&
@@ -1304,3 +1271,306 @@ BOOL WINAPI ws_MoveFileWithProgressW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFi
     return ws_move_locked(lpExistingFileName, lpNewFileName, dwFlags);
 }
 
+
+/* ---------------------------------------------------------------- R11-D-13d-gfibh
+ * ONE new target: GetFileInformationByHandle (count + per-call rc/err).
+ * Safety: NEVER fail-closed -- if the captured original is missing we call the
+ * real API directly (this module's own import table is never patched, so the
+ * direct call still reaches kernel32). Counting itself does no I/O; the log is
+ * LastError-transparent. */
+BOOL WINAPI ws_GetFileInformationByHandle(HANDLE hFile, LPVOID lpFileInformation)
+{
+    ws_callhit_named("GetFileInformationByHandle");
+    BOOL ok;
+    if (g_orig.GetFileInformationByHandle) {
+        ok = g_orig.GetFileInformationByHandle(hFile, lpFileInformation);
+    } else {
+        ok = GetFileInformationByHandle(hFile, (LPBY_HANDLE_FILE_INFORMATION)lpFileInformation);
+    }
+    DWORD e = GetLastError();
+    ws_log("ATTRDBG-GFIBH seq=%ld handle=%p ok=%d err=%lu", ws_seq(), (void *)hFile, (int)ok, (unsigned long)e); /* R11-D-13d-seq */
+    SetLastError(e);
+    return ok;
+}
+
+/* ---------------------------------------------------------------- R11-D-13d-ntqif
+ * ONE new ntdll target: NtQueryInformationFile (count + per-call status).
+ * The original is resolved EXPLICITLY from ntdll.dll (lazily, cached); if that
+ * fails we call the API directly -- this module's own import table is never
+ * patched, so the direct call still reaches ntdll. NEVER fail-closed. */
+static NTSTATUS(NTAPI *ws_ntqif_orig)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, int);
+static volatile LONG ws_ntqifResolved;
+
+NTSTATUS NTAPI ws_NtQueryInformationFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock,
+                                         PVOID FileInformation, ULONG Length, int FileInformationClass)
+{
+    ws_callhit_named("NtQueryInformationFile");
+    if (!ws_ntqif_orig && InterlockedCompareExchange(&ws_ntqifResolved, 1, 0) == 0) {
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        if (nt) {
+            ws_ntqif_orig = (NTSTATUS(NTAPI *)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, int))
+                GetProcAddress(nt, "NtQueryInformationFile");
+        }
+    }
+    NTSTATUS st;
+    if (ws_ntqif_orig) {
+        st = ws_ntqif_orig(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
+    } else {
+        st = NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
+    }
+    ws_log("ATTRDBG-NTQIF seq=%ld handle=%p class=%d status=0x%lx", /* R11-D-13d-seq */
+           ws_seq(), (void *)FileHandle, FileInformationClass, (unsigned long)st);
+    return st;
+}
+
+/* ---------------------------------------------------------------- R11-D-13d-gfibhex
+ * ONE new target: GetFileInformationByHandleEx (count + per-call ok/err).
+ * NEVER fail-closed: if the captured original is missing we call the real API
+ * directly (this module's own import table is never patched). Win32 family =>
+ * LastError is saved/restored around the log. */
+BOOL WINAPI ws_GetFileInformationByHandleEx(HANDLE hFile, int FileInformationClass,
+                                           LPVOID lpFileInformation, DWORD dwBufferSize)
+{
+    ws_callhit_named("GetFileInformationByHandleEx");
+    BOOL ok;
+    if (g_orig.GetFileInformationByHandleEx) {
+        ok = g_orig.GetFileInformationByHandleEx(hFile, FileInformationClass, lpFileInformation, dwBufferSize);
+    } else {
+        ok = GetFileInformationByHandleEx(hFile, (FILE_INFO_BY_HANDLE_CLASS)FileInformationClass,
+                                          lpFileInformation, dwBufferSize);
+    }
+    DWORD e = GetLastError();
+    ws_log("ATTRDBG-GFIBHEX handle=%p class=%d ok=%d err=%lu",
+           (void *)hFile, FileInformationClass, (int)ok, (unsigned long)e);
+    SetLastError(e);
+    return ok;
+}
+
+/* ---------------------------------------------------------------- R11-D-13d-nqaf
+ * 线A#1: ONE new ntdll target, NtQueryAttributesFile (count + per-call status).
+ * Explicit ntdll resolution, lazy + CAS cached; unresolved => call the API
+ * directly => NEVER fail-closed. Declared explicitly: unlike NtQueryInformationFile,
+ * winternl.h does NOT declare NtQueryAttributesFile (compile check caught this).
+ * Zero path I/O; ntdll family => LastError is NOT wrapped. */
+extern NTSTATUS NTAPI NtQueryAttributesFile(POBJECT_ATTRIBUTES, PVOID);
+static NTSTATUS(NTAPI *ws_nqaf_orig)(POBJECT_ATTRIBUTES, PVOID);
+static volatile LONG ws_nqafResolved;
+
+NTSTATUS NTAPI ws_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes, PVOID FileInformation)
+{
+    ws_callhit_named("NtQueryAttributesFile");
+    if (!ws_nqaf_orig && InterlockedCompareExchange(&ws_nqafResolved, 1, 0) == 0) {
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        if (nt) {
+            ws_nqaf_orig = (NTSTATUS(NTAPI *)(POBJECT_ATTRIBUTES, PVOID))
+                GetProcAddress(nt, "NtQueryAttributesFile");
+        }
+    }
+    NTSTATUS st;
+    if (ws_nqaf_orig) {
+        st = ws_nqaf_orig(ObjectAttributes, FileInformation);
+    } else {
+        st = NtQueryAttributesFile(ObjectAttributes, FileInformation);
+    }
+    const UNICODE_STRING *us = (ObjectAttributes ? ObjectAttributes->ObjectName : 0);
+    if (us && us->Buffer) {
+        ws_log("ATTRDBG-NQAF pid=%lu handle=%p path=%.*ls status=0x%lx class=%lu seq=%ld",
+               (unsigned long)GetCurrentProcessId(), (void *)0, (int)(us->Length / sizeof(wchar_t)),
+               us->Buffer, (unsigned long)st, (unsigned long)0, ws_seq());
+    } else {
+        ws_log("ATTRDBG-NQAF pid=%lu handle=%p path=<null> status=0x%lx class=%lu seq=%ld",
+               (unsigned long)GetCurrentProcessId(), (void *)0, (unsigned long)st, (unsigned long)0, ws_seq());
+    }
+    return st;
+}
+
+/* ---------------------------------------------------------------- R11-D-13d-nqfaf
+ * 线A#2: ONE new ntdll target, NtQueryFullAttributesFile (count + per-call status).
+ * Same safety contract as NtQueryAttributesFile: explicit ntdll resolution (lazy+CAS),
+ * unresolved => direct call => NEVER fail-closed; zero path I/O; no LastError wrap;
+ * winternl.h does not declare it either => explicit extern. */
+extern NTSTATUS NTAPI NtQueryFullAttributesFile(POBJECT_ATTRIBUTES, PVOID);
+static NTSTATUS(NTAPI *ws_nqfaf_orig)(POBJECT_ATTRIBUTES, PVOID);
+static volatile LONG ws_nqfafResolved;
+
+NTSTATUS NTAPI ws_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes, PVOID FileInformation)
+{
+    ws_callhit_named("NtQueryFullAttributesFile");
+    if (!ws_nqfaf_orig && InterlockedCompareExchange(&ws_nqfafResolved, 1, 0) == 0) {
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        if (nt) {
+            ws_nqfaf_orig = (NTSTATUS(NTAPI *)(POBJECT_ATTRIBUTES, PVOID))
+                GetProcAddress(nt, "NtQueryFullAttributesFile");
+        }
+    }
+    NTSTATUS st;
+    if (ws_nqfaf_orig) {
+        st = ws_nqfaf_orig(ObjectAttributes, FileInformation);
+    } else {
+        st = NtQueryFullAttributesFile(ObjectAttributes, FileInformation);
+    }
+    const UNICODE_STRING *us = (ObjectAttributes ? ObjectAttributes->ObjectName : 0);
+    if (us && us->Buffer) {
+        ws_log("ATTRDBG-NQFAF pid=%lu handle=%p path=%.*ls status=0x%lx class=%lu seq=%ld",
+               (unsigned long)GetCurrentProcessId(), (void *)0, (int)(us->Length / sizeof(wchar_t)),
+               us->Buffer, (unsigned long)st, (unsigned long)0, ws_seq());
+    } else {
+        ws_log("ATTRDBG-NQFAF pid=%lu handle=%p path=<null> status=0x%lx class=%lu seq=%ld",
+               (unsigned long)GetCurrentProcessId(), (void *)0, (unsigned long)st, (unsigned long)0, ws_seq());
+    }
+    return st;
+}
+
+/* ---------------------------------------------------------------- R11-D-13d-nqifbn
+ * 线A#3 (last): ONE new ntdll target, NtQueryInformationByName (count + status).
+ * Same safety contract: explicit ntdll resolution (lazy+CAS); unresolved => direct
+ * call => NEVER fail-closed; zero path I/O; no LastError wrap; explicit extern
+ * because winternl.h does not declare it either. */
+extern NTSTATUS NTAPI NtQueryInformationByName(POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PVOID, ULONG, int);
+static NTSTATUS(NTAPI *ws_nqifbn_orig)(POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PVOID, ULONG, int);
+static volatile LONG ws_nqifbnResolved;
+
+NTSTATUS NTAPI ws_NtQueryInformationByName(POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK IoStatusBlock,
+                                           PVOID FileInformation, ULONG Length, int FileInformationClass)
+{
+    ws_callhit_named("NtQueryInformationByName");
+    if (!ws_nqifbn_orig && InterlockedCompareExchange(&ws_nqifbnResolved, 1, 0) == 0) {
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        if (nt) {
+            ws_nqifbn_orig = (NTSTATUS(NTAPI *)(POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PVOID, ULONG, int))
+                GetProcAddress(nt, "NtQueryInformationByName");
+        }
+    }
+    /* ------------------------------------------------------- R11-D-96-nqifbn
+     * 线A#3 overlay 感知（D-FILE-6）：按名查询先问覆盖层，命中才换名。
+     *
+     * 三条被实测钉死的约束（不要"顺手简化"）：
+     *   ① `ObjectName` 常见形态是 NT 名 `\??\C:\...`，而 `GetFullPathNameW` **不剥**
+     *      `\??\`：D96 实测它把 `\??\C:\x` 编成 `C:\??\C:\x` ⇒ 必须**先**剥 NT 前缀、
+     *      再绝对化，否则解析链永远 no-op；
+     *   ② 相对名（`stage0-target.txt`）在 `ws_stat_resolve` 里是 no-op（D95 第 0 步：
+     *      `isStaged=0`、`mapped==in`）⇒ 用 CWD 绝对化是必需步骤，不是保险；
+     *   ③ `ObjectName` **不保证 NUL 结尾** ⇒ 一律按 `Length` 复制。
+     *
+     * 安全口径：只有 `isStaged==1`（provider 读分支，**覆盖层副本确实存在**）才换名；
+     * whiteout 直接答"不存在"且不调真实 API；其余一切（未命中 / 路径未变 / orig 未解析 /
+     * busy / RootDirectory 非空 / 名字为空或超长 / 任何解析失败）**原样透传**——
+     * 绝不 fail-closed、绝不伪造成功、绝不就地改写调用方结构；本包装自身零路径 I/O。 */
+    wchar_t ws_abs[WS_PATH_MAX];
+    wchar_t ws_map[WS_PATH_MAX];
+    ws_map[0] = 0;
+    int ws_staged = -1; /* -1 = 没走到解析链；0 = 走到但无覆盖层副本；1 = 命中覆盖层 */
+    const UNICODE_STRING *ws_us = (ObjectAttributes ? ObjectAttributes->ObjectName : 0);
+    if (!t_wsFileBusy && ws_nqifbn_orig && IoStatusBlock && ObjectAttributes && ws_us && ws_us->Buffer &&
+        ws_us->Length > 0 && ws_us->Length <= (ULONG)((WS_PATH_MAX - 1) * sizeof(wchar_t)) &&
+        ObjectAttributes->RootDirectory == NULL) {
+        wchar_t ws_nz[WS_PATH_MAX]; /* 按 Length 取值、补 NUL 后的逻辑名 */
+        size_t ws_n = (size_t)(ws_us->Length / sizeof(wchar_t));
+        memcpy(ws_nz, ws_us->Buffer, ws_n * sizeof(wchar_t));
+        ws_nz[ws_n] = 0;
+        /* NT 命名空间 -> Win32（见①；`\\?\` 的剥离仍由解析链里的 ws_normalize_path 负责）。 */
+        if (ws_starts_with_ci_w(ws_nz, L"\\??\\UNC\\")) {
+            size_t ws_len = wcslen(ws_nz + 8);
+            ws_nz[0] = ws_nz[1] = L'\\';
+            memmove(ws_nz + 2, ws_nz + 8, (ws_len + 1) * sizeof(wchar_t));
+        } else if (ws_starts_with_ci_w(ws_nz, L"\\??\\") &&
+                   ((ws_nz[4] >= L'A' && ws_nz[4] <= L'Z') || (ws_nz[4] >= L'a' && ws_nz[4] <= L'z')) &&
+                   ws_nz[5] == L':' && (ws_nz[6] == L'\\' || ws_nz[6] == L'/' || ws_nz[6] == 0)) {
+            /* 只剥**盘符绝对**形态 `\??\C:\...`：`\??\C:x.txt`（驱动器相对）与
+             * `\??\Volume{...}`（卷 GUID）都不剥，落进下面的 NT 命名空间黑名单 ⇒ 透传。 */
+            size_t ws_len = wcslen(ws_nz + 4);
+            memmove(ws_nz, ws_nz + 4, (ws_len + 1) * sizeof(wchar_t));
+        }
+        /* 仍留在 NT 命名空间里的名字（`\Device\` / `\\.\` / `\??\` / GLOBALROOT）Win32
+         * 解释不了，GetFullPathNameW 只会编出一个假盘符路径 ⇒ 不猜，原样透传。 */
+        if (!(ws_starts_with_ci_w(ws_nz, L"\\Device\\") || ws_starts_with_ci_w(ws_nz, L"\\\\.\\") ||
+              ws_starts_with_ci_w(ws_nz, L"\\??\\") || ws_starts_with_ci_w(ws_nz, L"\\\\?\\GLOBALROOT"))) {
+            /* GetFullPathNameW 会改 last error ⇒ 单点保存/恢复（用法同 ws_mask.c:603）。 */
+            DWORD ws_err = GetLastError();
+            if (GetFullPathNameW(ws_nz, WS_PATH_MAX, ws_abs, NULL) == 0) {
+                ws_strlcpy_w(ws_abs, ws_nz, WS_PATH_MAX);
+            }
+            SetLastError(ws_err);
+            int ws_isStaged = 0;
+            if (ws_stat_resolve(ws_abs, ws_map, WS_PATH_MAX, &ws_isStaged)) {
+                /* whiteout：按契约直接答"不存在"，**不调真实 API**、不伪造成功。 */
+                NTSTATUS ws_gone = (NTSTATUS)0xC0000034L; /* STATUS_OBJECT_NAME_NOT_FOUND */
+                IoStatusBlock->Status = ws_gone;
+                IoStatusBlock->Information = 0;
+                ws_log("ATTRDBG-NQIFBN pid=%lu handle=%p path=%ls mapped=<whiteout> nt=<none> staged=0 status=0x%lx class=%lu seq=%ld",
+                       (unsigned long)GetCurrentProcessId(), (void *)0, ws_nz, (unsigned long)ws_gone,
+                       (unsigned long)FileInformationClass, ws_seq());
+                return ws_gone;
+            }
+            ws_staged = ws_isStaged;
+            if (ws_isStaged && ws_wcscmp_ci(ws_map, ws_abs) != 0) {
+                /* ★ D98：交回真实 API 的 ObjectName 必须是 **NT 对象路径**。
+                 * 规格 §3 骨架的 `un.Buffer = mapped;`（Win32 `C:\…`）是**缺陷**：
+                 * RootDirectory=NULL 时对象管理器把 `C:\…` 当成根下的 `\C:\…`
+                 * ⇒ 0xC000003B（STATUS_OBJECT_PATH_SYNTAX_BAD，实测定案）。
+                 * 同文件先例 ws_NtOpenFile：`\??\` 只用于自己的判断，交回真实 API 时保持 NT 原名。
+                 * 只认三种可安全转换的形态，其它一律不换名、原样透传（绝不猜）。 */
+                wchar_t ws_nt[WS_PATH_MAX]; /* 独立缓冲：ws_map 仍要留给 Win32 的 mapped= 日志 */
+                size_t ws_ntPos = 0;
+                int ws_ntOk = 0;
+                ws_nt[0] = 0;
+                if (ws_starts_with_ci_w(ws_map, L"\\??\\") && ws_map[4]) {
+                    /* 已是 NT 形态：原样使用，不重复加前缀 */
+                    ws_ntOk = ws_append_w(ws_nt, WS_PATH_MAX, &ws_ntPos, ws_map);
+                } else if (ws_map[0] == L'\\' && ws_map[1] == L'\\' && ws_map[2] &&
+                           ws_map[2] != L'?' && ws_map[2] != L'.') {
+                    /* 真 UNC：\\server\share\p -> \??\UNC\server\share\p。
+                     * `\\?\…`（含 `\\?\Volume{…}` / `\\?\GLOBALROOT…`）与 `\\.\…` 是设备命名空间，
+                     * **不**属于此形态 ⇒ 落到下面 ⇒ 不换名、原样透传。 */
+                    ws_ntOk = ws_append_w(ws_nt, WS_PATH_MAX, &ws_ntPos, L"\\??\\UNC\\") &&
+                              ws_append_w(ws_nt, WS_PATH_MAX, &ws_ntPos, ws_map + 2);
+                } else if (((ws_map[0] >= L'A' && ws_map[0] <= L'Z') ||
+                            (ws_map[0] >= L'a' && ws_map[0] <= L'z')) &&
+                           ws_map[1] == L':' && ws_map[2] == L'\\') {
+                    /* 盘符绝对：X:\p -> \??\X:\p（大小写皆可） */
+                    ws_ntOk = ws_append_w(ws_nt, WS_PATH_MAX, &ws_ntPos, L"\\??\\") &&
+                              ws_append_w(ws_nt, WS_PATH_MAX, &ws_ntPos, ws_map);
+                }
+                /* 其它一切形态（`\\?\…`、`\\.\…`、`\Device\…`、`\\?\GLOBALROOT`、单 `\` 开头、
+                 * 相对名…）都构造不出可信 NT 名 ⇒ ws_ntOk==0 ⇒ 不换名、原样透传。 */
+                if (ws_ntOk && ws_ntPos > 0) {
+                    /* 本地副本：ObjectName 指向**覆盖层 NT 路径**、RootDirectory=NULL，
+                     * 其余字段逐字保留；Length/MaximumLength 按 NT 串重算；调用方结构一字节不动。 */
+                    OBJECT_ATTRIBUTES ws_oa = *ObjectAttributes;
+                    UNICODE_STRING ws_un;
+                    ws_un.Buffer = ws_nt;
+                    ws_un.Length = (USHORT)(ws_ntPos * sizeof(wchar_t));
+                    ws_un.MaximumLength = (USHORT)(ws_un.Length + sizeof(wchar_t));
+                    ws_oa.ObjectName = &ws_un;
+                    ws_oa.RootDirectory = NULL;
+                    NTSTATUS ws_st = ws_nqifbn_orig(&ws_oa, IoStatusBlock, FileInformation, Length, FileInformationClass);
+                    ws_log("ATTRDBG-NQIFBN pid=%lu handle=%p path=%ls mapped=%ls nt=%ls staged=1 status=0x%lx class=%lu seq=%ld",
+                           (unsigned long)GetCurrentProcessId(), (void *)0, ws_nz, ws_map, ws_nt,
+                           (unsigned long)ws_st, (unsigned long)FileInformationClass, ws_seq());
+                    return ws_st;
+                }
+                /* 无法安全构造 NT 形态 ⇒ 不换名、原样透传（日志 staged=1 / nt=<none> 可区分）。 */
+            }
+        }
+    }
+
+    NTSTATUS st;
+    if (ws_nqifbn_orig) {
+        st = ws_nqifbn_orig(ObjectAttributes, IoStatusBlock, FileInformation, Length, FileInformationClass);
+    } else {
+        st = NtQueryInformationByName(ObjectAttributes, IoStatusBlock, FileInformation, Length, FileInformationClass);
+    }
+    const UNICODE_STRING *us = (ObjectAttributes ? ObjectAttributes->ObjectName : 0);
+    const wchar_t *ws_map_log = (ws_staged >= 0 && ws_map[0]) ? ws_map : L"<none>";
+    if (us && us->Buffer) {
+        ws_log("ATTRDBG-NQIFBN pid=%lu handle=%p path=%.*ls mapped=%ls nt=<none> staged=%d status=0x%lx class=%lu seq=%ld",
+               (unsigned long)GetCurrentProcessId(), (void *)0, (int)(us->Length / sizeof(wchar_t)),
+               us->Buffer, ws_map_log, ws_staged, (unsigned long)st, (unsigned long)FileInformationClass,
+               ws_seq());
+    } else {
+        ws_log("ATTRDBG-NQIFBN pid=%lu handle=%p path=<null> mapped=%ls nt=<none> staged=%d status=0x%lx class=%lu seq=%ld",
+               (unsigned long)GetCurrentProcessId(), (void *)0, ws_map_log, ws_staged, (unsigned long)st,
+               (unsigned long)FileInformationClass, ws_seq());
+    }
+    return st;
+}

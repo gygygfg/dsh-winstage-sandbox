@@ -104,8 +104,6 @@ typedef struct WsOriginals {
     NTSTATUS(NTAPI *LdrLoadDll)(PCWSTR, PULONG, const void * /*PUNICODE_STRING*/, PHANDLE);
     /* task-13 ②：ntdll 属性查询面 —— node/libuv 的 stat/exists 与 cmd 的存在性检查
      * 走这里（实测：GetFileAttributes* 面看得见 overlay，这两个不钩就看不见）。 */
-    NTSTATUS(NTAPI *NtQueryAttributesFile)(const void * /*POBJECT_ATTRIBUTES*/, PVOID);
-    NTSTATUS(NTAPI *NtQueryFullAttributesFile)(const void *, PVOID);
 
     /* --- registry --- */
     LONG(WINAPI *RegCreateKeyExW)(HKEY, LPCWSTR, DWORD, LPWSTR, DWORD, REGSAM, LPSECURITY_ATTRIBUTES, PHKEY, LPDWORD);
@@ -131,6 +129,17 @@ typedef struct WsOriginals {
     LONG(WINAPI *RegQueryInfoKeyW)(HKEY, LPWSTR, LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, PFILETIME);
     LONG(WINAPI *RegEnumValueW)(HKEY, DWORD, LPWSTR, LPDWORD, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
     LONG(WINAPI *RegEnumKeyExW)(HKEY, DWORD, LPWSTR, LPDWORD, LPDWORD, LPWSTR, LPDWORD, PFILETIME);
+    /* task-18: ntdll!NtQueryValueKey -- reg.exe reads values without going through advapi32. */
+    NTSTATUS(NTAPI *NtQueryValueKey)(HANDLE, const void * /*PUNICODE_STRING*/, ULONG, PVOID, ULONG, PULONG);
+    /* task-18c: the rest of the ntdll query family (same policy as NtQueryValueKey). */
+    NTSTATUS(NTAPI *NtEnumerateValueKey)(HANDLE, ULONG, ULONG, PVOID, ULONG, PULONG);
+    NTSTATUS(NTAPI *NtQueryKey)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    BOOL(WINAPI *GetFileInformationByHandle)(HANDLE, LPVOID);
+    NTSTATUS(NTAPI *NtQueryInformationFile)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, int);
+    BOOL(WINAPI *GetFileInformationByHandleEx)(HANDLE, int, LPVOID, DWORD);
+    NTSTATUS(NTAPI *NtQueryAttributesFile)(POBJECT_ATTRIBUTES, PVOID);
+    NTSTATUS(NTAPI *NtQueryFullAttributesFile)(POBJECT_ATTRIBUTES, PVOID);
+    NTSTATUS(NTAPI *NtQueryInformationByName)(POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PVOID, ULONG, int);
 } WsOriginals;
 
 typedef NTSTATUS(NTAPI *WsNtQueryKeyFn)(HANDLE, int, PVOID, ULONG, PULONG);
@@ -139,6 +148,14 @@ extern WsConfig g_ws;
 extern WsOriginals g_orig;
 extern WinstageStageApi g_wsStage;   /* currently bound provider (never NULL after init) */
 extern WsNtQueryKeyFn g_NtQueryKey;
+
+/* R11-D-13d-gfibh: exactly ONE新增目标（一候选一变量）。计数/日志 pass-through；未解析时直调真实实现。 */
+BOOL WINAPI ws_GetFileInformationByHandle(HANDLE, LPVOID);
+NTSTATUS NTAPI ws_NtQueryInformationFile(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, int); /* R11-D-13d-ntqif */
+BOOL WINAPI ws_GetFileInformationByHandleEx(HANDLE, int, LPVOID, DWORD); /* R11-D-13d-gfibhex */
+NTSTATUS NTAPI ws_NtQueryAttributesFile(POBJECT_ATTRIBUTES, PVOID); /* R11-D-13d-nqaf */
+NTSTATUS NTAPI ws_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES, PVOID); /* R11-D-13d-nqfaf */
+NTSTATUS NTAPI ws_NtQueryInformationByName(POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PVOID, ULONG, int); /* R11-D-13d-nqifbn */
 
 /* --- ws_util.c: reentrant lock (defect 4) -------------------------------
  * The old per-module spinlocks (`while (InterlockedCompareExchange(...))`) were
@@ -166,6 +183,12 @@ void ws_lock_leave(WsLock *l);
 void ws_stuck_enter(const char *name);
 void ws_stuck_path(const wchar_t *path);
 void ws_stuck_leave(void);
+
+/* R11-D-13d (v2): call-time hit counting for ALREADY-HOOKED entries only.
+ * No new hook targets, no pass-through wrappers -- v1's new hooks broke CLR hosts.
+ * Pure counting, no I/O => cannot re-enter the hooks. */
+void ws_callhit_named(const char *name);
+void ws_count_dump(void);
 
 /* Scope guard: `WS_STUCK("CreateFileW");` at the top of a hook registers the
  * call for its whole scope and clears it on *every* return path (compiler
@@ -392,9 +415,10 @@ HMODULE WINAPI ws_LoadLibraryExA(LPCSTR, HANDLE, DWORD);
 NTSTATUS NTAPI ws_LdrGetProcedureAddress(PVOID, const void *, ULONG, PVOID *);
 /* task-13：单模块补丁的加载路径扩展（见 ws_hook.c 的 ws_patch_one 长注释）。 */
 NTSTATUS NTAPI ws_LdrLoadDll(PCWSTR, PULONG, const void *, PHANDLE);
+NTSTATUS NTAPI ws_NtQueryValueKey(HANDLE, const void *, ULONG, PVOID, ULONG, PULONG);
+NTSTATUS NTAPI ws_NtEnumerateValueKey(HANDLE, ULONG, ULONG, PVOID, ULONG, PULONG);
+NTSTATUS NTAPI ws_NtQueryKey(HANDLE, ULONG, PVOID, ULONG, PULONG);
 /* task-13 ②：ntdll 属性查询面的 overlay-aware 包装（见 ws_file.c 的长注释）。 */
-NTSTATUS NTAPI ws_NtQueryAttributesFile(const void *, PVOID);
-NTSTATUS NTAPI ws_NtQueryFullAttributesFile(const void *, PVOID);
 int ws_hook_refresh_module(HMODULE base);
 
 #endif /* WINSTAGE_INTERNAL_H */

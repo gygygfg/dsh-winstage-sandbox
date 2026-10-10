@@ -90,6 +90,19 @@ static const WsHookTarget g_targets[] = {
     WS_TARGET(LoadLibraryA),
     WS_TARGET(LoadLibraryExW),
     WS_TARGET(LoadLibraryExA),
+    /* task-18 (option 2, minimal surface): reg.exe reads values through ntdll directly,
+     * so a synthesised (pseudo) handle never reaches a kernel handle -> STATUS_INVALID_HANDLE. */
+    WS_TARGET(NtQueryValueKey),
+    WS_TARGET(NtEnumerateValueKey),
+    WS_TARGET(NtQueryKey),
+    /* task-13 R fix: LdrLoadDll = the load path CLR P/Invoke / Add-Type / native self-imports use. */
+    WS_TARGET(LdrLoadDll),
+    WS_TARGET(GetFileInformationByHandle),
+    WS_TARGET(NtQueryInformationFile), /* R11-D-13d-ntqif */
+    WS_TARGET(GetFileInformationByHandleEx), /* R11-D-13d-gfibhex */
+    WS_TARGET(NtQueryAttributesFile), /* R11-D-13d-nqaf */
+    WS_TARGET(NtQueryFullAttributesFile), /* R11-D-13d-nqfaf */
+    WS_TARGET(NtQueryInformationByName), /* R11-D-13d-nqifbn */
 };
 #define WS_TARGET_COUNT (sizeof(g_targets) / sizeof(g_targets[0]))
 
@@ -108,8 +121,57 @@ static const char *const g_targetNames[] = {
     "RegDeleteValueW", "RegDeleteValueA", "RegCloseKey", "RegFlushKey",
     "RegQueryInfoKeyW", "RegEnumValueW", "RegEnumKeyExW",
     "GetProcAddress", "LoadLibraryW", "LoadLibraryA", "LoadLibraryExW", "LoadLibraryExA",
+    "LdrLoadDll",
+    "NtQueryValueKey",
+    "NtEnumerateValueKey",
+    "NtQueryKey",
     "LdrGetProcedureAddress",
+    "GetFileInformationByHandle",
+    "NtQueryInformationFile", /* R11-D-13d-ntqif */
+    "GetFileInformationByHandleEx", /* R11-D-13d-gfibhex */
+    "NtQueryAttributesFile", /* R11-D-13d-nqaf */
+    "NtQueryFullAttributesFile", /* R11-D-13d-nqfaf */
+    "NtQueryInformationByName", /* R11-D-13d-nqifbn */
 };
+/* R11-D-13d (v2)：调用期命中计数（与 g_targetHits 的"安装期 IAT 站点数"无关）。
+ * v2 **不新增任何挂钩目标**：只统计既已挂钩入口被调用的次数。
+ * 纯计数、**无 I/O** ⇒ 不会重入钩子。已知代价（仅测量构建）：按名字线性查表。 */
+#define WS_CALLHIT_MAX 64
+static LONG g_callHits[WS_CALLHIT_MAX];
+static volatile LONG g_countDumping;
+
+void ws_callhit_named(const char *name)
+{
+    if (!name) {
+        return;
+    }
+    for (size_t ti = 0; ti < WS_TARGET_COUNT; ti++) {
+        const char *tn = g_targets[ti].name;
+        if (tn && strcmp(tn, name) == 0) {
+            if (ti < WS_CALLHIT_MAX) {
+                InterlockedIncrement(&g_callHits[ti]);
+            }
+            return;
+        }
+    }
+}
+
+/* Dump once. Called from DLL_PROCESS_DETACH on BOTH paths: Win32 passes
+ * lpvReserved != NULL when the process is terminating, which is exactly the
+ * path a short-lived probe process takes (v1's !lpvReserved guard never fired). */
+void ws_count_dump(void)
+{
+    if (InterlockedExchange(&g_countDumping, 1) != 0) {
+        return;
+    }
+    for (size_t ti = 0; ti < WS_TARGET_COUNT && ti < WS_CALLHIT_MAX; ti++) {
+        LONG n = g_callHits[ti];
+        if (n > 0) {
+            ws_log("R11-D-13d hit %s n=%ld", g_targets[ti].name, (long)n);
+        }
+    }
+}
+
 
 #define WS_MAX_SITES 8192
 
@@ -145,47 +207,7 @@ static WsLock g_hookLock = { 0, 0, 0, "hook" };
 static wchar_t g_providerNames[WS_MAX_PROVIDERS][64];
 static int g_providerCount = -1; /* -1 = not collected yet */
 
-/* ── task-11c：已打补丁模块的基址集合（增量收敛用）─────────────────────────────
- * 为什么需要它（独立复核 task-9 §8 实测的**回归**）：
- *   task-11b 把 LoadLibrary 钩子里的 `ws_hook_refresh()`（**全量**重扫）换成
- *   `ws_hook_refresh_module(h)`（只补刚加载的那一个模块）之后，经 **`LdrLoadDll`**
- *   （CLR P/Invoke、Add-Type、URLDownloadToFileW 这类原生模块自身导入）载入、
- *   从不经过我们 LoadLibrary 钩子的模块**再也不会被顺带补丁** ⇒
- *   `urlmon!URLDownloadToFileW` 的写**绕过垫片、无候选、无 audit、直落真实盘**。
- *   而旧 DLL 的"全量重扫"正是靠**下一次任意 LoadLibrary** 顺带把这些迟到模块补上。
- *
- * 本集合把"顺带覆盖"从**全量重扫**改成**增量收敛**：
- *   · 已经打过补丁的模块**整段跳过**（连导入表都不再遍历）⇒ 重复工作量 ≈ 0，
- *     也就是 task-11b 去掉那部分"每次 LoadLibrary 都重扫全部模块"的开销；
- *   · 尚未打补丁的模块（典型来源就是 `LdrLoadDll`）在钩子里被补一次并登记，
- *     于是一次登记之后不会再被重复处理。
- * 语义底线：provider 模块（shim 自己 import 的那些）与 `g_selfModule` 一律不补，
- * 但仍**登记**为"已处理"，避免每轮都去做名字比较。 */
-#define WS_MAX_PATCHED_BASES 512
-static HMODULE g_patchedBases[WS_MAX_PATCHED_BASES];
-static int g_patchedBasesCount;
 
-static int ws_is_patched_base(HMODULE base)
-{
-    for (int i = 0; i < g_patchedBasesCount; i++) {
-        if (g_patchedBases[i] == base) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static void ws_note_patched_base(HMODULE base)
-{
-    if (!base || ws_is_patched_base(base)) {
-        return;
-    }
-    if (g_patchedBasesCount < WS_MAX_PATCHED_BASES) {
-        g_patchedBases[g_patchedBasesCount++] = base;
-    }
-    /* 溢出：不再登记（该模块下一轮会被重复遍历一次；`ws_patch_module` 对已经是
-     * 我们钩子的槽位会跳过，因此重复本身无害）。 */
-}
 
 /* LDR_DATA_TABLE_ENTRY prefix, so BaseDllName can be read without relying on the
  * toolchain's winternl.h layout (which omits it). */
@@ -398,6 +420,10 @@ int ws_hook_init(void)
         { (void **)&g_orig.RegEnumValueW, "RegEnumValueW" },
         { (void **)&g_orig.RegEnumKeyExW, "RegEnumKeyExW" },
         { (void **)&g_orig.LdrGetProcedureAddress, "LdrGetProcedureAddress" },
+        { (void **)&g_orig.LdrLoadDll, "LdrLoadDll" },
+        { (void **)&g_orig.NtQueryValueKey, "NtQueryValueKey" },
+        { (void **)&g_orig.NtEnumerateValueKey, "NtEnumerateValueKey" },
+        { (void **)&g_orig.NtQueryKey, "NtQueryKey" },
     };
     for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
         HMODULE order[] = { g_orig.hKernelBase, g_orig.hKernel32, g_orig.hAdvapi32, g_orig.hNtdll };
@@ -411,7 +437,21 @@ int ws_hook_init(void)
         }
     }
     if (g_orig.hNtdll) {
+        /* task-18c: resolve the ntdll query family EXPLICITLY so the 0xC0000002 sentinel can
+         * only mean "ntdll lacks the export", never "we forgot to resolve it". */
+        if (!g_orig.NtQueryValueKey) {
+            g_orig.NtQueryValueKey = (NTSTATUS(NTAPI *)(HANDLE, const void *, ULONG, PVOID, ULONG, PULONG))
+                (void *)GetProcAddress(g_orig.hNtdll, "NtQueryValueKey");
+        }
+        if (!g_orig.NtEnumerateValueKey) {
+            g_orig.NtEnumerateValueKey = (NTSTATUS(NTAPI *)(HANDLE, ULONG, ULONG, PVOID, ULONG, PULONG))
+                (void *)GetProcAddress(g_orig.hNtdll, "NtEnumerateValueKey");
+        }
         g_NtQueryKey = (WsNtQueryKeyFn)(void *)GetProcAddress(g_orig.hNtdll, "NtQueryKey");
+        if (!g_orig.NtQueryKey) {
+            g_orig.NtQueryKey = (NTSTATUS(NTAPI *)(HANDLE, ULONG, PVOID, ULONG, PULONG))
+                (void *)GetProcAddress(g_orig.hNtdll, "NtQueryKey");
+        }
     }
     /* Arm child self-injection (ws_proc.c) with this module's own path. */
     ws_proc_set_self_module(g_selfModule);
@@ -597,7 +637,6 @@ static int ws_patch_all(void)
         modules++;
         patched += ws_patch_module(base);
         /* task-11c：初始全量重扫同样登记集合，后续增量收敛就不会重复处理这些模块。 */
-        ws_note_patched_base(base);
     }
     g_moduleCount = modules;
     return patched;
@@ -645,59 +684,12 @@ static int ws_patch_one(HMODULE base)
                 ws_log("skip provider module (the shim imports from it): %ls",
                        ((WsLdrEntry *)entry)->BaseDllName.Buffer);
             }
-            ws_note_patched_base(base); /* 登记以免每轮重复做名字比较 */
             return 0;
         }
         int patched = ws_patch_module(base);
-        ws_note_patched_base(base);
         return patched;
     }
     return 0; /* not in the loader list (yet): do not patch blind */
-}
-
-/**
- * ── task-11c：LoadLibrary 钩子里的**增量收敛**（O(新增)，不是全量重扫）─────────
- *
- * 调用时机：四个 `LoadLibraryW/A/ExW/ExA` 钩子在真实加载返回之后（`fresh` = 刚加载的模块）。
- * 做两件事：
- *   ① 快路径：补丁 `fresh`（task-11b 的收益，保持）；
- *   ② 增量收敛：走一遍 loader 表，只对**尚未登记**的模块补丁 —— 这条正是恢复
- *      "LdrLoadDll 载入模块也被顺带覆盖"的关键；已登记模块整段跳过，
- *      所以不会退回"每次 LoadLibrary 重扫全部模块"的开销。
- */
-int ws_hook_converge(HMODULE fresh)
-{
-    if (!g_installed) {
-        return 0;
-    }
-    ws_lock_enter(&g_hookLock);
-    int patched = 0;
-    if (fresh) {
-        patched += ws_patch_one(fresh);
-    }
-    PPEB_LDR_DATA ldr = ws_ldr();
-    if (ldr) {
-        ws_collect_self_providers();
-        LIST_ENTRY *head = &ldr->InMemoryOrderModuleList;
-        for (LIST_ENTRY *e = head->Flink; e && e != head; e = e->Flink) {
-            LDR_DATA_TABLE_ENTRY *entry = CONTAINING_RECORD(e, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
-            HMODULE base = (HMODULE)entry->DllBase;
-            if (!base || base == g_selfModule) {
-                continue;
-            }
-            if (ws_is_patched_base(base)) {
-                continue; /* 增量收敛：已打过补丁的模块整段跳过 */
-            }
-            if (ws_is_self_provider(&((WsLdrEntry *)entry)->BaseDllName)) {
-                ws_note_patched_base(base);
-                continue;
-            }
-            patched += ws_patch_module(base);
-            ws_note_patched_base(base);
-        }
-    }
-    ws_lock_leave(&g_hookLock);
-    return patched;
 }
 
 int ws_hook_refresh_module(HMODULE base)
@@ -804,7 +796,6 @@ void ws_hook_remove(void)
     g_siteCount = 0;
     g_installed = 0;
     /* task-11c：撤钩后集合必须清空，否则下次安装会把"已卸载"的基址当成已补丁。 */
-    g_patchedBasesCount = 0;
     ws_lock_leave(&g_hookLock);
 }
 
@@ -848,8 +839,7 @@ HMODULE WINAPI ws_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFl
 {
     HMODULE h = g_orig.LoadLibraryExW(lpLibFileName, hFile, dwFlags);
     if (h) {
-        /* task-11c: 快路径 + 增量收敛（见 ws_hook_converge 的长注释）。 */
-        ws_hook_converge(h);
+        ws_hook_refresh_module(h);
     }
     return h;
 }
@@ -858,7 +848,7 @@ HMODULE WINAPI ws_LoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile, DWORD dwFla
 {
     HMODULE h = g_orig.LoadLibraryExA(lpLibFileName, hFile, dwFlags);
     if (h) {
-        ws_hook_converge(h);
+        ws_hook_refresh_module(h);
     }
     return h;
 }
@@ -867,7 +857,7 @@ HMODULE WINAPI ws_LoadLibraryW(LPCWSTR lpLibFileName)
 {
     HMODULE h = g_orig.LoadLibraryW(lpLibFileName);
     if (h) {
-        ws_hook_converge(h);
+        ws_hook_refresh_module(h);
     }
     return h;
 }
@@ -876,7 +866,7 @@ HMODULE WINAPI ws_LoadLibraryA(LPCSTR lpLibFileName)
 {
     HMODULE h = g_orig.LoadLibraryA(lpLibFileName);
     if (h) {
-        ws_hook_converge(h);
+        ws_hook_refresh_module(h);
     }
     return h;
 }
@@ -897,6 +887,19 @@ NTSTATUS NTAPI ws_LdrGetProcedureAddress(PVOID DllHandle, const void *ProcedureN
                 *ProcedureAddress = rep;
             }
         }
+    }
+    return st;
+}
+
+/* ntdll!LdrLoadDll -- single-module patch of the module this very load returned (task-13). */
+NTSTATUS NTAPI ws_LdrLoadDll(PCWSTR PathToFile, PULONG Flags, const void *ModuleFileName, PHANDLE ModuleHandle)
+{
+    if (!g_orig.LdrLoadDll) {
+        return (NTSTATUS)0xC0000135;
+    }
+    NTSTATUS st = g_orig.LdrLoadDll(PathToFile, Flags, ModuleFileName, ModuleHandle);
+    if (st >= 0 && ModuleHandle && *ModuleHandle) {
+        ws_hook_refresh_module((HMODULE)*ModuleHandle);
     }
     return st;
 }

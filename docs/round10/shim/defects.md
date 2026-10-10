@@ -1,5 +1,37 @@
 # R10-SHIM 缺陷清单（产品缺陷 / 流程缺陷）
 
+> ★ **置顶：三条跨域拦截纪律**（Lead 于 2026-10-10 粘贴，`fileio` 起草；本文件此前不在其写权范围）
+> ① **件里有字符串 ≠ 被挂钩** —— 判"是否挂钩"必须查 `g_targets[]`，不能凭 `strings`/导入表里有该名字下结论；
+> 工具 `.t/round10/fileio/13d-count-probe/check-target-tables.mjs`（可复算静态检查）。
+> ② **wrapper 被调用 ≠ 原函数已解析 ≠ 参数/类分发正确** —— 三者是三件事，必须用**真 status** 区分
+> （例：`0xC0000002` 是自建哨兵、`0xC0000008` 才是 ntdll 对无效句柄的真答复；另有 `WS_KV_PARTIAL` 类常量写错导致"看起来像未实现"）。
+> ③ **门禁全绿 ≠ 已修** —— 窗口 #4/#5 并集门禁全绿（含整仓 `33/0/0`）而 D-R1 读回仍 `0/4`；功能判据必须独立成立。
+> 另两条同族提醒：**档位不是 `TS` 的读数**、**根本没读到数的用例**，都**不得**写成"未命中/未发生"
+> （`13d` 计数的 `not-run` 三因记法即此：换件被拦 + 候选崩载体降 T1 + dump 分支被抑制）。
+
+## D-REG-UNION-DEFAULT（高 · **产品缺陷** · ✅ 已修并采纳）
+
+**现象**：沙箱内 `reg query <KEY>`（**不带 `/v`**，走枚举）输出 **2 B（空）**、退出码 0，而 `reg query <KEY> /v V`（具名读）**78 B 正常** —— 这是窗口 #3–#7 四轮里条件 ③ 的唯一红项（也是 D-R1 定案后剩下的最后一块）。
+
+**根因**：`shim/src/ws_reg.c` 的 **`ws_reg_build_union` 的 values 路径**原为
+```c
+if (rc != 0 || !name[0]) { break; }
+```
+而 **`index 0` 是"空名字的默认值"**（provider 实测 `value_enum(0) status=0 name=""`、`value_enum(1) name="V"`）⇒ **i=0 就 break，把其后的具名值全部挡掉** ⇒ `count=0` ⇒ `RegQueryInfoKeyW` 报 `lpcValues=0` ⇒ `reg.exe` 认为"无值"⇒ **根本不进入枚举** ⇒ 打印空 + exit 0。
+
+**证据链（三段式，可供后人复用）**：
+1. **窗口 #7 pid 归属**：`step2a` = pid 2072/5796/10260/10444（每回合一个），每个仅 `RegQueryInfoKeyW`×2（伪句柄、`ret=0`）+ `RegCloseKey`×1，**`RegEnumValueW`/`RegEnumKeyExW` 命中 = 0**；`replayedBytes`=480/282/678/876 ⇒ **覆盖层确有值**（"空覆盖层/观测窗"假设被证伪）。
+2. **`out-21` 定源**：`REGDBG union kind=values … real=0 index=0 **valid=1 count=0**`（keys 同，属正常无子键）⇒ 缓存建过、**values 类 union 对"值存在且可读"的键产出 0 条**，且未走 real-hive 回退 ⇒ **values 构建没查 `ws_rstore_value_get` 所读的 overlay store**。
+3. **`out-22` 修复**：仅 `rc != 0` 才 break（空名字 keys 仍 break / **values 继续**）+ 硬迭代上限；`union count=1`、`qik lpcValues=1 maxValueLenComputed=26`、`qik-unionfail index=1`（正常结束）、**伪句柄 `RegEnumValueW` 0→4**、`step2a`/`step2b`/`step3` **三者同 sha256 `12aa39d1…972cb`**。
+
+**同源附带（已修）**：`:1889`（原 `:1865`）由"无条件 `*lpcbMaxValueLen = 0`"改为 **写回 `maxValueLen`**（真句柄语义未动）。
+**⚠ 插桩标签失效（非产品缺陷）**：`REGDBG qik` 里的 **`maxValueLenWritten` 是 `out-20` 插桩硬编的 `0ul`**，**不得作为结论依据**；建议 owner 删除该字段或改为读实际 `*lpcbMaxValueLen`（记"待复测"）。
+
+**状态**：**已修并在受控窗口 #8 采纳** —— `shim/out/winstage-shim.dll` = `63808F5188643C085BDC71E86AC843BB8758579938A4CB61781044B93C8A99EB`（257,024 B，`.text 6ec5a5da…`）；四条件 **4/4 PASS**。
+**证据**：`docs/round10/shim/evidence/D66-window8-verdict.md`、`D66-1-swap-timeline.md`、`.t/round10/shim/D70-out21-union-source-readout.txt`、`D71-out22-step2a-green.txt`、`D73-*`、`docs/round10/registry/evidence/fix-r1/arm-window7|8/**`。
+
+---
+
 > 生成 2026-10-08 · teammate `env-harness`（task-10）
 > 分类口径：**产品缺陷** = 被测系统（shim/执行器/审批面）的行为问题；
 > **流程/环境缺陷** = 会让判定失真或被误读的问题（测试夹具、证据链、防护软件等）。
@@ -209,4 +241,91 @@ restricted-token（T1）**，而**暂存面（暂存树/候选）照常工作** 
 ③ 闭环默认 `--keep-stage` 并保留其 WAL。**在修好前，任何窗口/门禁都必须先做一次带 `--keep-stage` 的闭环重跑**，
 否则会在任何 DLL 上误报 2 条红（本轮已实际误导过一次，`D47-2 §9`→§10 撤回）。
 
+---
+
+### ✅ 已修（2026-10-09，owner `registry`，task-14 派生）—— 采 ① + ② 组合
+
+**改了什么**（只改 `tests/registry-conformance.mjs` 一个文件；`tests/*.mjs` 在封印面内，已重封）：
+
+1. **新增"本次探针"谓词** `journalProbeVerdict(journalFile, {runId})`（导出）：
+   解析该 journal，要求存在 `SET_VALUE` 记录 `HKCU\Software\WinstageShimProbe` / `T4Probe`，
+   且（给了 `runId` 时）其 `wireBytes` **逐字节等于** `t4-probe-<本次 runId>\0`（UTF-16LE）。
+   探针常量 `CONFORMANCE_PROBE_KEY` / `CONFORMANCE_PROBE_VALUE` 从 `tools/run-shim-closedloop.mjs:53-54` 提升为单一口径，A.2 的断言也改用它（消灭"选树谓词 ≠ 断言谓词"这个根因）。
+2. **`findStageRoot()` 的每一层都要过这个谓词**（①）：显式 env → runner 记录（按 mtime 取最新）→ `run-*` 的 journal mtime。
+   第 ③ 层**按 journal mtime 降序逐个试到第一个合格为止**（只试"最新的那一棵"就会在"陈旧树更新"时重新退化）。
+   全部不合格 ⇒ 返回 `undefined`，并把每个被拒候选与理由记进 `lastStageRootDiagnostics()`（**不再退回一棵未验证的树**）。
+3. **显式 `DSH_CONFORMANCE_STAGE_ROOT` 不合格 ⇒ 直接抛错**（②）：错误信息 4 段 = 结论 / 指定的树 / 原因（点名"属于别的 run"或"没有 T4Probe 记录"）/ 期望与修法。**不静默通过、不静默假红、不静默回退**。
+4. **A.2 缺产物不再无条件判红**：`DSH_CONFORMANCE_ARTIFACTS=auto`（缺省）⇒ **SKIP**（原因里列出被拒候选）；`required` ⇒ 仍判红。
+   "改了 DLL 没重跑 runner" 这条纪律**不受影响** —— 它由 A.5 用**报告文件** mtime vs DLL mtime 把关，与本 check 无关。
+5. **新增回归断言 S3b（7 条）**：构造受控夹具（`run-current` 含本次 runId 探针 / `run-stale` 探针属旧 run 且 **journal mtime 更新** / `run-noprobe` 无探针记录），断言
+   ①谓词正例通过 ②陈旧树被拒且理由含"别的 run" ③无探针树被拒 ④**陈旧树 mtime 更新也不得胜出** ⑤无合格树返回 `undefined` 不退回未验证树 ⑥显式指向陈旧树**抛错** ⑦显式指向合格树通过。
+
+**验收判据（实测，同一在用 DLL `02C7418F…`，未换件）**：
+
+| 场景 | 读数 |
+|---|---|
+| 机器上**存在 9 棵陈旧 `--keep-stage` 保留树**，`registry-conformance` | **断言 65 项 / 失败 0 / 跳过 1，exit 0** |
+| 同上，`registry-guard` | **断言 385 项 / 失败 0 / 跳过 1，exit 0**（= 原 378/0 基线 + 新增 7 条 S3b） |
+| **显式指向陈旧树** `DSH_CONFORMANCE_STAGE_ROOT=shim\.stage\run-2026-10-08T13-41-27…` | **exit 1**，抛出可诊断错误（"原因：探针记录的数据属于**别的 run**（期望 `t4-probe-2026-10-09T14-36-32-995Z-2ff467`）⇒ 陈旧保树" + 修法） |
+| 选树级前后对照（同一夹具，旧谓词 vs 新谓词） | **旧谓词选中陈旧树 = true；新谓词选中合格树 = true** ⇒ `FIX CONFIRMED` |
+
+**重封后的基线**：`node tools\baseline-sha256.mjs --write` → `--check` **exit 0 / 115 个受封印文件逐条相符**。
+`tests/registry-conformance.mjs` 重封后 sha256 = **`E14685B5AF36F79435966B0F6757B36F31985177BF01CE74D0F01DFFEDAED2D8`**
+（修改前 = `51C9A52D834EA11BAFD370D079410589E2C35E594ECE1200FBC676AACADC1674`，备份在 `.t/round10/registry/fixture-fix-backup/registry-conformance.mjs.orig`）。
+
+**证据**：`docs/round10/registry/evidence/fixture-stageroot/{selector-before-after.txt,conformance-after-stale-present.txt,guard-after-stale-present.txt,explicit-stale-error.txt,baseline-write.txt,baseline-check.txt}`。
+
+**是否影响别的套件**：`registry-guard` 也跑同一批 A.* 判定 ⇒ 一并受益（378→385/0，多出的是 S3b）。其余套件不改动；
+整仓 `autotest` 建议由 Lead 择时复跑确认（本次未跑整仓，避免与并行任务互相影响）。
+
 **证据**：`docs/round10/shim/evidence/D47-2-window3-verdict.md` §9（撤回）/ §10（采信）、`.t/round10/verify/d47-*`。
+
+---
+
+### 补记：显式路径语义 + 一处实现不一致（2026-10-10，`exe` 在窗口 #4 发现，owner `registry` 已修）
+
+**现象（`exe`，单变量 = 只改 `DSH_CONFORMANCE_STAGE_ROOT`）**：
+- **负控制** 显式指向陈旧树 `run-2026-10-08T13-41-27…` ⇒ `exit 1`，诊断正确（期望 = 该报告 runId）✅
+- **正控制（疑点）** 显式指向**最新合格树** `run-2026-10-09T14-36-32-995Z-2ff467` ⇒ **也 `exit 1`**，
+  但期望值变成 **`t4-probe-fixture-run-current`**（我 S3b 夹具的合成 id），报错位置 `:248`/`:522`
+- **默认路径**（不设该变量）⇒ 连续两次 **65/0/1 exit 0** ✅
+
+**定因（两个独立问题，别混为一谈）**：
+
+1. **① 语义问题（不是缺陷）：`DSH_CONFORMANCE_STAGE_ROOT` 的期望语义 = "必须指向**本次 run** 的树"。**
+   依据：A.2/A.3 是把 journal 里探针的**数据字节**与 `report.runId` 比对（`t4-probe-${report.runId}`）——
+   即"本次 run"的定义来自 `closedloop-report.json` 的 `runId`，是**唯一**的期望值来源。
+   ⇒ 显式指向**别的 run** 的树**必然报错，这是设计（fail-closed）**，不是缺陷；若接受"与树自身 runId 自洽"的 journal，
+   就等于把"操作员指错了树"重新变成窗口 #3 那种**双假红**。
+   退化规则：`report` 不存在或无 `runId` 时，谓词退化为"该 journal 含**任一**探针写入"（自洽即可）。
+
+2. **③ 实现不一致（真缺陷，已修）：S3b 夹具继承了外在环境变量。**
+   `findStageRoot()` 内部是 `options.explicit ?? envOr('DSH_CONFORMANCE_STAGE_ROOT','')`；
+   我 S3b 里有两处调用**没传 `explicit`**（原 `:522`/`:526`）⇒ 操作员一旦合法地设了该变量，
+   这两处就被**短路进显式分支**，并被拿去和**夹具自己的** `runId='fixture-run-current'` 比对 ⇒ 抛错。
+   这正好解释 `exe` 看到的 "正控制报错、且期望值是合成 id"：`:367`（用真 `report.runId`）其实**已经过了**，
+   是**后面的 S3b 夹具**把套件打挂的。
+   **修法**：S3b 全部夹具调用钉 `explicit: ''`；并新增回归断言
+   `S3b 回归：夹具选树不受外在 DSH_CONFORMANCE_STAGE_ROOT 影响`（在测试内临时把环境变量设成一个别的 run 的合格树，断言夹具行为不变，再还原）。
+
+**验收（三条各留原始输出，`evidence/fixture-stageroot/pm-affirm-*.txt`）**：
+
+| # | 场景 | 结果 |
+|---|---|---|
+| 1 | 默认（不设变量） | **66/0/1 exit 0** |
+| 2 | 显式 → **本次 run** 的树（构造夹具：取最新真实树的 2 条记录重编码，探针数据改为 `t4-probe-<report.runId>`，journal mtime 新于 DLL） | **66/0/1 exit 0**，A.2 四条全绿（含"WAL 里确实有探针那次写入"） |
+| 3 | 显式 → 陈旧树 | **exit 1**，诊断点名"属于**别的 run**"、给出**期望的本次 runId** `t4-probe-2026-10-09T17-23-10-430Z-64c72c` 与修法 |
+
+**为什么 (2) 要用构造夹具**：当前 `report.runId` 的对应树（`run-…b1c33e`）已被非 `--keep-stage` 的运行删除，
+磁盘上不存在"本次 run 的树"。构造脚本 `.t/round10/registry/harness/make-current-run-tree.mjs`
+（复制最新真实树的记录并重编码探针记录 ⇒ 契约仍然合规；已在输出里注明这是夹具）。
+> ⚠ 踩坑记录：`validateJournalBuffer()` 返回的 `record.wireBytes` 是**该记录的数据载荷**（A.2 就是拿它比 `t4-probe-…\0`），
+> **不是整条记录的序列化字节**；我第一版按"拼接 payload"重建 journal，结果 journal 只剩 1 条记录。正确做法是**重新编码**记录。
+
+**重封（第二次）**：`baseline-sha256 --write` → `--check` **exit 0 / 115 条**。
+`tests/registry-conformance.mjs` = **`B011FA25E569855A07CD6474B1D8D3F80E00B17D9064FA061E323455AB80AFA2`**
+（第一次修复后 `E14685B5…`；原始 `51C9A52D…`）。`registry-guard` = **386/0/1 exit 0**（多出的 1 条即上面的 S3b 回归）。
+
+**给 `exe` 的答复（对应其三问）**：① 采用"必须指向**本次** run 的树"，并在本文档写明这是**设计**而非缺陷；
+② "两处调用点期望不同" = 我的夹具继承环境变量这一实现缺陷，**已修**，现在期望值只有一个来源（`report.runId`）；
+③ 已加回归断言覆盖"显式指向合格树"与"夹具与环境变量无关"两条路径。

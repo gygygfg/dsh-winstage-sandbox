@@ -31,7 +31,7 @@
  *   DSH_CONFORMANCE_STAGE_ROOT=<stage>     # 指定保留了 --keep-stage 的暂存树
  */
 
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -159,61 +159,159 @@ function artifactMode() {
  * 上一版的缺陷（T4 实测）：按**目录名字典序**取第一个带 journal 的 `run-*`，
  * 在保留了多轮历史的机器上会挑到**修复前**的旧 journal ⇒ 对当前 DLL 报出
  * `PATH_IS_BARE_ROOT` 与 `STALE_EVIDENCE`（把旧字节当成新产物评级）。
- * 现在按证据强度依次取：
- *   1. 显式 `DSH_CONFORMANCE_STAGE_ROOT`；
- *   2. runner 自己记下的"最新一次运行"（`closedloop-evidence-latest.json` / `closedloop-report.json` 的 `stageRoot`）
- *      —— 这是**权威**信号：它就是最后一次运行的目录；
- *   3. 所有 `run-*` 里 **journal 文件 mtime 最新**的那个（比目录名/目录 mtime 都更贴近"哪份字节最新"）；
- *   4. 都没有 journal 时，退化成目录 mtime 最新的（只为把"期望路径"写进红 check 的 detail）。
- * ⚠ runner 默认会删除暂存树（只有 `--keep-stage` 保留）⇒ 缺 journal 时提示用 `--keep-stage` 重跑。
+ * 之后改成"按记录文件 mtime / journal mtime 取最新"，但**仍然只要求"该 stageRoot 下有
+ * journal"**。
+ *
+ * ★ D-FIXTURE-STAGEROOT（2026-10-09 修复）：那个判据**不够**。只要机器上存在任何一棵
+ * `--keep-stage` 保留树，而它的 `overlay.journal` mtime 比本次运行的更新（例如它是在更晚的
+ * 时间被保留下来的旧 run），它就会**稳定胜出** ⇒ A.2/A.3 拿**别的 run 的字节**给当前 DLL 评级
+ * ⇒ 在**任何 DLL** 上双假红（本轮已误导致一次结论撤回）。
+ *
+ * 修法：选树谓词与 A.2 的断言谓词**必须同一个** —— "这份 journal 里有没有**本次**探针的写入"
+ * （`HKCU\Software\WinstageShimProbe` / `T4Probe`，取值 `t4-probe-<runId>`）。
+ *   · 有 ⇒ 接受；
+ *   · 没有 ⇒ **拒绝**（不是"接受后再判红"），并把拒绝理由记进 `lastStageRootDiagnostics()`；
+ *   · 显式 `DSH_CONFORMANCE_STAGE_ROOT` 指向不合格的树 ⇒ **直接抛错**（可诊断），
+ *     绝不静默回退到别的树、也绝不静默通过（② 的语义）。
+ *
+ * 取证强度顺序保持不变：1 显式 env → 2 runner 记录（按 mtime 取最新）→ 3 `run-*` 的 journal mtime 最新 → 4 目录 mtime 最新。
+ * 与上一版的唯一区别是**每一层都要过"本次探针"谓词**；都不合格时返回 `undefined`（由调用方按
+ * `DSH_CONFORMANCE_ARTIFACTS` 决定 SKIP 还是判红），而不是退回一棵没验证过的树。
  */
-export function findStageRoot() {
-  const explicit = envOr('DSH_CONFORMANCE_STAGE_ROOT', '')
-  if (explicit) return explicit
-  /* ── 2026-10-08 修复：两个记录文件**按 mtime 取最新**，不再固定 evidence-latest 优先 ──
-   * 实测（docs/round10/shim/报告.md §registry-guard）：A.5 要求"报告必须比 DLL 新"
-   * ⇒ 重新跑 `tools/run-shim-closedloop.mjs` 是**规定动作**；但 runner 默认删除暂存树、
-   * 且**不重写** `closedloop-evidence-latest.json`（只有非 `--keep-stage` 分支写它）。
-   * 旧逻辑固定先读 evidence-latest（上一轮的、指向上一轮 run-* 且那份 journal 仍在）
-   * ⇒ 拿旧 WAL 去比新 `report.runId` ⇒ A.2/A.3 两条假红，且与 A.5 的要求自相矛盾。
-   * 现在按写入时间取最新记录；仍然要求它声明的 stageRoot 下**真的有 journal**
-   * （找不到就继续往证据更弱的来源退，判据不放松）。 */
-  const records = [
-    join(REPO, 'shim', 'out', 'closedloop-evidence-latest.json'),
-    join(REPO, 'shim', 'out', 'closedloop-report.json'),
-  ]
+
+/** 探针写入的规范路径与值名（与 `tools/run-shim-closedloop.mjs:53-54` 同源，不许漂移）。 */
+export const CONFORMANCE_PROBE_KEY = 'HKCU\\Software\\WinstageShimProbe'
+export const CONFORMANCE_PROBE_VALUE = 'T4Probe'
+
+let stageRootDiagnostics = []
+
+/** 上一次 `findStageRoot()` 被拒绝的候选及理由（供调用方写进 SKIP/FAIL 的 detail）。 */
+export function lastStageRootDiagnostics() {
+  return [...stageRootDiagnostics]
+}
+
+/**
+ * 这份 journal 是否含"本次运行"的探针写入。
+ * @returns {{ok: true, record: object} | {ok: false, reason: string}}
+ */
+export function journalProbeVerdict(journalFile, { runId } = {}) {
+  let buffer
+  try {
+    buffer = readFileSync(journalFile)
+  } catch {
+    return { ok: false, reason: `journal 不可读：${journalFile}` }
+  }
+  let verdict
+  try {
+    verdict = validateJournalBuffer(buffer)
+  } catch (error) {
+    return { ok: false, reason: `journal 解析抛错：${error.message}` }
+  }
+  if (verdict.ok !== true) {
+    return { ok: false, reason: `journal 逐字段不合规（${verdict.problems.map((problem) => problem.code).join(',') || 'unknown'}）：${journalFile}` }
+  }
+  const record = verdict.records.find(
+    (entry) => entry.kind === REG_STAGE_KIND.SET_VALUE && parseRegistryPath(entry.path).canonical === CONFORMANCE_PROBE_KEY && entry.valueName === CONFORMANCE_PROBE_VALUE,
+  )
+  if (record === undefined) {
+    return { ok: false, reason: `没有 ${CONFORMANCE_PROBE_KEY} / ${CONFORMANCE_PROBE_VALUE} 的 SET_VALUE 记录 ⇒ 这不是本次探针写出的 WAL：${journalFile}` }
+  }
+  if (typeof runId === 'string' && runId.length > 0) {
+    const expected = Buffer.from(`t4-probe-${runId}\u0000`, 'utf16le')
+    if (!record.wireBytes.equals(expected)) {
+      return { ok: false, reason: `探针记录的数据属于**别的 run**（期望 t4-probe-${runId}，实际 hex=${record.wireBytes.toString('hex').slice(0, 48)}…）⇒ 陈旧保树：${journalFile}` }
+    }
+  }
+  return { ok: true, record }
+}
+
+/**
+ * @param {{explicit?: string, runId?: string, baseDir?: string, recordFiles?: string[]}} [options]
+ *   三个可选注入点只为**可测性**存在（回归断言要能构造受控的树），缺省保持生产行为。
+ */
+export function findStageRoot(options = {}) {
+  const explicit = options.explicit ?? envOr('DSH_CONFORMANCE_STAGE_ROOT', '')
+  const runId = options.runId
+  const baseDir = options.baseDir ?? join(REPO, 'shim', '.stage')
+  const recordFiles = options.recordFiles ?? [join(REPO, 'shim', 'out', 'closedloop-evidence-latest.json'), join(REPO, 'shim', 'out', 'closedloop-report.json')]
+  const rejected = []
+  const journalOf = (root) => join(root, 'registry', 'overlay.journal')
+
+  /* ① 显式指定：只接受"本次探针"树；不合格就**抛错**，不静默回退。 */
+  if (explicit) {
+    const verdict = journalProbeVerdict(journalOf(explicit), { runId })
+    if (verdict.ok === true) {
+      stageRootDiagnostics = []
+      return explicit
+    }
+    stageRootDiagnostics = [`DSH_CONFORMANCE_STAGE_ROOT(显式): ${explicit} -> ${verdict.reason}`]
+    throw new Error(
+      [
+        'D-FIXTURE-STAGEROOT: DSH_CONFORMANCE_STAGE_ROOT 指向的暂存树不合格，拒绝用它给当前 DLL 评级（fail-closed，不静默通过也不静默假红）。',
+        `  指定的树：${explicit}`,
+        `  原因：${verdict.reason}`,
+        '  期望：该树 registry/overlay.journal 含本次运行的探针写入 '
+          + `${CONFORMANCE_PROBE_KEY} / ${CONFORMANCE_PROBE_VALUE}${typeof runId === 'string' && runId ? ` = t4-probe-${runId}` : ''}。`,
+        '  修法：node tools/run-shim-closedloop.mjs --keep-stage（再用它输出的 stageRoot），或清空该环境变量让套件自己选。',
+      ].join('\n'),
+    )
+  }
+
+  /* ② runner 自己记的"最新一次运行"（按记录文件 mtime 取最新）——同样要过探针谓词。 */
+  const records = recordFiles
     .map((file) => ({ file, mtime: fileMtimeMs(file) ?? -1, parsed: jsonIfExists(file) }))
     .filter((entry) => entry.parsed)
     .sort((a, b) => b.mtime - a.mtime)
   for (const entry of records) {
     const root = entry.parsed?.stageRoot
-    if (typeof root === 'string' && root.length > 0 && fileMtimeMs(join(root, 'registry', 'overlay.journal')) !== undefined) return root
+    if (typeof root !== 'string' || root.length === 0) continue
+    const verdict = journalProbeVerdict(journalOf(root), { runId })
+    if (verdict.ok === true) {
+      stageRootDiagnostics = rejected
+      return root
+    }
+    rejected.push(`${entry.file.split(/[\\/]/).pop()}: ${root} -> ${verdict.reason}`)
   }
-  const base = join(REPO, 'shim', '.stage')
+
+  /* ③ 所有 `run-*` 里 journal mtime 最新的**合格**树；④ 都没有时退化成目录 mtime 最新的
+   *    （只为把"期望路径"写进 detail；仍然要被判为不合格，由调用方决定 SKIP/判红）。
+   *    ⚠ 必须**按 journal mtime 降序逐个试到第一个合格的为止** —— 只看"最新的那一棵"然后
+   *    放弃，就正好会在"陈旧树的 journal 更新"这个场景下重新退化成假红（本轮实测踩到过）。 */
   let entries = []
   try {
-    entries = readdirSync(base).filter((name) => name.startsWith('run-'))
+    entries = readdirSync(baseDir).filter((name) => name.startsWith('run-'))
   } catch {
+    stageRootDiagnostics = rejected
     return undefined
   }
-  let bestWithJournal
-  let bestJournalMtime = -1
+  const withJournal = []
   let fallback
   let fallbackMtime = -1
   for (const name of entries) {
-    const dir = join(base, name)
-    const journalMtime = fileMtimeMs(join(dir, 'registry', 'overlay.journal'))
-    if (journalMtime !== undefined && journalMtime > bestJournalMtime) {
-      bestJournalMtime = journalMtime
-      bestWithJournal = dir
-    }
+    const dir = join(baseDir, name)
+    const journalMtime = fileMtimeMs(journalOf(dir))
+    if (journalMtime !== undefined) withJournal.push({ dir, mtime: journalMtime })
     const dirMtime = fileMtimeMs(dir)
     if (dirMtime !== undefined && dirMtime > fallbackMtime) {
       fallbackMtime = dirMtime
       fallback = dir
     }
   }
-  return bestWithJournal ?? fallback
+  withJournal.sort((left, right) => right.mtime - left.mtime)
+  for (let index = 0; index < withJournal.length; index += 1) {
+    const candidate = withJournal[index]
+    const verdict = journalProbeVerdict(journalOf(candidate.dir), { runId })
+    if (verdict.ok === true) {
+      stageRootDiagnostics = rejected
+      return candidate.dir
+    }
+    rejected.push(`shim/.stage 保留树（journal mtime 第 ${index + 1} 新）${candidate.dir} -> ${verdict.reason}`)
+  }
+  if (fallback !== undefined) {
+    rejected.push(`(退化路径，未采用) 目录 mtime 最新的保留树：${fallback}`)
+  }
+  stageRootDiagnostics = rejected
+  return undefined
 }
 
 function fileMtimeMs(file) {
@@ -263,8 +361,10 @@ export async function runRegistryConformanceChecks(harness, options = {}) {
       return false
     }
   })()
-  const stageRoot = options.stageRoot ?? findStageRoot()
+  /* ★ D-FIXTURE-STAGEROOT：先把报告读出来，选树谓词要用**本次 runId**（"journal 里有没有
+   * 本次探针的写入"）—— 这比"有没有 journal"强，是防陈旧保树的唯一可靠判据。 */
   const report = jsonIfExists(REPORT)
+  const stageRoot = options.stageRoot ?? findStageRoot({ runId: report?.runId })
   const tempRoot = mkdtempSync(join(tmpdir(), 'dsh-conformance-'))
   const problemsOf = (result) => result.problems.map((problem) => `${problem.code}${problem.index === undefined ? '' : `#${problem.index}`}`).join(',') || 'none'
 
@@ -372,6 +472,110 @@ export async function runRegistryConformanceChecks(harness, options = {}) {
       check('容差内的"稍旧"不算过期（避免把同一秒内的重跑判红）', validateEvidenceFreshness({ reportMtimeMs: 100, dllMtimeMs: 150, toleranceMs: 100 }).ok === true, 'tolerance respected')
     }
 
+    /* ★ D-FIXTURE-STAGEROOT 回归断言：选树谓词必须与 A.2 的断言谓词同一个
+     *   —— "这份 journal 里有没有**本次**探针的写入"。
+     *   场景：机器上同时存在一棵**合格**树与一棵**陈旧**树，且陈旧树的
+     *   `overlay.journal` mtime **更新**（这正是真实事故的形态：旧 `--keep-stage`
+     *   保树"稳定胜出"）。选树必须拒绝陈旧树；显式指向陈旧树必须**抛错**。 */
+    section('S3b. D-FIXTURE-STAGEROOT：选树谓词 = 本次探针写入（陈旧保树必须被拒绝）')
+    {
+      const fixtureRoot = mkdtempSync(join(tmpdir(), 'dsh-stageroot-'))
+      const runIdNow = 'fixture-run-current'
+      const writeTree = (name, { runId, probeKey = CONFORMANCE_PROBE_KEY, probeValue = CONFORMANCE_PROBE_VALUE, withProbe = true }) => {
+        const dir = join(fixtureRoot, name)
+        mkdirSync(join(dir, 'registry'), { recursive: true })
+        const records = []
+        if (withProbe) {
+          records.push(encodeJournalRecord(journalRecordForOperation({ op: 'create-key', path: probeKey })))
+          records.push(encodeJournalRecord(journalRecordForOperation({ op: 'set-value', path: probeKey, valueName: probeValue, type: 'REG_SZ', value: `t4-probe-${runId}` })))
+        } else {
+          records.push(encodeJournalRecord(journalRecordForOperation({ op: 'set-value', path: 'HKCU\\Software\\UnrelatedProbe', valueName: 'Other', type: 'REG_SZ', value: 'nope' })))
+        }
+        writeFileSync(join(dir, 'registry', 'overlay.journal'), Buffer.concat(records))
+        return dir
+      }
+      try {
+        const fresh = writeTree('run-current', { runId: runIdNow })
+        const stale = writeTree('run-stale', { runId: 'fixture-run-OLD' })
+        const probeless = writeTree('run-noprobe', { runId: runIdNow, withProbe: false })
+
+        /* 陈旧树的 journal mtime 必须**更新**，否则测不到"稳定胜出"那条路径。 */
+        const future = new Date(Date.now() + 60_000)
+        utimesSync(join(stale, 'registry', 'overlay.journal'), future, future)
+
+        const okVerdict = journalProbeVerdict(join(fresh, 'registry', 'overlay.journal'), { runId: runIdNow })
+        check('S3b 正例：含本次 runId 探针写入的 journal ⇒ 接受', okVerdict.ok === true, okVerdict.ok ? `record=${CONFORMANCE_PROBE_VALUE}` : okVerdict.reason)
+        const staleVerdict = journalProbeVerdict(join(stale, 'registry', 'overlay.journal'), { runId: runIdNow })
+        check(
+          'S3b 判否：探针数据属于别的 run ⇒ 拒绝且理由可诊断',
+          staleVerdict.ok === false && /别的 run/.test(staleVerdict.reason),
+          staleVerdict.ok === true ? 'unexpectedly accepted' : staleVerdict.reason,
+        )
+        const noProbeVerdict = journalProbeVerdict(join(probeless, 'registry', 'overlay.journal'), { runId: runIdNow })
+        check(
+          `S3b 判否：没有 ${CONFORMANCE_PROBE_KEY} / ${CONFORMANCE_PROBE_VALUE} 记录 ⇒ 拒绝`,
+          noProbeVerdict.ok === false && /没有 .*T4Probe/.test(noProbeVerdict.reason),
+          noProbeVerdict.ok === true ? 'unexpectedly accepted' : noProbeVerdict.reason,
+        )
+
+        /* NOTE: the fixture calls below MUST pin `explicit: ''`. Without it they inherit
+         * the ambient DSH_CONFORMANCE_STAGE_ROOT, short-circuit into the explicit branch
+         * and get validated against the FIXTURE's runId -- so a perfectly legitimate
+         * explicit path (the current run's tree) made the suite die inside S3b with a
+         * nonsense expectation `t4-probe-fixture-run-current` (found by exe, window #4).
+         * Regression assertion for that leak is the "S3b 与环境变量无关" check below. */
+
+        /* 选择行为：陈旧树 mtime 更新，但**本次探针**在 fresh 树里 ⇒ 必须选 fresh。 */
+        const picked = findStageRoot({ explicit: '', runId: runIdNow, baseDir: fixtureRoot, recordFiles: [] })
+        check('S3b 选树：陈旧保树 journal 更新也不得胜出（必须选含本次探针的树）', picked === fresh, `picked=${picked ?? '<undefined>'} expected=${fresh}`)
+
+        /* 只留陈旧树时 ⇒ 不得静默采纳；返回 undefined 并把理由记进诊断。 */
+        const onlyStale = findStageRoot({ explicit: '', runId: runIdNow, baseDir: join(fixtureRoot, 'nope'), recordFiles: [] })
+        check('S3b 选树：没有合格树 ⇒ 返回 undefined（由调用方按模式决定 SKIP/判红），不退回未验证的树', onlyStale === undefined, `picked=${onlyStale ?? '<undefined>'}`)
+
+        /* ★ 回归：S3b 夹具必须与外在 DSH_CONFORMANCE_STAGE_ROOT **无关**。
+         * 这里故意把环境变量设成一个"合格但属于别的 run"的树：若不隔离，上面两条会被
+         * 环境变量短路并抛错（历史缺陷）；隔离后必须照常通过。 */
+        const ambientBefore = process.env.DSH_CONFORMANCE_STAGE_ROOT
+        try {
+          process.env.DSH_CONFORMANCE_STAGE_ROOT = stale
+          const envIndependent = findStageRoot({ explicit: '', runId: runIdNow, baseDir: fixtureRoot, recordFiles: [] })
+          check(
+            'S3b 回归：夹具选树不受外在 DSH_CONFORMANCE_STAGE_ROOT 影响（历史缺陷：环境变量短路导致正控制也报错）',
+            envIndependent === fresh,
+            `env=stale picked=${envIndependent ?? '<undefined>'} expected=${fresh}`,
+          )
+        } catch (error) {
+          check('S3b 回归：夹具选树不受外在 DSH_CONFORMANCE_STAGE_ROOT 影响（历史缺陷：环境变量短路导致正控制也报错）', false, `threw: ${error.message.split('\n')[0]}`)
+        } finally {
+          if (ambientBefore === undefined) delete process.env.DSH_CONFORMANCE_STAGE_ROOT
+          else process.env.DSH_CONFORMANCE_STAGE_ROOT = ambientBefore
+        }
+
+        /* ② 显式指向陈旚树 ⇒ 必须抛错，且错误信息点名"别的 run"、给出期望本runId 与修法。 */
+        let explicitError
+        try {
+          findStageRoot({ explicit: stale, runId: runIdNow, baseDir: fixtureRoot, recordFiles: [] })
+        } catch (error) {
+          explicitError = error
+        }
+        check(
+          'S3b 显式 DSH_CONFORMANCE_STAGE_ROOT=陈旧树 ⇒ 抛错（fail-closed，不静默通过/不静默假红）',
+          explicitError instanceof Error
+            && /D-FIXTURE-STAGEROOT/.test(explicitError.message)
+            && /别的 run/.test(explicitError.message)
+            && explicitError.message.includes(`t4-probe-${runIdNow}`)
+            && /run-shim-closedloop\.mjs/.test(explicitError.message),
+          explicitError ? explicitError.message.split('\n')[2] ?? explicitError.message.split('\n')[0] : 'no error thrown',
+        )
+        /* 正例：显式指向合格树 ⇒ 原样返回（不因"显式"就一律拒绝）。 */
+        const explicitOk = findStageRoot({ explicit: fresh, runId: runIdNow, baseDir: fixtureRoot, recordFiles: [] })
+        check('S3b 正例：显式指向合格树 ⇒ 接受', explicitOk === fresh, `picked=${explicitOk ?? '<undefined>'}`)
+      } finally {
+        rmSync(fixtureRoot, { recursive: true, force: true })
+      }
+    }
+
     section(`S4. PE 解析器判定力（${dllExists ? '真实 DLL 的内存副本改名' : '无 DLL ⇒ SKIP'}）`)
     let dllInfo
     if (!dllExists) {
@@ -465,14 +669,27 @@ export async function runRegistryConformanceChecks(harness, options = {}) {
         } catch {
           journalBuffer = undefined
         }
-        check(
-          `A.2 DLL 写出的 WAL 在契约路径上（${journalPath ?? '<no stage root>'}）`,
-          Buffer.isBuffer(journalBuffer),
-          journalBuffer
-            ? `${journalBuffer.length} bytes`
-            : `missing; ${legacyLayoutHint(stageRoot)}；runner 默认会删暂存树 ⇒ 用 ` +
-              '`node tools/run-shim-closedloop.mjs --keep-stage` 重跑，或用 DSH_CONFORMANCE_STAGE_ROOT 指定保留的暂存树',
-        )
+        /* ★ D-FIXTURE-STAGEROOT：这里以前**无条件判红**。那正是"机器上留着任何一棵陈旧
+         * `--keep-stage` 树 ⇒ 在任何 DLL 上双假红"的来源之一。现在按模式区分：
+         *   · `required`（或显式设了 stageRoot）⇒ 必须判红（缺产物就是不合格）；
+         *   · `auto`（缺省）⇒ SKIP，并在原因里列出被拒绝的候选与理由，
+         *     调用方据此去 `run-shim-closedloop.mjs --keep-stage`。
+         * "改了 DLL 没重跑 runner" 这条纪律**不受影响**：它由 A.5 用**报告文件** vs DLL 的 mtime 把关
+         * （见 A.5 与 :624），不依赖本 check 是否为红。 */
+        const noRootDiagnostics = lastStageRootDiagnostics()
+        const noRootReason =
+          `missing; ${legacyLayoutHint(stageRoot)}；runner 默认会删暂存树 ⇒ 用 ` +
+          '`node tools/run-shim-closedloop.mjs --keep-stage` 重跑，或用 DSH_CONFORMANCE_STAGE_ROOT 指定保留的暂存树' +
+          (noRootDiagnostics.length > 0 ? `；已拒绝的候选（选树谓词=本次探针写入）：\n      - ${noRootDiagnostics.join('\n      - ')}` : '')
+        if (journalBuffer === undefined && artifactMode() === 'auto' && options.stageRoot === undefined) {
+          skip(`A.2 DLL 写出的 WAL 在契约路径上（${journalPath ?? '<no stage root>'}）`, noRootReason)
+        } else {
+          check(
+            `A.2 DLL 写出的 WAL 在契约路径上（${journalPath ?? '<no stage root>'}）`,
+            Buffer.isBuffer(journalBuffer),
+            journalBuffer ? `${journalBuffer.length} bytes` : noRootReason,
+          )
+        }
         if (Buffer.isBuffer(journalBuffer)) {
           // 与 A.5 同一条纪律，但对象是 **WAL 本身**：journal 比 DLL 旧 ⇒ 这份字节不描述当前产物，
           // 不能拿它给当前 DLL 评级（否则"改了 DLL 没重跑 runner"会被静默判成通过）。
@@ -488,7 +705,7 @@ export async function runRegistryConformanceChecks(harness, options = {}) {
           const verdict = validateJournalBuffer(journalBuffer)
           check('A.2 WAL 逐字段合规（魔数/版本/偏移/reserved/路径可解析/kind-flags 组合）', verdict.ok === true, problemsOf(verdict))
           const probeRecord = verdict.records.find(
-            (record) => record.kind === REG_STAGE_KIND.SET_VALUE && parseRegistryPath(record.path).canonical === 'HKCU\\Software\\WinstageShimProbe' && record.valueName === 'T4Probe',
+            (record) => record.kind === REG_STAGE_KIND.SET_VALUE && parseRegistryPath(record.path).canonical === CONFORMANCE_PROBE_KEY && record.valueName === CONFORMANCE_PROBE_VALUE,
           )
           check(
             'A.2 WAL 里确实有探针那次写入（HKCU\\Software\\WinstageShimProbe / T4Probe / REG_SZ）',

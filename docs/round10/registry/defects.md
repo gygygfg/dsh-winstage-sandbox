@@ -10,6 +10,53 @@
 
 ---
 
+## D-R10-enum / D-R12（条件 ③：`reg query <key>` 不带 `/v` 枚举打印为空）—— ✅ **结案**（2026-10-10，窗口 #8）
+
+**归属**：`shim/src/ws_reg.c` 的 **`ws_reg_build_union` values 路径**（在**空名默认值**处 `break`）——
+**不是**枚举钩子未装、**不是** ntdll 直调面、**不是** 打开路径、**不是** provider（D-R11 早已撤回）。
+
+### 三段式定因链（供后人复用）
+
+**第 1 段 · 窗口 #7：把"哪一步、哪个 pid"钉死（取代推断）**
+- `step2a` = **pid 2072 / 5796 / 10260 / 10444**（每回合一个；`pid 7628` 是另一辅助进程：`tier=1`、`replayedBytes=0`、零 `REGDBG`、从未做注册表调用）。
+- 四者 `replayedBytes` = **480 / 282 / 678 / 876**（`applied=5`、`tier=3`、`viewIncomplete=0`）⇒ **覆盖层确有值**，"空覆盖层/观测窗"假设**被证伪**。
+- `step2a` 跑在两次写之后、同一会话同一 stage root；命令 `reg query "%KEY%" > step2a.txt 2>&1` **已收 stderr**，而文件**仅 2 B** ⇒ **开成功、无错、无输出**。
+- 伪句柄句柄量级普查：`RegQueryInfoKeyW` ×8、`RegCloseKey` ×24、**`RegEnumValueW`/`RegEnumKeyExW` = 0** ⇒ `reg.exe` 未走到枚举 ⇒ 被 `RegQueryInfoKeyW` 告知"没有值"。
+- **join 纪律**：按 `canonical=`（只有 `/v` 路径才写）取 hKey 再 join **结构上看不到 `step2a`**；那 8 个 pid 实为 **7 个 `/v` 读者 + 1 个写者**（`pid 7612` `replayedBytes=0` = `reg add /f` 的预读）。⇒ **按 pid 关联或按句柄量级分类**；**句柄要按数值分类（`%p` 定宽，不能按字符串长度）**。
+
+**第 2 段 · `out-21`：把"计数为 0"定源**
+- 插桩 `ws_query_info_key_inner` 的 values 循环 ⇒ `union count=0`（即 `ws_reg_build_union` 在 **index 0** 就返回失败）。
+- 结合第 1 段 ⇒ `valueCount` 停在 0 ⇒ `lpcValues=0` ⇒ `reg.exe` 不枚举。
+
+**第 3 段 · `out-22`：修 `break`，并以机制级计数证实**
+- `qik`：**`lpcValues` 0 → 1**、`maxNameLen=4`、`maxValueLenComputed=26`；
+- `qik-unionfail`：**`index` 0 → 1**（0 是"i=0 取不到"的致命点；1 是**正常枚举结束**）；
+- 伪句柄 `RegEnumValueW`：**0 → 4**（四个 `step2a` 子进程各一次）；
+- 窗口 #8 四条件 **4/4 PASS**，`step2a` 78 B 且与 `step2b`/`step3` **同一 sha256** `12AA39D1F31AF899C625CDB0D7DB384F86F394262801252D5334FADE863972CB`。
+
+### 判据技巧（本轮沉淀）
+
+1. **"枚举打印为空"与"值读不回"必须分开测**：`step2a`（不带 `/v`）走枚举、`step2b`（带 `/v`）走单值查询；两者一起跑才能把"枚举面"从"值面"里剥出来。
+2. **优先看插桩的机制计数**，而不是只看两个输出是否相等：`lpcValues` 0→1、伪句柄 `RegEnumValueW` 0→4 才是真正的因果证据。
+3. **免换件同层 override 可用于取日志读数**：只设 `WINSTAGE_SHIM_DLL`（不设 `_DIR`，injector/probe 仍取已证件）+ `step2a-min.cmd`，可在**不开窗口**的情况下拿到 `qik`/`union` 两行；`exe` 用它得到的 `step2a` 哈希与窗口内**完全一致**，构成两条独立路径互证。
+4. **陈旧/构造性插桩字段不得当作结论**：`maxValueLenWritten` 是硬编 `0ul` 的标签（见下）。
+
+**`maxValueLenWritten` 一条：已复测闭环（`pkgs` 的 `out-22b`，2026-10-10）**
+
+记法（按实测，不夸大）：**「插桩标签缺陷（已修正）；实测值 0 = 调用方未请求该字段；产品发布路径已修并被窗口 #8 采纳；此处无残留产品缺陷」**。
+
+- **标签修正**：`out-22b`（`9B0C6188ED88460D93CE9999466175B21E35AA60973A45616EC93B0555EC15C1` / 257,024 B；**仅标签、零语义、诊断件、不替换 `shim/out`**）把 `qik` 的 `maxValueLenWritten` 由硬编 `0ul` 改成 `lpcbMaxValueLen ? *lpcbMaxValueLen : 0ul`。
+- **实测（同入口、只 override `WINSTAGE_SHIM_DLL`、免换件；门禁 `applied=5 bytes=480 rc=0`、`self=…out-22b…ok=1`）**：`REGDBG qik … lpcValues=1 maxNameLen=4 maxValueLenWritten=0 maxValueLenComputed=26`（两次一致）；`REGDBG union kind=values … valid=1 count=1`；`step2a`/`step2b` 各 **78 B**、sha256 **`12AA39D1…72CB`**，**与窗口 #8 完全一致** ⇒ 证明该标签改动**无语义影响**。
+- **判读**：标签现在真实反映"实际写回值"，**仍为 0** ⇒ 最可能是**调用方（`reg.exe`）对该字段传 `NULL`**（不请求 MaxValueLen），此时写回 0 正是"**未请求**"的正确语义。
+- **限制（如实记录）**：单条日志**无法区分**"指针为 NULL"与"指针被写成 0"；要彻底闭环需再加 `maxValueLenPtr=%d`（**未做**，按实测上报）。
+- **产品侧已正确**：`ws_reg.c` 现为 `if (lpcbMaxValueLen) *lpcbMaxValueLen = maxValueLen;`（原 `:1865` → 今 `:1889`），即窗口 #8 采纳的 `out-22` 修复。
+
+**关键纪律（仍成立）**：**不得**用 `out-20` 那份硬编 `0ul` 的旧读数作为"`*lpcbMaxValueLen` 发布值有误"的证据 —— 它只证明那个插桩字段没读真实值。
+
+证据：`pkgs` 的 `.t/round10/shim/D74-out22b-label-fix.txt`。
+
+---
+
 ## D-R10【高 · 归属 `shim/src/ws_reg.c`（owner: `env-harness`）】伪句柄直通真实 API ⇒ 覆盖层里**已存在的键**读值时 `ERROR_INVALID_HANDLE(6)`
 
 **判定**：**未修复** · 本域只交付定因证据与代码路径；`ws_reg.c` **不在本任务写范围**，Lead 已派 owner。
@@ -51,6 +98,44 @@ RESULT readseeded key_resolve=0 key_open=0 key_exists=1 value_get=0
 **待查点**：为什么对"覆盖层里确实存在"的键（`flags=STAGED|EXISTS`），`:958` 的 `ws_reg_read_ctx` 仍解析失败／`canServe` 仍为假。
 **建议最小单变量定位**：在 `:958` 前后各打一行，输出 `read_ctx` 返回值、`isPseudo`、`isBareRoot`、`canonical`。
 
+### 10.3b 窗口 #4 追加定因：**task-17 只修了一个函数，同族三个"读类"函数仍在直通伪句柄**（2026-10-10）
+
+窗口 #4（候选 `out-15` `17825DF4F255B72BFE6091CC4B937E70DC44AE11FEDFEB399C9363EAC0FD76E9`）**复现同一签名**：
+`replayedBytes>0` ✅（`0,170,282,368,480,566,678,764,876`）、`self=` 正确、`DLL_HASH_STABLE_DURING_RUN=True`（无中途回滚），
+但四回合 `query-value-exit=1` / `query2-value-exit=1`，**`ERROR: The handle is invalid.` × 8**。
+
+此时 `shim/src/ws_reg.c` **已经**含 task-17 的修复（`:958-987`：`!canServe && isPseudo` 时用 `ws_pseudo_key_path`
+取回 canonical 并置 `canServe=1`；`!canServe` 且 `isPseudo` 时 **fail-closed 返回 `ERROR_FILE_NOT_FOUND`**，不再直通）。
+**但该修复只作用于 `ws_query_value_ex` 一个函数**，同族三处仍是老代码：
+
+| 行 | 函数 | 现状 |
+|---|---|---|
+| `:1464-1466` | `ws_query_info_key_inner`（`RegQueryInfoKeyW`） | `if (!ws_reg_read_ctx(…) \|\| isBareRoot) return g_orig.RegQueryInfoKeyW(hKey, …)` ⇒ **伪句柄直通** |
+| `:1550-1552` | `ws_enum_value_inner`（`RegEnumValueW`） | 同上 ⇒ 伪句柄直通 |
+| `:1635-1637` | `ws_enum_key_ex_inner`（`RegEnumKeyExW`） | 同上 ⇒ 伪句柄直通 |
+| `:1474` / `:1558` / `:1643` | 同三者的 `!isPseudo && !overlay_has_key` 分支 | 有 `!isPseudo` 保护，**没问题** |
+| `:679`（`:695` 注释） | `ws_RegOpenKeyExW` | 已 "forward by PATH, never with the pseudo handle"，**没问题** |
+
+**这解释了窗口 #3/#4 的每一个表征**：
+1. `query-value-exit=1` + `ERROR: The handle is invalid.` —— `reg.exe /v V` 会先调 `RegQueryInfoKeyW`（探测值是否存在/取长度）⇒ 撞 `:1464` ⇒ **`ERROR_INVALID_HANDLE(6)`**。
+2. **`step2a` 为空但 `query-key-exit=0`** —— 不带 `/v` 的 `reg query <key>` 走 `RegEnumKeyEx`/`RegEnumValue` ⇒ 撞 `:1550`/`:1635` ⇒ 枚举 0 项 ⇒ **打印空、退出码 0**（不是"键里没值"，是**枚举也被打挂**）。
+
+**修法（给 owner）**：把 task-17 在 `:966-984` 的那套（`ws_pseudo_key_path` 取回 canonical + `!canServe && isPseudo` 时 **fail-closed，绝不直通**）
+抽成一个共用小函数，应用到 `:1464` / `:1550` / `:1635` 三处。
+
+**独立交叉验证（`exe`，同一件 `out-15`）**：他自建的**离线**双进程探针（LoadLibrary + **真实 `RegQueryValueExW`**，A 写 / B 读，**先删掉 app hive 只留 journal**）
+取到 **`ERROR_SUCCESS` + `written-by-A`**；基线 `02C7418F…` 取到 `RegOpenKeyExW rc=2`、`out-13c` 取到 `LoadLibraryW=NULL err=1114`。
+⇒ **回放侧与加载侧都无问题**，失败点在**沙箱内的伪句柄读路径**，与本节定因一致。
+
+**下一候选（建议 `out-16`）验收口径**：四回合 `query-value-exit=0` **且** `query2-value-exit=0` **且** `step2a` **非空**（枚举能看到值）**且** `replayedBytes>0`。
+前三者缺一即说明读路径仍有未修的伪句柄直通点。
+
+**另（重要经验，`exe` 提供）**：窗口 #4 内**并集门禁全绿**（closedloop 30/30、`registry-guard` 385/0、`registry-conformance` 65/0、
+`registry-unstaged-wow64` 36/0、delete-capture 36、file-cow 19/19、boundary 62/0、整仓 autotest **33/0/0 · 2076 ok/0 bad**）
+**却仍然 `query-value-exit=1`** ⇒ **没有任何门禁能替代"读回"判据**；此点必须写进下一轮验收清单。
+
+**证据**：`evidence/fix-r1/arm-window4/{WINDOW-PROVENANCE.txt,transcripts,logs,wal}`（跑前/跑后钉哈希均为 `17825DF4…`）。
+
 ### 10.4 判据纪律（本轮踩过的坑，务必沿用）
 
 | 量 | 是不是"读回成功"的判据 | 理由 |
@@ -64,6 +149,89 @@ RESULT readseeded key_resolve=0 key_open=0 key_exists=1 value_get=0
 **归因纪律**（Lead 已采纳）：这是**既有**缺陷，由 D-R1 的修复**首次暴露**；修复前该键不可见，走不到这段代码。因此 `out-r2` 判"仍未修"是准确的，但**待修对象是 `ws_reg.c`**。
 
 **交接物**：`evidence/fix-r1/offline/readseeded-decisive-b.txt` + `evidence/fix-r1/arm-window/{transcripts,logs,wal}`。
+
+---
+
+## D-R11【❌ 已撤回 · **我方夹具假阳性**，非产品缺陷】~~`ws_rstore_value_enum` 看不到 `ws_rstore_value_get` 能看到的值~~
+
+> **⚠ 本条已撤回（2026-10-10，撤回者 `registry` 本人）。它不是产品缺陷，请勿据此修改 `shim/src/ws_regstore.c`。
+> 保留在案只为防止后人重犯同一种错误。根因与正确读数见 §11.0；原文保留在 §11.1 以下（已作废）。**
+
+### 11.0 撤回原因与正确读数（**以本节为准**）
+
+**根因**：我的离线 harness 的**桩层**只填了 8 个 `g_orig.Reg*`
+（`RegCreateKeyExW`/`RegOpenKeyExW`/`RegSetValueExW`/`RegQueryValueExW`/`RegDeleteKeyW`/`RegDeleteValueW`/`RegCloseKey`/`RegEnumKeyExW`），
+**漏填了 `RegEnumValueW`（以及 `RegQueryInfoKeyW`）** ⇒ `g_orig.RegEnumValueW == NULL`
+⇒ 我观测到的 `value_enum(0) status=1` 是**无效读数**，与 `ws_rstore_value_enum` 的真实行为无关。
+**这是夹具缺陷（与 D-R6 同类），不是产品缺陷。**
+
+**补全桩层后的正确读数**（同一 journal 876 B、同一进程、同一把键）：
+```
+diagseed: value_get(V) status=0 bytes=26
+diagseed: value_enum(0) status=0 name=""      <- 默认值（空名），正确
+diagseed: value_enum(1) status=0 name="V"     <- 探针值正常枚举出来
+diagseed: value_enum(2) status=1              <- 枚举正常结束
+diagseed: key_resolve=0 flags=17
+```
+⇒ **provider 的 `get` 与 `enum` 是一致的**；"`get(name)` 成功 ⟺ 该 name 出现在 `enum` 里"这条断言**成立（绿）**。
+
+**净影响**：受影响的**只有"基于 enum 的结论"**。`value_get`/回放/AFTER/C1/C2/C3、以及窗口 #3/#4/#5 的四条件读数
+**全部照旧有效**（它们走的是 `RegQueryValueExW`，该指针本来就在桩里）。
+窗口 #5 条件 ③（`step2a` 为空）**改归因**：不是 provider 枚举，而是 **D-R10 那一族的钩子层路径**
+（`reg query <key>` 不带 `/v` 会先调 `RegQueryInfoKeyW`、再走 `RegEnumValueW`/`RegEnumKeyExW`，
+而这四个 API 正是 `out-16` 里**唯一没有 REGDBG 插桩的**）。
+⇒ **四条件之红大概率同源于 D-R10 一族**，provider 无须改动。
+
+**纪律教训（建议纳入新一轮清单）**：离线 harness 的 `g_orig` **必须覆盖被测 API**；
+凡是调用 `g_orig.X` 而 X 未被桩层填充的读数**一律无效**——必须先证明"桩已覆盖"再报数。
+
+**证据**：`evidence/fix-r1/tier3-timing/{case2-enum-vs-get-WITHDRAWN.txt,case2-enum-vs-get-CORRECTED.txt,control-apphive-enum.txt}`。
+
+---
+
+<details><summary>以下为**已作废**的原始条目（保留存档）</summary>
+
+### 11.1 现象（同进程 / 同 hive / 同键，一次运行内同时取两路读数）
+
+`.t/round10/registry/harness/r1harness.exe diagseed <seededTree>`（journal 876 B，replay `applied=9 bytes=876 rc=0`）：
+```
+diagseed: journal=…\overlay.journal bytes=876
+diagseed: attach status=0
+diagseed: per-process hive …\overlay.<pid>.hive exists=0
+diagseed: value_get(V) status=0 bytes=26      ← 值在
+diagseed: value_enum(0) status=1 name=""      ← 枚举说"没有了"（1 = NO_MORE_ITEMS）
+diagseed: key_resolve=0 flags=17              ← STAGED|EXISTS
+```
+⇒ **同一把键、同一进程：`get` 拿得到值，`enum` 一个都列不出来。**
+
+### 11.2 排除"app hive 不支持枚举"（关键对照）
+
+`RegLoadAppKeyW`+`REG_PROCESS_APPKEY` 的 app hive **完全支持** `RegEnumValueW` ——
+纯 Win32 对照程序 `.t/round10/registry/harness/apphive-enum.c`（**不含任何 shim 代码**）自建 hive 后：
+```
+[B] RegEnumValueW(0) on create-handle   status=0 name="V"
+[B] RegEnumValueW(1) on create-handle   status=0 name="W"
+[C] RegEnumValueW(0) on reopened-handle status=0 name="V"     ← 重新打开也枚举得到
+[D] RegEnumValueW(0) KEY_READ-only      status=0 name="V"
+```
+⇒ 平台不背这个锅；**是 provider 的枚举路径本身看不到值**。
+
+### 11.3 影响
+
+- **`reg query <key>`（不带 `/v`）会打印空、退出码 0** —— 这正是受控窗口 #5 四条件之 ③ `step2a` 为空；
+  用户看到的是"这个键没有值"，而 `query-value` 那条路又因伪句柄缺陷（D-R10）失败 ⇒ **"写成功却什么都不显示"**。
+- 任何依赖枚举的消费方（列出暂存值的 UI、按值遍历的净变化/白障计算、安装器式遍历）都会**看不到已暂存的键值**。
+- 与 D-R10 是**两个独立的读路径缺陷**（一个在钩子层伪句柄，一个在 provider 枚举），**可叠加**。
+
+### 11.4 修法方向（给 owner）
+
+让 `ws_rstore_value_enum` 与 `ws_rstore_value_get` **同源**：要么复用 `get` 的打开/取数路径，
+要么直接**以 journal 为准**枚举（设计原则本就是"journal 是事实，hive 只是物化"——见 D-R1 修复 §2）。
+并加一条**两者必须一致**的回归断言：对已回放的 hive，`get(name)` 成功 ⟺ 该 name 出现在 `enum` 结果里。
+
+**证据**：`docs/round10/registry/evidence/fix-r1/tier3-timing/{case2-enum-vs-get.txt,control-apphive-enum.txt}`。
+
+</details>
 
 ---
 
@@ -192,11 +360,21 @@ D-R8 **不是** D-R1 引入的：D-R1 的实现缺陷只是**恰好把 `DllMain`
 
 ## D-R1【高】"写成功 → 立刻读不回来"：共享覆盖 hive 一失手就换成**逐进程私有 hive**，而私有 hive 覆盖了读路径
 
+> **✅ 状态更新（2026-10-10，受控窗口 #6）：D-R1 已修并端到端验证（跨进程读回成立）。**
+> 候选 `out-18b` = `8FEAB38D89ED372BD891A2A017575D5B81C86C0199DCA3F7C11EE784FDB82D66`（253,440 B）换入 `shim/out`，
+> 经**官方入口** `sbx-thread` 跑四回合（`exe` 执行换件、我执行测量；跑前=跑后钉哈希一致、`self=…\shim\out\winstage-shim.dll ok=1`）：
+> **四回合每回合 `query-value-exit=0` 且 `query2-value-exit=0`**，`reg query … /v V` 逐字打印
+> `V    REG_SZ    written-by-A` —— **前一个进程写、后一个进程读回，逐字节成立**。
+> 窗口 #3/#4/#5 连续三轮的读回红项**全部消失**。⇒ **D-R1 的"写成功→读得回"目标达成。**
+> 四条件合计 **3/4**：①②④ 绿，③（`reg query <key>` **不带 `/v`** 的枚举面仍打印空）仍红 ——
+> 该残留**不是** D-R11/provider（那条已撤回），归属见 `exe` 的 `docs/round10/shim/evidence/D61-window6-verdict.md`
+> 与下一轮待办 `D-R10-enum`/`D-R12`。原始件：`evidence/fix-r1/arm-window6/**`（含逐字 transcript 与 `step2a`=2 B vs `step2b`=78 B 的反差）。
+>
 > **状态更新（2026-10-09）**：根因不变；**修复已实现**（journal 回放 + 会话级 fallback hive），
 > 且修复过程中发现并修掉了**我自己实现的一个缺陷**（回放在 `g_orig` 就绪前调用它 ⇒ DllMain 抛错）——
 > 详见 [`修复-D-R1.md`](./修复-D-R1.md) §2 / §5.4。修复前的原始 42%/79% 与 12/12 读数保持原样。
 
-**判定**：**根因未修复（源码自认为"契约等价"，`shim/src/ws_t3reg.c:232`）；修复补丁已交付待集成**
+**判定**：**✅ 已修复，并在受控窗口 #8 端到端验证通过 + 已采纳**（`shim/out` 现为 `63808F5188643C085BDC71E86AC843BB8758579938A4CB61781044B93C8A99EB`/257,024 B；窗口 #8 四条件 **4/4 PASS**，含条件 ③ 枚举面）。原始"根因未修复"判定见下方归档；修复过程与候选沿革见 [`修复-D-R1.md`](./修复-D-R1.md) §5.2.3–§5.3c。
 
 ### 现象（同一沙箱会话、同一条 `reg.exe` 通道、跨进程）
 
@@ -425,6 +603,17 @@ rec43 HKLM\SOFTWARE\WSTestR10Net32
 ---
 
 ## D-R6【低 · 探针侧，非产品缺陷】我的探针缺陷（已修，存证以免误判为产品问题）
+
+0. **★ 离线 harness 桩层漏填 `g_orig.RegEnumValueW`（2026-10-10，导致 D-R11 假阳性）**
+   —— 我的 `harness.c` 桩层只填了 8 个 `g_orig.Reg*`（`RegCreateKeyExW`/`RegOpenKeyExW`/`RegSetValueExW`/
+   `RegQueryValueExW`/`RegDeleteKeyW`/`RegDeleteValueW`/`RegCloseKey`/`RegEnumKeyExW`），
+   **漏了 `RegEnumValueW` 与 `RegQueryInfoKeyW`** ⇒ `g_orig.RegEnumValueW == NULL`
+   ⇒ 基于枚举的读数**全部无效**，我据此报出的 **D-R11 是假阳性**（已撤回，见该条 §11.0）。
+   修法：桩层补齐 `g_orig.RegEnumValueW = RegEnumValueW;` / `g_orig.RegQueryInfoKeyW = RegQueryInfoKeyW;`；补齐后枚举读数正确
+   （`value_enum(0) name=""`、`value_enum(1) name="V"`、`value_enum(2) status=1`）。
+   **影响面**：仅"基于 enum 的结论"；走 `RegQueryValueExW` 的回放/AFTER/C1/C2/C3 与窗口 #3/#4/#5 四条件读数**不受影响**。
+   **纪律**：离线 harness 的 `g_orig` **必须覆盖被测 API**；凡调用 `g_orig.X` 而 X 未被桩层填充者，读数一律无效 —— 先证明"桩已覆盖"再报数。
+   **证据**：`evidence/fix-r1/tier3-timing/{case2-enum-vs-get-WITHDRAWN.txt,case2-enum-vs-get-CORRECTED.txt}`。
 
 1. **批处理 `:label` 里用 `%*`**：`%*` 在 `call :label` 内仍展开**原始 `%0..%9`** ⇒ 把标签自身当程序执行，
    首轮 `run-burst` 步骤 1–15 全 `exit=9009`（`'"A1_read_control_…" is not recognized …'`）。

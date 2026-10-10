@@ -225,8 +225,182 @@ RESULT readseeded key_resolve=0 key_open=0 key_exists=1 value_get=0
 
 **对 BEFORE 候选（`out-r1`/`out-cur`/`out-13c`）**：**仍失**，且已定因为**候选自身缺陷**（见 §5.2.2，非"方向错"）。
 
-**下一轮**：候选由 `env-harness` 出（`ws_reg.c` 修复 + 我的 D-R1 源码合并；建议命名 `out-r3` 并记录 `.text` 代码身份）。
+**下一轮**：候选由 `env-harness` 出（`ws_reg.c` 修复 + 我的 D-R1 源码合并；建议命名 `out-16` 并记录 `.text` 代码身份）。
 我只需在窗口内跑四回合 `r1-repro`，判据 **`query-value-exit=0` 且 `replayedBytes>0`**，**不需要**重建候选。
+
+#### 5.2.4 受控窗口 #4：候选 `out-15` **仍未修**，并定位到 `ws_reg.c` 的**另外三个函数**
+
+`exe` 换入 `out-15` = `17825DF4F255B72BFE6091CC4B937E70DC44AE11FEDFEB399C9363EAC0FD76E9`（251,392 B），
+我在窗口内跑四回合（`evidence/fix-r1/arm-window4/**`）：
+
+| 项 | 读数 |
+|---|---|
+| 哈希门禁 | `BEFORE = EXPECTED = 17825DF4…`；`AFTER` 同值 ⇒ `DLL_HASH_STABLE_DURING_RUN=True`（**无中途回滚**） |
+| `self=` | `…\shim\out\winstage-shim.dll ok=1` |
+| **`replayedBytes>0`** | ✅ `0,170,282,368,480,566,678,764,876` |
+| `query-key-exit` | **0**（键可见；`step2a` 输出为空） |
+| **`query-value-exit` / `query2-value-exit`** | **1 / 1**（四回合一致） |
+| 错因 | **`ERROR: The handle is invalid.` × 8** |
+| **结论** | **仍未修（read-back 0/4）** —— 与窗口 #3 **同一签名** |
+
+**追加定因（本轮最有价值的一条）**：`out-15` 里 `ws_reg.c` **确实已含 task-17 修复**（`:958-987`），
+但**只修了 `ws_query_value_ex` 一个函数**；同族三处仍在把伪句柄直通 advapi32 ——
+`:1464-1466`（`RegQueryInfoKeyW`）、`:1550-1552`（`RegEnumValueW`）、`:1635-1637`（`RegEnumKeyExW`）。
+这同时解释了两个表征：`/v V` 读值撞 `RegQueryInfoKeyW` ⇒ `ERROR_INVALID_HANDLE(6)`；
+不带 `/v` 的 `reg query <key>` 撞枚举 ⇒ **0 项 + 退出码 0（`step2a` 为空）**。
+详见 [`defects.md` D-R10 §10.3b](./defects.md)（含修法：把那套 `ws_pseudo_key_path` 取回 + fail-closed 抽成共用函数，应用到三处）。
+
+**`exe` 的独立交叉验证**（同一件 `out-15`，离线双进程 + 真实 `RegQueryValueExW`）：取到 **`ERROR_SUCCESS` + `written-by-A`**
+⇒ 回放侧与加载侧都无问题，失败点确在沙箱内的伪句柄读路径，与上述定因一致。
+
+**下一候选（`out-16`）验收口径（四者必须同时成立）**：
+① 四回合 `query-value-exit=0` ② 四回合 `query2-value-exit=0` ③ **`step2a` 非空**（枚举能看到值）④ `replayedBytes>0`。
+①③ 缺一即说明读路径仍有未修的伪句柄直通点。
+
+**⚠ 一条必须写进下一轮清单的经验**：窗口 #4 内**并集门禁全绿**（closedloop 30/30、`registry-guard` 385/0、
+`registry-conformance` 65/0、`registry-unstaged-wow64` 36/0、delete-capture 36、file-cow 19/19、boundary 62/0、
+整仓 autotest **33/0/0 · 2076 ok/0 bad**）**却仍然 `query-value-exit=1`**
+⇒ **没有任何门禁能替代"读回"判据**；门禁全绿不等于 D-R1 已修。
+
+**窗口 #4 收尾（`exe` 广播）**：`shim/out` 已回滚 `02C7418F…`/246,784 B，inject/probe 未覆盖，`baseline --check` exit 0/115，
+回滚后 `registry-conformance` 65/0/1 exit 0。我的 runner 表现合格（哈希硬门禁拦住错件、逐回合判据解析、AFTER 同值）。
+
+#### 5.2.5 受控窗口 #5（`out-16` `06B2D381…`）：四条件 **0/4**，并缩小到两个独立读路径缺陷
+
+| # | 条件 | 读数 |
+|---|---|---|
+| — | 哈希门禁 | `BEFORE = EXPECTED = AFTER = 06B2D3816684E407DA3C31D32220BF7838A85F86462102137AE5A93201919D2C`（无中途回滚）；`self=…\shim\out\winstage-shim.dll ok=1` |
+| ① | `query-value-exit=0` ×4 | **1 / 1 / 1 / 1** ❌ |
+| ② | `query2-value-exit=0` ×4 | **1 / 1 / 1 / 1** ❌ |
+| ③ | `step2a` 非空 | **空**（2 B = 仅 CRLF）×4 ❌ |
+| ④ | `replayedBytes>0` | ✅ `0,170,282,…,876` |
+| — | 错因 | `ERROR: The handle is invalid.` × 8 |
+
+**`REGDBG`（`out-16` 内建插桩）的运行时事实**：对探针键 `HKCU\Software\WSTestR10DR1`，**8 个读子进程逐个**都是
+`ctxOk=1 isPseudo=1 isBareRoot=0 canServe=1` + `branch=ctx-recovered`；全日志 `branch=` 仅 `PASSTHROUGH=7316` / `ctx-recovered=8`；
+每个读子进程都 `hooks installed: 75 IAT sites across 9 modules (… reg=on)`；**8 个读者全部 tier=3**（`BOTH shared hives unusable (32/32)`）。
+⇒ **task-17 的修复路径确实执行了、钩子确实装上了** —— 失败点不在"没拦到"，而在"拦到之后仍读不回"。
+
+### 5.3 时序疑点闭环（Lead 正交合查项）：journal 长度**不会**落后，`real-open err=2` **不是**竞态
+
+**最小复现**（离线、两进程、真实源码；`harness/r1harness.exe`）：
+
+| 步骤 | 读数 |
+|---|---|
+| A（写者）attach | `tier=1`，`replayedBytes=0` |
+| A 写 | `materialize=0 value_set=0 same_process_get=0` |
+| **A 落盘后 journal 字节** | **194** |
+| B（读者）attach | **`applied=2 bytes=194 rc=0`** ⇒ **恰好等于 A 落盘后的 journal 长度** |
+| B 读 | `value_get status=0 bytes=24 "written-by-A"`；`key_resolve=0 flags=17 key_open=0` |
+
+第二轮（同法）：journal **304** ⇒ 读者 `applied=3 bytes=304`。**两次逐字节吻合。**
+
+**结论 1 —— journal 长度不会落后**：WAL-first（先追加 journal 再落实状态）+ 共享追加文件 ⇒ 读者看到的 **≥** 写者已 flush 的记录；
+两个受控例子 `replayedBytes` 与 journal 字节数**完全相等**（194/194、304/304）；窗口 #5 读者的 `170,282,…,876` 也正是 journal 的累积前缀，
+**无截断、无旧长度** ⇒ **这不是四条件继续红的原因**。
+
+**结论 2 —— `real-open ok=0 err=2` 不是 per-process hive 的创建/命名/清理竞态，与 `swept` 无关**：
+它出自 `ws_reg.c` 的 **real-hive 回退**（`ws_reg_real_root(hive)` + `RegOpenKeyExW(realRoot, rel, …)`）；
+`err=2` = `ERROR_FILE_NOT_FOUND`，因为**真实 HKCU 本来就没有这个只被暂存的键** ⇒ **期望行为**。
+它的价值是**症状**：`real-open` 出现即说明那一刻 **provider 的 `value_get` 没供上值**。
+
+**结论 3 —— ❌ 原判 D-R11「provider 枚举看不到已回放的值」是 **我方夹具假阳性**，已撤回（存档见 [`defects.md` D-R11](./defects.md) §11.0）**：
+
+当时的（**无效**）读数：
+```
+value_get(V)  status=0 bytes=26      ← 值在
+value_enum(0) status=1 name=""       ← 假阳性：来自 NULL 指针，不是 provider 行为
+```
+**根因**：我的离线 harness 桩层只填了 8 个 `g_orig.Reg*`，**漏填 `RegEnumValueW`**（与 `RegQueryInfoKeyW`）
+⇒ `g_orig.RegEnumValueW == NULL` ⇒ 枚举读数无效。**补全桩层后**（同一 journal / 进程 / 键）：
+```
+value_get(V)  status=0 bytes=26
+value_enum(0) status=0 name=""       ← 默认值（空名）
+value_enum(1) status=0 name="V"      ← 探针值正常枚举出来
+value_enum(2) status=1               ← 枚举正常结束
+```
+⇒ **provider 的 `get`/`enum` 一致；`ws_regstore.c` 无须改动。**（纯 Win32 对照 `harness/apphive-enum.c` 也证明 app hive 枚举本来正常。）
+`exe` 已用同一二进制独立复跑确认（其原始件 `.t/round10/verify/d58-dr11-diagseed.txt`）。
+**净影响**：只有"基于 enum 的结论"作废；回放/AFTER/C1/C2/C3 与窗口 #3/#4/#5 的四条件读数**全部照旧有效**。
+
+**⇒ 四条件之红（撤回后修订）= 单一族**：`query-value-exit` 与 `step2a` 空**大概率同源**，都由 **D-R10（钩子层伪句柄，`ws_reg.c`）** 一族解释 ——
+`reg query <key>`（不带 `/v`）会先调 `RegQueryInfoKeyW`、再走 `RegEnumValueW`/`RegEnumKeyExW`，
+而这四个 API（含 `RegCloseKey`）正是 `out-16` 里**唯一没有 REGDBG 插桩的** ⇒ **下一窗该动的是插桩那四个 API，不是 provider。**
+
+**未做的取证（`not-run`）**：原想用 `holdshared` 模式持有两把共享 hive 制造 `SHARING_VIOLATION(32)` 以离线强制 tier=3，
+但 `Start-Process` 被策略拦截 ⇒ **tier=3 下读数未取得**。（撤回 D-R11 后，这条不再影响归因。）
+
+#### 5.2.7 受控窗口 #7（`out-18c` `DE59C89D…`）：四条件 **3/4**，仅枚举面仍红
+
+候选 `out-18c` = `DE59C89D84700FDF57EEFB2D9D81555E8B80E0B9242B49B2939E2AD23A57E881`（256,000 B；`.text` `20511486…`；15 exports）
+换入 `shim/out`（`exe` 执行并复核在盘=交付值）。**过程披露**：本次运行原是我为"哈希门禁自测"启动的干跑（OutDir `gate-selftest3`），
+启动瞬间换件落盘，脚本读到 `BEFORE == EXPECTED` ⇒ **门禁正确放行并直接跑完一次真实四回合**；
+读数有效但非"官方启动"，已在 `evidence/fix-r1/arm-window7/README-WINDOW7.txt` 逐条写明来路。
+
+| # | 条件 | 读数 |
+|---|---|---|
+| — | 钉哈希 | `BEFORE = EXPECTED = AFTER = DE59C89D…`；`DLL_HASH_STABLE_DURING_RUN=True`；`self=…\shim\out\winstage-shim.dll ok=1` |
+| ① | `query-value-exit=0` ×4 | **0 / 0 / 0 / 0** ✅ |
+| ② | `query2-value-exit=0` ×4 | **0 / 0 / 0 / 0** ✅ |
+| ③ | `step2a` 非空 | **2 B / 0 非空白** ❌ |
+| ④ | `replayedBytes>0` | ✅ `0,170,282,…,876`（`applied=2 bytes=170 rc=0` …） |
+
+值读回逐字 `V    REG_SZ    written-by-A`（四回合一致）⇒ **D-R1 的读回目标继续成立**。
+
+**③ 的最尖线索**：`step2a`（**不带 `/v`**）= **2 B**，而 `step2b`/`step3`（**带 `/v V`**）= **78 B / 58 非空白、都打印出了值**。
+**`REGDBG api=` 计数**：`RegCloseKey` 17,512（全 `ret=0`）、`RegQueryInfoKeyW` 12,290（全 `ret=0`）、
+`RegEnumValueW` 8,042（`ret=0`×8005、`ret=259`×37）、`RegEnumKeyExW` 2,557（`ret=0`×2462、`ret=259`×95）。
+⇒ **四个 API 都被拦到且绝大多数返回 0，`reg query <key>` 仍打印空** ⇒ 残留**不是**"API 未挂钩"的朴素形态。
+归属仍由 owner 判定（`exe` D61 / `D-R10-enum` / `D-R12`）；本域只交事实与该反差。
+#### 5.2.6 受控窗口 #6（`out-18b` `8FEAB38D…`）：**D-R1 已修并端到端验证（四条件 3/4）**
+
+候选 `out-18b` = `8FEAB38D89ED372BD891A2A017575D5B81C86C0199DCA3F7C11EE784FDB82D66`（253,440 B；15 exports；含 `REGDBG api=` 5 处）换入 `shim/out`，
+经**官方入口** `sbx-thread` 跑四回合（`evidence/fix-r1/arm-window6/**`）：
+
+| # | 条件 | 读数 |
+|---|---|---|
+| — | 哈希门禁 | `BEFORE = EXPECTED = AFTER = 8FEAB38D…`；`DLL_HASH_STABLE_DURING_RUN=True`；`self=…\shim\out\winstage-shim.dll ok=1` |
+| **①** | `query-value-exit=0` ×4 | **0 / 0 / 0 / 0** ✅ |
+| **②** | `query2-value-exit=0` ×4 | **0 / 0 / 0 / 0** ✅ |
+| ③ | `step2a` 非空 | **仍空**（2 B）❌ |
+| **④** | `replayedBytes>0` | ✅ `0,170,282,…,876` |
+
+**决定性正面证据（`transcripts/repro-t1.txt` 逐字，t2/t3/t4 同形）**：
+```
+--- STEP2 read (reg.exe child) ---
+query-key-exit=0
+
+query-value-exit=0
+
+HKEY_CURRENT_USER\Software\WSTestR10DR1
+    V    REG_SZ    written-by-A        <- 前一个进程写的值，被后一个进程逐字节读回
+
+--- STEP3 read again (third reg.exe child) ---
+query2-value-exit=0
+
+HKEY_CURRENT_USER\Software\WSTestR10DR1
+    V    REG_SZ    written-by-A
+```
+⇒ **窗口 #3/#4/#5 连续三轮的"写成功→读不回"红项全部消失。D-R1 的修目标达成。**
+
+**③ 的残留（唯一未过项，且已缩小范围）**：`step2a`（`reg query <key>`，**不带 `/v`**）仍空，但**反差鲜明**：
+`step2b`（带 `/v V`）与 `step3` 各 **78 B / 58 非空白字符**，**都打印出了那个值**。
+⇒ 失败只在"**枚举**"这一面，**不是** provider（D-R11 已撤回），也不是"值读不回"。
+归属见 `exe` 的 `docs/round10/shim/evidence/D61-window6-verdict.md`（记为同一族的未完成面：ntdll 直调面
+`NtQueryValueKey` 已修、`NtEnumerateValueKey`/`NtQueryKey` 仍 `0xC0000008`），并单列下一轮待办 `D-R10-enum`/`D-R12`。
+**我的读数只支持"枚举面单独未过"，不替 owner 下归属结论**；`step2a`=2 B vs `step2b`=78 B 这条反差可直接复用。
+
+**四 `REGDBG api=` 证据（本窗新插桩，条件③定因用）**：`exe` 统计 `RegCloseKey` 16,292 / `RegQueryInfoKeyW` 11,472 /
+`RegEnumValueW` 7,372 / `RegEnumKeyExW` 2,353，返回值域含 `0,0,259`（`259 = ERROR_NO_MORE_ITEMS`）；
+原文在 `arm-window6/logs/shim.log`（我 runner 新增的抽取段会原样附回）。
+
+**窗口收尾**：`exe` 按协议回滚 `shim/out` = `02C7418F…`，`baseline --check` exit 0/115。
+**纪律（本轮教训，已写入 D-R6 第 0 条）**：离线 harness 的 `g_orig` **必须覆盖被测 API**；
+凡调用 `g_orig.X` 而 X 未被桩层填充者，读数**一律无效** —— 先证明"桩已覆盖"再报数。`exe` 已把它并入复核协议（三步检查：覆盖了哪些 / 被测路径调用哪些 / 差集是否为空）。
+
+**纪律**：本轮**未改 `shim/src`** —— 授权到手后我在动手前先做了桩层自检，从而发现了假阳性，**最终没有对 `ws_regstore.c` 施加任何补丁**
+（其 sha256 仍为 `125CB9FFA5D83F9651214C0FB989A45FB8E49515698406963B79B3B094F03D23`，未改一行）；
+本轮改动仅限 `.t/round10/registry/harness/**`（自建夹具）与文档。
 
 **顺带排除的两件事（有价值）**：
 1. **不是我的 `out-r1` 构建坏了** —— env-harness 的 13c 表现**逐字相同**（宿主 ok=1 / 子进程 15 次失败），
@@ -246,7 +420,41 @@ RESULT readseeded key_resolve=0 key_open=0 key_exists=1 value_get=0
 
 **仍未闭合的唯一断言**：`replayedBytes>0` 的 attach 行。等候选真的进 `shim/out` 后再取。
 
-### 5.3 环境事件（影响取证，不影响源码）
+#### 5.3c 受控窗口 #8（`out-22` `63808F51…`）：**四条件 4/4 —— PASS，并已按协议采纳（保留）**
+
+| # | 条件 | 读数 |
+|---|---|---|
+| — | 钉哈希 | `BEFORE = EXPECTED = AFTER = 63808F5188643C085BDC71E86AC843BB8758579938A4CB61781044B93C8A99EB`（257,024 B）；injector `07FE55DD…518F` 未覆盖；`DLL_HASH_STABLE_DURING_RUN=True`；`SBX_THREAD_EXIT=0`；`self=…\shim\out\winstage-shim.dll ok=1` |
+| ① | `query-value-exit=0` ×4 | **0/0/0/0** ✅ |
+| ② | `query2-value-exit=0` ×4 | **0/0/0/0** ✅ |
+| ③ | `step2a` 非空 ×4 | ✅ **78 B / 58 非空白**；`step2a` / `step2b` / `step3` **三者同一 sha256** `12AA39D1F31AF899C625CDB0D7DB384F86F394262801252D5334FADE863972CB`，内容 `HKEY_CURRENT_USER\Software\WSTestR10DR1` ＋ `V    REG_SZ    written-by-A` |
+| ④ | `replayedBytes>0` | ✅ `0,170,282,368,480,566,678,764,876` |
+| — | **VERDICT** | **PASS（四条件全中）** |
+
+**两条独立路径互证**：`step2a` 的 sha256 与 `exe` 在**窗口外、只改 `WINSTAGE_SHIM_DLL`、不换件**跑 `step2a-min.cmd` 得到的哈希**完全相同**（`12AA39D1…72CB`）。
+
+**机制级证实（比"两串字节相等"更强）**——插桩原文：
+```
+REGDBG qik pid=2624 hKey=0000025114ADF1B0 isPseudo=1 ret=0 lpcValues=1 maxNameLen=4 maxValueLenWritten=0 maxValueLenComputed=26
+REGDBG qik-unionfail pid=2624 index=1 hive=HKCU rel=Software\WSTestR10DR1 canonical=HKCU\Software\WSTestR10DR1 real=0
+```
+`lpcValues` **0 → 1**、`qik-unionfail` 的 `index` **0 → 1**。
+**句柄量级普查**（`hKey > 0x100000` 为伪句柄）：`RegQueryInfoKeyW` pseudo=8 / real=11,464；
+**`RegEnumValueW` pseudo=4** / real=7,372（**窗口 #7 为 0**）；`RegEnumKeyExW` pseudo=0 / real=2,485；`RegCloseKey` pseudo=22 / real=16,359。
+⇒ 伪句柄上 `RegEnumValueW` **0 → 4** 正对应"四个 `step2a` 子进程各枚举一次"，与条件 ③ 转绿同步。
+（`exe` 独立按数值重算得 pseudo `RegQueryInfoKeyW=8` / `RegEnumValueW=4` / `RegCloseKey=20`；22 vs 20 属句柄归类边界，**决定性结论一致**。）
+
+**采纳状态**：按协议"**全过保留 / 任一不过回滚**"，本窗 **4/4 ⇒ 保留**：`shim/out` 现为 `63808F51…`/257,024 B。
+（我此前一句"可按协议回滚"是**笔误**，`exe` 已更正、Lead 已确认。）
+
+**⚠ 口径更正（避免幻影缺陷）**：我先前写"`maxValueLenWritten=0` 而 `maxValueLenComputed=26` ⇒ `:1889`（原 `:1865`）仍是缺陷"——**本窗无法支持该结论**：
+`maxValueLenWritten` 是 `out-20` 插桩里**硬编为 `0ul` 的构造性陈旧标签**，**并未读取 `:1889` 实际发布的值**。
+⇒ 本窗只证明"该插桩字段没读真实值"，**不证明发布值有误**。**该条已由 `pkgs` 的 `out-22b` 复测闭环**（仅标签诊断件、不替换 `shim/out`）：标签改为读实际发布值后**实测仍为 0**，`union kind=values valid=1 count=1`，`step2a`/`step2b` 仍 78 B 且与窗口 #8 同哈希 ⇒ **无语义影响**；判读为**调用方（`reg.exe`）对该字段传 `NULL`（未请求 MaxValueLen），写回 0 属正确语义**；产品侧 `ws_reg.c` 已是 `if (lpcbMaxValueLen) *lpcbMaxValueLen = maxValueLen;`（**无残留产品缺陷**）。**限制**：单条日志无法区分"指针为 NULL"与"被写成 0"，彻底闭环需再加 `maxValueLenPtr=%d`（未做）。详见 [`defects.md`](./defects.md) 的 `D-R10-enum` 节。原状态：**"未被本窗证据支持，待复测"**；
+复测方式：把插桩改为读取实际发布的 `*lpcbMaxValueLen`，或加一个只读该字段的调用方探针。
+
+**证据**：`evidence/fix-r1/arm-window8/**`（`README-WINDOW8-PASS.txt`、`WINDOW-PROVENANCE.txt`、`transcripts/*`、`logs/shim.log`、`wal/*`）。
+
+### 5.6 环境事件（影响取证，不影响源码）
 
 ---
 

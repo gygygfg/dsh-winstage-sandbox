@@ -26,11 +26,16 @@
   `…run-9/…runlog5.txt`、`evidence/threads/run-7/staged-list.txt`。
 - **【2026-10-09 状态】仍未修**，且有可复用的最小复现 + 机器判据：
   `.t\round10\pkgs\fix-npm\run.cmd winstage <tag>` → `NPM_INSTALL_OK=0`（`platform` 对照 = 1）。
-  | 时点 | 实际注入的 DLL | `NPM_INSTALL_OK` |
-  |---|---|---|
-  | shim 未修（`before-fix`） | `47DF4A5A…` | 0 |
-  | R 边界修复后（`midfix-r-boundary-02C7418F`） | `02C7418F…` | 0 |
-  | `out-13c` = R + D-R1（`after-fix-13c`、`judge-proof-13c`） | `5E7A010E…` / 251,392 B | **0（两次一致）** |
+  | 时点 | 实际注入的 DLL | **tierEffective** | `NPM_INSTALL_OK` |
+  |---|---|---|---|
+  | shim 未修（`before-fix`） | `47DF4A5A…` | **TS** | 0（有效） |
+  | R 边界修复后（`midfix-r-boundary-02C7418F`） | `02C7418F…` | **TS** | 0（有效） |
+  | `out-13c` = R + D-R1（`after-fix-13c`、`judge-proof-13c`） | `5E7A010E…` / 251,392 B | **TS** | **0（两次一致，有效）** |
+  | 未过门禁候选期间（`after-fix-13b`） | (not recorded) | **T1 = 载体错误** | **VOID**（无产物 + 档位错误，双重理由） |
+  - **档位规则（fileio 发现，Lead 采纳）**：`run.cmd src\cli.mjs exec` **默认 `tier=T1`（restricted-token，无 shim、无 overlay）**；
+    凡读数 `tierEffective=T1` ⇒ **载体错误、结论无效**，必须标 VOID；只有 `TS` 的读数可用。
+    来源：每 run 的 `lane.txt` / `stage-root-*\sandbox-lane.json`（`LANE_OK = degraded===false 且 tierEffective==='TS'`）。
+    本域 5 个读数中 4 个为 TS（有效），仅 `after-fix-13b` 为 T1（作废）。
   - env-harness 已**独立否证** `out-13c` 的目录面钩子（挂 `NtQueryAttributesFile`/`NtQueryFullAttributesFile`
     后 node `existsSync`/`statSync` 与 npm 行为一字未变，见其 `evidence/D44`）⇒ 13c 不是目录面修复载体，
     下一步是 ntdll 入口命中计数定位 libuv 真 API，再做 **13d** 候选。

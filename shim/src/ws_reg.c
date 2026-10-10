@@ -724,7 +724,9 @@ LONG WINAPI ws_RegOpenKeyExA(HKEY hKey, LPCSTR lpSubKey, DWORD ulOptions, REGSAM
         MultiByteToWideChar(CP_ACP, 0, lpSubKey, -1, sub, WS_PATH_MAX);
     }
     LONG rc = ws_open_key(hKey, sub[0] ? sub : NULL, ulOptions, samDesired, phkResult);
-    SetLastError(ws_saved_last_error);
+        ws_log("REGDBG open api=W pid=%lu hKey=%p ret=%ld", (unsigned long)GetCurrentProcessId(), (void *)hKey, (long)rc);
+    ws_log("REGDBG open api=A pid=%lu hKey=%p ret=%ld", (unsigned long)GetCurrentProcessId(), (void *)hKey, (long)rc);
+SetLastError(ws_saved_last_error);
     return rc;
 }
 
@@ -955,8 +957,14 @@ static LONG ws_query_value_ex(HKEY hKey, LPCWSTR nameW, LPCSTR nameA, LPDWORD lp
     wchar_t hive[64], canonical[WS_PATH_MAX];
     canonical[0] = 0;
     int isPseudo = 0, isBareRoot = 0;
-    int canServe = ws_reg_read_ctx(hKey, NULL, 0, hive, 64, canonical, WS_PATH_MAX, &isPseudo, &isBareRoot) &&
-                   !isBareRoot;
+    /* task-17 插桩（只日志、不改语义）：D-R1 端到端仍报 ERROR_INVALID_HANDLE(6)，需判定
+     * reg.exe 的读路径走"取回 ctx / fail-closed / 直通 advapi32"哪一条（Lead 的首要假设：
+     * 失败那次 hKey 根本没被识别为 isPseudo ⇒ 直通假句柄）。 */
+    int ctxOk = ws_reg_read_ctx(hKey, NULL, 0, hive, 64, canonical, WS_PATH_MAX, &isPseudo, &isBareRoot);
+    int canServe = ctxOk && !isBareRoot;
+    ws_log("REGDBG query%s pid=%lu hKey=%p ctxOk=%d isPseudo=%d isBareRoot=%d canServe=%d canonical=%ls",
+           isAnsi ? "A" : "W", (unsigned long)GetCurrentProcessId(), (void *)hKey, ctxOk, isPseudo,
+           isBareRoot, canServe, canonical[0] ? canonical : L"(none)");
     /* ★ task-17（D-R1 读回缺失的正因）：伪句柄不是内核句柄，`ws_reg_read_ctx` 在它上面
      * 可能返回 0（此时 `isPseudo` 已由 `ws_rstore_canonical` 置 1），于是本函数会落到下面的
      * `!canServe` 分支、把**伪句柄**直通 advapi32 ⇒ 必然 `ERROR_INVALID_HANDLE(6)`：
@@ -965,7 +973,11 @@ static LONG ws_query_value_ex(HKEY hKey, LPCWSTR nameW, LPCSTR nameA, LPDWORD lp
      * 覆盖层直接服务 —— 既不直通假句柄，也不丢值。 */
     if (!canServe && isPseudo) {
         int pseudo = 0;
-        if (ws_pseudo_key_path(hKey, hive, 64, canonical, WS_PATH_MAX, &pseudo) && pseudo) {
+        int rec = ws_pseudo_key_path(hKey, hive, 64, canonical, WS_PATH_MAX, &pseudo);
+        ws_log("REGDBG recover pid=%lu hKey=%p rec=%d pseudo=%d canonical=%ls",
+               (unsigned long)GetCurrentProcessId(), (void *)hKey, rec, pseudo,
+               canonical[0] ? canonical : L"(none)");
+        if (rec && pseudo) {
             isPseudo = 1;
             canServe = 1;
         }
@@ -979,12 +991,20 @@ static LONG ws_query_value_ex(HKEY hKey, LPCWSTR nameW, LPCSTR nameA, LPDWORD lp
      * have it yet at query time). */
     if (!canServe) {
         if (isPseudo) {
+            ws_log("REGDBG branch=fail-closed pid=%lu hKey=%p", (unsigned long)GetCurrentProcessId(),
+                   (void *)hKey);
             /* fail closed: never hand a pseudo handle to advapi32 (task-17) */
             return ERROR_FILE_NOT_FOUND;
         }
+        ws_log("REGDBG branch=PASSTHROUGH pid=%lu hKey=%p isPseudo=%d canonical=%ls",
+               (unsigned long)GetCurrentProcessId(), (void *)hKey, isPseudo,
+               canonical[0] ? canonical : L"(none)");
         return isAnsi ? g_orig.RegQueryValueExA(hKey, nameA, lpReserved, lpType, lpData, lpcbData)
                       : g_orig.RegQueryValueExW(hKey, nameW, lpReserved, lpType, lpData, lpcbData);
     }
+    ws_log("REGDBG branch=ctx-recovered pid=%lu hKey=%p isPseudo=%d canonical=%ls",
+           (unsigned long)GetCurrentProcessId(), (void *)hKey, isPseudo,
+           canonical[0] ? canonical : L"(none)");
     WS_TRACE("RegQueryValueEx%s: overlay query %ls", isAnsi ? "A" : "W", canonical);
     const wchar_t *rel = ws_reg_rel_of(hive, canonical);
 
@@ -1063,6 +1083,311 @@ static LONG ws_query_value_ex(HKEY hKey, LPCWSTR nameW, LPCSTR nameA, LPDWORD lp
     HeapFree(GetProcessHeap(), 0, buf);
     return result;
 }
+/* ============================================================================
+ * task-18 (option 2, minimal surface): ntdll!NtQueryValueKey
+ *
+ * reg.exe reads registry values through ntdll, not advapi32. A handle we
+ * synthesised for an overlay-only key is not a kernel handle, so the real
+ * NtQueryValueKey fails with STATUS_INVALID_HANDLE, which surfaces as
+ * ERROR_INVALID_HANDLE(6) -- exactly the observed D-R1 read-back failure.
+ *
+ * Policy: real handles are forwarded untouched; pseudo handles are resolved via
+ * ws_pseudo_key_path and served from the overlay (same ctx path as
+ * ws_query_value_ex); an unresolvable pseudo handle fails closed with
+ * STATUS_INVALID_HANDLE and is NEVER passed through.
+ *
+ * Layouts are written at explicit fixed offsets (no struct padding assumptions):
+ *   KeyValuePartialInformation (0): TitleIndex@0 Type@4 DataLength@8 Data@12
+ *   KeyValueFullInformation    (1): TitleIndex@0 Type@4 DataOffset@8 DataLength@12 NameLength@16 Name@20
+ * ==========================================================================*/
+#define WS_KV_PARTIAL 2u  /* real enum: Basic=0 Full=1 Partial=2 */
+#define WS_KV_FULL 1u     /* KeyValueFullInformation */
+#define WS_KV_PARTIAL_FIXED 12u
+#define WS_KV_FULL_FIXED 20u
+#define WS_ST_SUCCESS ((NTSTATUS)0x00000000L)
+#define WS_ST_NOT_IMPLEMENTED ((NTSTATUS)0xC0000002L)
+#define WS_ST_INVALID_HANDLE ((NTSTATUS)0xC0000008L)
+#define WS_ST_NO_MEMORY ((NTSTATUS)0xC0000017L)
+#define WS_ST_BUFFER_TOO_SMALL ((NTSTATUS)0xC0000023L)
+#define WS_ST_OBJECT_NAME_NOT_FOUND ((NTSTATUS)0xC0000034L)
+#define WS_ST_BUFFER_OVERFLOW ((NTSTATUS)0x80000005L)
+
+static _Thread_local int t_wsRegBusy;
+
+static void ws_kv_put32(void *base, ULONG off, ULONG v)
+{
+    memcpy((BYTE *)base + off, &v, sizeof(v));
+}
+
+NTSTATUS NTAPI ws_NtQueryValueKey(HANDLE KeyHandle, const void *ValueName,
+                                  ULONG KeyValueInformationClass, PVOID KeyValueInformation,
+                                  ULONG Length, PULONG ResultLength)
+{
+    if (!g_orig.NtQueryValueKey) {
+        return WS_ST_NOT_IMPLEMENTED;
+    }
+    /* Reentrancy guard: the overlay machinery below may itself touch the registry. */
+    if (t_wsRegBusy) {
+        return g_orig.NtQueryValueKey(KeyHandle, ValueName, KeyValueInformationClass,
+                                      KeyValueInformation, Length, ResultLength);
+    }
+    if (ResultLength) {
+        *ResultLength = 0;
+    }
+    /* Real (kernel) handle -> untouched. Only synthesised handles get served here. */
+    if (ws_pseudo_index_of((HKEY)KeyHandle) < 0) {
+        return g_orig.NtQueryValueKey(KeyHandle, ValueName, KeyValueInformationClass,
+                                      KeyValueInformation, Length, ResultLength);
+    }
+    wchar_t hive[64], canonical[WS_PATH_MAX];
+    canonical[0] = 0;
+    int isPseudo = 0;
+    if (!ws_pseudo_key_path((HKEY)KeyHandle, hive, 64, canonical, WS_PATH_MAX, &isPseudo) ||
+        !isPseudo) {
+        return WS_ST_INVALID_HANDLE; /* never hand a synthetic handle to ntdll */
+    }
+    const wchar_t *name = L"";
+    if (ValueName) {
+        const UNICODE_STRING *us = (const UNICODE_STRING *)ValueName;
+        if (us->Buffer && us->Length) {
+            name = us->Buffer;
+        }
+    }
+    const wchar_t *rel = ws_reg_rel_of(hive, canonical);
+    const DWORD kMaxValue = 1u << 20;
+    BYTE *buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, kMaxValue);
+    if (!buf) {
+        return WS_ST_NO_MEMORY;
+    }
+    uint32_t type = 0, len = kMaxValue, flags = 0;
+    t_wsRegBusy++;
+    int rc = ws_rstore_value_get(hive, rel, name, &type, buf, &len, &flags);
+    t_wsRegBusy--;
+    if (rc != 0 || (flags & WINSTAGE_RES_WHITEOUT)) {
+        HeapFree(GetProcessHeap(), 0, buf);
+        return WS_ST_OBJECT_NAME_NOT_FOUND;
+    }
+    ULONG nameBytes = 0;
+    ULONG fixedPart = 0;
+    ULONG dataOff = 0;
+    if (KeyValueInformationClass == WS_KV_PARTIAL) {
+        fixedPart = WS_KV_PARTIAL_FIXED;
+        dataOff = fixedPart;
+    } else if (KeyValueInformationClass == WS_KV_FULL) {
+        nameBytes = (ULONG)(wcslen(name) * sizeof(wchar_t));
+        fixedPart = WS_KV_FULL_FIXED;
+        dataOff = fixedPart + nameBytes;
+    } else {
+        HeapFree(GetProcessHeap(), 0, buf);
+        return WS_ST_NOT_IMPLEMENTED; /* only the two classes reg.exe uses */
+    }
+    ULONG need = dataOff + len;
+    if (ResultLength) {
+        *ResultLength = need;
+    }
+    if (!KeyValueInformation) {
+        HeapFree(GetProcessHeap(), 0, buf);
+        return WS_ST_BUFFER_TOO_SMALL;
+    }
+    if (Length < fixedPart) {
+        HeapFree(GetProcessHeap(), 0, buf);
+        return WS_ST_BUFFER_TOO_SMALL; /* cannot even write the fixed fields */
+    }
+    ws_kv_put32(KeyValueInformation, 0, 0u);       /* TitleIndex */
+    ws_kv_put32(KeyValueInformation, 4, type);     /* Type */
+    if (KeyValueInformationClass == WS_KV_PARTIAL) {
+        ws_kv_put32(KeyValueInformation, 8, len);  /* DataLength */
+    } else {
+        ws_kv_put32(KeyValueInformation, 8, dataOff);   /* DataOffset */
+        ws_kv_put32(KeyValueInformation, 12, len);      /* DataLength */
+        ws_kv_put32(KeyValueInformation, 16, nameBytes);/* NameLength */
+        if (nameBytes) {
+            memcpy((BYTE *)KeyValueInformation + fixedPart, name, nameBytes);
+        }
+    }
+    NTSTATUS st = WS_ST_SUCCESS;
+    if (Length < need) {
+        ULONG copy = (Length > fixedPart) ? (Length - fixedPart) : 0;
+        if (copy > len) {
+            copy = len;
+        }
+        if (copy) {
+            memcpy((BYTE *)KeyValueInformation + dataOff, buf, copy);
+        }
+        st = WS_ST_BUFFER_OVERFLOW;
+    } else if (len) {
+        memcpy((BYTE *)KeyValueInformation + dataOff, buf, len);
+    }
+    HeapFree(GetProcessHeap(), 0, buf);
+    return st;
+}
+
+/* ============================================================================
+ * task-18c: ntdll!NtEnumerateValueKey + ntdll!NtQueryKey
+ * Same proven policy as ws_NtQueryValueKey:
+ *   real handle -> forward untouched; pseudo handle -> resolve + serve from the overlay;
+ *   unresolvable pseudo handle -> STATUS_INVALID_HANDLE; unresolved ORIGINAL -> the
+ *   distinguishable STATUS_NOT_IMPLEMENTED sentinel (never a fail-closed behaviour change).
+ *   KEY_VALUE_INFORMATION_CLASS: Basic=0 Full=1 Partial=2
+ *   KEY_INFORMATION_CLASS:       Basic=0 Node=1 Full=2 Name=3
+ * ==========================================================================*/
+NTSTATUS NTAPI ws_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, ULONG KeyValueInformationClass,
+                                      PVOID KeyValueInformation, ULONG Length, PULONG ResultLength)
+{
+    if (!g_orig.NtEnumerateValueKey) {
+        return WS_ST_NOT_IMPLEMENTED;
+    }
+    if (t_wsRegBusy) {
+        return g_orig.NtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation,
+                                          Length, ResultLength);
+    }
+    if (ResultLength) {
+        *ResultLength = 0;
+    }
+    if (ws_pseudo_index_of((HKEY)KeyHandle) < 0) {
+        return g_orig.NtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation,
+                                         Length, ResultLength);
+    }
+    wchar_t hive[64], canonical[WS_PATH_MAX];
+    canonical[0] = 0;
+    int isPseudo = 0;
+    if (!ws_pseudo_key_path((HKEY)KeyHandle, hive, 64, canonical, WS_PATH_MAX, &isPseudo) || !isPseudo) {
+        return WS_ST_INVALID_HANDLE;
+    }
+    const wchar_t *rel = ws_reg_rel_of(hive, canonical);
+    wchar_t name[256];
+    name[0] = 0;
+    uint32_t type = 0, vlen = 0, vflags = 0;
+    t_wsRegBusy++;
+    int erc = ws_rstore_value_enum(hive, rel, Index, name, 256, &type, NULL, &vlen, &vflags);
+    t_wsRegBusy--;
+    if (erc != 0) {
+        return (NTSTATUS)0x8000001AL; /* STATUS_NO_MORE_ENTRIES */
+    }
+    BYTE *buf = NULL;
+    uint32_t dataLen = 0;
+    if (vlen) {
+        buf = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, vlen);
+        if (!buf) {
+            return WS_ST_NO_MEMORY;
+        }
+        uint32_t cap = vlen;
+        t_wsRegBusy++;
+        int grc = ws_rstore_value_get(hive, rel, name, &type, buf, &cap, &vflags);
+        t_wsRegBusy--;
+        if (grc != 0 || (vflags & WINSTAGE_RES_WHITEOUT)) {
+            HeapFree(GetProcessHeap(), 0, buf);
+            return WS_ST_OBJECT_NAME_NOT_FOUND;
+        }
+        dataLen = cap;
+    }
+    ULONG nameBytes = (ULONG)(wcslen(name) * sizeof(wchar_t));
+    ULONG fixedPart, dataOff, need;
+    if (KeyValueInformationClass == 1u) {          /* KeyValueFullInformation */
+        fixedPart = 20u;
+        dataOff = fixedPart + nameBytes;
+        need = dataOff + dataLen;
+    } else if (KeyValueInformationClass == 2u) {   /* KeyValuePartialInformation */
+        fixedPart = 12u;
+        dataOff = fixedPart;
+        need = dataOff + dataLen;
+    } else {                                        /* KeyValueBasicInformation */
+        fixedPart = 12u;                            /* TitleIndex/Type/NameLength */
+        dataOff = fixedPart + nameBytes;
+        need = dataOff;
+    }
+    if (ResultLength) {
+        *ResultLength = need;
+    }
+    if (!KeyValueInformation) {
+        if (buf) HeapFree(GetProcessHeap(), 0, buf);
+        return WS_ST_BUFFER_TOO_SMALL;
+    }
+    if (Length < fixedPart) {
+        if (buf) HeapFree(GetProcessHeap(), 0, buf);
+        return WS_ST_BUFFER_TOO_SMALL;
+    }
+    ws_kv_put32(KeyValueInformation, 0, 0u);
+    ws_kv_put32(KeyValueInformation, 4, type);
+    if (KeyValueInformationClass == 1u) {
+        ws_kv_put32(KeyValueInformation, 8, dataOff);
+        ws_kv_put32(KeyValueInformation, 12, dataLen);
+        ws_kv_put32(KeyValueInformation, 16, nameBytes);
+        if (nameBytes) memcpy((BYTE *)KeyValueInformation + fixedPart, name, nameBytes);
+        if (dataLen && Length >= need) memcpy((BYTE *)KeyValueInformation + dataOff, buf, dataLen);
+    } else if (KeyValueInformationClass == 2u) {
+        ws_kv_put32(KeyValueInformation, 8, dataLen);
+        if (dataLen && Length >= need) memcpy((BYTE *)KeyValueInformation + dataOff, buf, dataLen);
+    } else {
+        ws_kv_put32(KeyValueInformation, 8, nameBytes);
+        if (nameBytes) memcpy((BYTE *)KeyValueInformation + fixedPart, name, nameBytes);
+    }
+    if (buf) HeapFree(GetProcessHeap(), 0, buf);
+    return (Length < need) ? WS_ST_BUFFER_OVERFLOW : WS_ST_SUCCESS;
+}
+
+NTSTATUS NTAPI ws_NtQueryKey(HANDLE KeyHandle, ULONG KeyInformationClass, PVOID KeyInformation,
+                             ULONG Length, PULONG ResultLength)
+{
+    if (!g_orig.NtQueryKey) {
+        return WS_ST_NOT_IMPLEMENTED;
+    }
+    if (t_wsRegBusy) {
+        return g_orig.NtQueryKey(KeyHandle, KeyInformationClass, KeyInformation, Length, ResultLength);
+    }
+    if (ResultLength) {
+        *ResultLength = 0;
+    }
+    if (ws_pseudo_index_of((HKEY)KeyHandle) < 0) {
+        return g_orig.NtQueryKey(KeyHandle, KeyInformationClass, KeyInformation, Length, ResultLength);
+    }
+    wchar_t hive[64], canonical[WS_PATH_MAX];
+    canonical[0] = 0;
+    int isPseudo = 0;
+    if (!ws_pseudo_key_path((HKEY)KeyHandle, hive, 64, canonical, WS_PATH_MAX, &isPseudo) || !isPseudo) {
+        return WS_ST_INVALID_HANDLE;
+    }
+    const wchar_t *name = canonical[0] ? canonical : L"";
+    ULONG nameBytes = (ULONG)(wcslen(name) * sizeof(wchar_t));
+    ULONG fixedPart, dataOff, need;
+    if (KeyInformationClass == 3u) {        /* KeyNameInformation: {NameLength; WCHAR Name[];} */
+        fixedPart = 4u;
+        dataOff = fixedPart;
+        need = dataOff + nameBytes;
+    } else if (KeyInformationClass == 2u) { /* KeyFullInformation */
+        fixedPart = 48u;
+        dataOff = fixedPart;
+        need = dataOff;
+    } else {                                 /* KeyBasicInformation */
+        fixedPart = 16u;                     /* LastWriteTime(8) TitleIndex(4) NameLength(4) */
+        dataOff = fixedPart;
+        need = dataOff + nameBytes;
+    }
+    if (ResultLength) {
+        *ResultLength = need;
+    }
+    if (!KeyInformation) {
+        return WS_ST_BUFFER_TOO_SMALL;
+    }
+    if (Length < fixedPart) {
+        return WS_ST_BUFFER_TOO_SMALL;
+    }
+    if (KeyInformationClass == 3u) {
+        ws_kv_put32(KeyInformation, 0, nameBytes);
+        if (nameBytes) memcpy((BYTE *)KeyInformation + dataOff, name, nameBytes);
+    } else if (KeyInformationClass == 2u) {
+        /* SubKeys/MaxNameLen/Values/MaxValueNameLen/MaxValueDataLen/SecurityDescriptor/LastWriteTime */
+        for (ULONG off = 0; off < 40u; off += 4u) ws_kv_put32(KeyInformation, off, 0u);
+        memset((BYTE *)KeyInformation + 40u, 0, 8u);
+    } else {
+        memset((BYTE *)KeyInformation, 0, 8u);       /* LastWriteTime = 0 */
+        ws_kv_put32(KeyInformation, 8, 0u);          /* TitleIndex */
+        ws_kv_put32(KeyInformation, 12, nameBytes);  /* NameLength */
+        if (nameBytes) memcpy((BYTE *)KeyInformation + dataOff, name, nameBytes);
+    }
+    return (Length < need) ? WS_ST_BUFFER_OVERFLOW : WS_ST_SUCCESS;
+}
+
 LONG WINAPI ws_RegQueryValueExW(HKEY hKey, LPCWSTR lpValueName, LPDWORD lpReserved, LPDWORD lpType,
                                 LPBYTE lpData, LPDWORD lpcbData)
 {
@@ -1334,7 +1659,8 @@ static void ws_reg_build_union(const wchar_t *hive, const wchar_t *rel, const wc
     g_enumCache.gen = gen;
     int count = 0;
 
-    for (uint32_t i = 0; count < WS_ENUM_MAX_NAMES; i++) {
+    /* hard cap: a misbehaving value enum must never spin this loop forever */
+    for (uint32_t i = 0; count < WS_ENUM_MAX_NAMES && i < (uint32_t)WS_ENUM_MAX_NAMES * 4u; i++) {
         wchar_t name[WS_ENUM_NAME_CCH];
         name[0] = 0;
         int rc;
@@ -1344,8 +1670,17 @@ static void ws_reg_build_union(const wchar_t *hive, const wchar_t *rel, const wc
             uint32_t type = 0, len = 0, flags = 0;
             rc = ws_rstore_value_enum(hive, rel, i, name, WS_ENUM_NAME_CCH, &type, NULL, &len, &flags);
         }
-        if (rc != 0 || !name[0]) {
+        if (rc != 0) {
             break;
+        }
+        if (!name[0]) {
+            /* EMPTY-DEFAULT-VALUE: index 0 of a value enum is the DEFAULT value and carries an
+             * empty name; it is a real entry, not the end of the enumeration. Stopping here hid
+             * every named value (step2a). Keys cannot have an empty name, so keys still stop. */
+            if (kind == 0) {
+                break;
+            }
+            continue;
         }
         ws_strlcpy_w(g_enumCache.names[count].name, name, WS_ENUM_NAME_CCH);
         count++;
@@ -1398,6 +1733,15 @@ static int ws_reg_union_lookup(const wchar_t *hive, const wchar_t *rel, const wc
                                HKEY realHandle, int kind, DWORD index, wchar_t *out, DWORD cch)
 {
     ws_reg_build_union(hive, rel, canonical, realHandle, kind);
+    /* task-21 instrumentation (log only): which source produced the union cache, and how many
+     * entries it holds. kind=0 keys / kind=1 values; real=1 means the real-hive fallback. */
+    if (index == 0) {
+        ws_log("REGDBG union pid=%lu kind=%s hive=%ls rel=%ls canonical=%ls real=%d index=%lu valid=%d count=%d",
+               (unsigned long)GetCurrentProcessId(), kind ? "values" : "keys",
+               hive ? hive : L"(null)", rel ? rel : L"(null)",
+               canonical ? canonical : L"(null)", realHandle ? 1 : 0,
+               (unsigned long)index, g_enumCache.valid ? 1 : 0, (int)g_enumCache.count);
+    }
     if (!g_enumCache.valid || index >= (DWORD)g_enumCache.count) {
         return 0;
     }
@@ -1413,11 +1757,14 @@ LONG WINAPI ws_RegCloseKey(HKEY hKey)
     DWORD ws_saved_last_error = GetLastError();
     if (ws_pseudo_key_is(hKey)) {
         ws_pseudo_key_free(hKey);
+        ws_log("REGDBG api=RegCloseKey pid=%lu hKey=%p isPseudo=1 ret=0",
+               (unsigned long)GetCurrentProcessId(), (void *)hKey);
         SetLastError(ws_saved_last_error);
         return ERROR_SUCCESS;
     }
     LONG rc = g_orig.RegCloseKey(hKey);
-    SetLastError(ws_saved_last_error);
+        ws_log("REGDBG api=RegCloseKey pid=%lu hKey=%p ret=%ld", (unsigned long)GetCurrentProcessId(), (void *)hKey, (long)rc);
+SetLastError(ws_saved_last_error);
     return rc;
 }
 
@@ -1449,7 +1796,8 @@ LONG WINAPI ws_RegQueryInfoKeyW(HKEY hKey, LPWSTR lpClass, LPDWORD lpcchClass, L
     LONG rc = ws_query_info_key_inner(hKey, lpClass, lpcchClass, lpReserved, lpcSubKeys,
                                       lpcbMaxSubKeyLen, lpcbMaxClassLen, lpcValues, lpcbMaxValueNameLen,
                                       lpcbMaxValueLen, lpcbSecurityDescriptor, lpftLastWriteTime);
-    SetLastError(ws_saved_last_error);
+        ws_log("REGDBG api=RegQueryInfoKeyW pid=%lu hKey=%p ret=%ld", (unsigned long)GetCurrentProcessId(), (void *)hKey, (long)rc);
+SetLastError(ws_saved_last_error);
     return rc;
 }
 
@@ -1461,8 +1809,21 @@ static LONG ws_query_info_key_inner(HKEY hKey, LPWSTR lpClass, LPDWORD lpcchClas
     wchar_t hive[64], canonical[WS_PATH_MAX];
     canonical[0] = 0;
     int isPseudo = 0, isBareRoot = 0;
-    if (!ws_reg_read_ctx(hKey, NULL, 0, hive, 64, canonical, WS_PATH_MAX, &isPseudo, &isBareRoot) ||
-        isBareRoot) {
+    /* task-17 扩展（与 ws_query_value_ex 同源）：伪句柄**绝不**直通 advapi32（＝ERROR_INVALID_HANDLE(6)）：
+     * 先用伪句柄表取回 ctx 交给覆盖层服务，取不回则 fail-closed。 */
+    int ctxOk = ws_reg_read_ctx(hKey, NULL, 0, hive, 64, canonical, WS_PATH_MAX, &isPseudo, &isBareRoot);
+    int canServe = ctxOk && !isBareRoot;
+    int pRecovered = 0;
+    if (!canServe && isPseudo &&
+        ws_pseudo_key_path(hKey, hive, 64, canonical, WS_PATH_MAX, &pRecovered) && pRecovered) {
+        canServe = 1;
+    }
+    if (!canServe) {
+        if (isPseudo) {
+            ws_log("REGDBG branch=fail-closed(enum/info) pid=%lu hKey=%p",
+                   (unsigned long)GetCurrentProcessId(), (void *)hKey);
+            return ERROR_FILE_NOT_FOUND;
+        }
         return g_orig.RegQueryInfoKeyW(hKey, lpClass, lpcchClass, lpReserved, lpcSubKeys,
                                        lpcbMaxSubKeyLen, lpcbMaxClassLen, lpcValues,
                                        lpcbMaxValueNameLen, lpcbMaxValueLen, lpcbSecurityDescriptor,
@@ -1486,7 +1847,12 @@ static LONG ws_query_info_key_inner(HKEY hKey, LPWSTR lpClass, LPDWORD lpcchClas
     }
     for (uint32_t i = 0;; i++) {
         wchar_t name[WS_ENUM_NAME_CCH];
-        if (!ws_reg_union_lookup(hive, rel, canonical, real, 1, i, name, WS_ENUM_NAME_CCH)) break;
+        if (!ws_reg_union_lookup(hive, rel, canonical, real, 1, i, name, WS_ENUM_NAME_CCH)) {
+            ws_log("REGDBG qik-unionfail pid=%lu index=%lu hive=%ls rel=%ls canonical=%ls real=%d",
+                   (unsigned long)GetCurrentProcessId(), (unsigned long)i, hive,
+                   rel ? rel : L"(null)", canonical, real ? 1 : 0);
+            break;
+        }
         uint32_t nl = (uint32_t)((wcslen(name) + 1) * sizeof(wchar_t));
         if (nl > maxNameLen) maxNameLen = nl;
         /* Value length must be a real number: a caller that sizes a buffer from
@@ -1520,7 +1886,15 @@ static LONG ws_query_info_key_inner(HKEY hKey, LPWSTR lpClass, LPDWORD lpcchClas
     if (lpcValues) *lpcValues = valueCount;
     if (lpcbMaxSubKeyLen) *lpcbMaxSubKeyLen = maxSubKeyLen;
     if (lpcbMaxValueNameLen) *lpcbMaxValueNameLen = maxNameLen;
-    if (lpcbMaxValueLen) *lpcbMaxValueLen = 0;
+    if (lpcbMaxValueLen) *lpcbMaxValueLen = maxValueLen;
+    /* task-20 instrumentation (log only): the values actually written back to the caller.
+     * lpcValues/maxNameLen are real; maxValueLenWritten is what :1865 publishes (0);
+     * maxValueLenComputed is what the loops above derived. */
+    ws_log("REGDBG qik pid=%lu hKey=%p isPseudo=%d ret=%ld lpcValues=%lu maxNameLen=%lu maxValueLenWritten=%lu maxValueLenComputed=%lu",
+           (unsigned long)GetCurrentProcessId(), (void *)hKey, isPseudo, (long)ERROR_SUCCESS,
+           (unsigned long)valueCount, (unsigned long)maxNameLen,
+           (unsigned long)(lpcbMaxValueLen ? *lpcbMaxValueLen : 0ul),
+           (unsigned long)maxValueLen);
     return ERROR_SUCCESS;
 }
 
@@ -1537,7 +1911,8 @@ LONG WINAPI ws_RegEnumValueW(HKEY hKey, DWORD dwIndex, LPWSTR lpValueName, LPDWO
     DWORD ws_saved_last_error = GetLastError();
     LONG rc = ws_enum_value_inner(hKey, dwIndex, lpValueName, lpcchValueName, lpReserved, lpType,
                                   lpData, lpcbData);
-    SetLastError(ws_saved_last_error);
+        ws_log("REGDBG api=RegEnumValueW pid=%lu hKey=%p ret=%ld", (unsigned long)GetCurrentProcessId(), (void *)hKey, (long)rc);
+SetLastError(ws_saved_last_error);
     return rc;
 }
 
@@ -1547,8 +1922,21 @@ static LONG ws_enum_value_inner(HKEY hKey, DWORD dwIndex, LPWSTR lpValueName, LP
     wchar_t hive[64], canonical[WS_PATH_MAX];
     canonical[0] = 0;
     int isPseudo = 0, isBareRoot = 0;
-    if (!ws_reg_read_ctx(hKey, NULL, 0, hive, 64, canonical, WS_PATH_MAX, &isPseudo, &isBareRoot) ||
-        isBareRoot) {
+    /* task-17 扩展（与 ws_query_value_ex 同源）：伪句柄**绝不**直通 advapi32（＝ERROR_INVALID_HANDLE(6)）：
+     * 先用伪句柄表取回 ctx 交给覆盖层服务，取不回则 fail-closed。 */
+    int ctxOk = ws_reg_read_ctx(hKey, NULL, 0, hive, 64, canonical, WS_PATH_MAX, &isPseudo, &isBareRoot);
+    int canServe = ctxOk && !isBareRoot;
+    int pRecovered = 0;
+    if (!canServe && isPseudo &&
+        ws_pseudo_key_path(hKey, hive, 64, canonical, WS_PATH_MAX, &pRecovered) && pRecovered) {
+        canServe = 1;
+    }
+    if (!canServe) {
+        if (isPseudo) {
+            ws_log("REGDBG branch=fail-closed(enum/info) pid=%lu hKey=%p",
+                   (unsigned long)GetCurrentProcessId(), (void *)hKey);
+            return ERROR_FILE_NOT_FOUND;
+        }
         return g_orig.RegEnumValueW(hKey, dwIndex, lpValueName, lpcchValueName, lpReserved, lpType,
                                     lpData, lpcbData);
     }
@@ -1621,7 +2009,8 @@ LONG WINAPI ws_RegEnumKeyExW(HKEY hKey, DWORD dwIndex, LPWSTR lpName, LPDWORD lp
     DWORD ws_saved_last_error = GetLastError();
     LONG rc = ws_enum_key_ex_inner(hKey, dwIndex, lpName, lpcchName, lpReserved, lpClass, lpcchClass,
                                    lpftLastWriteTime);
-    SetLastError(ws_saved_last_error);
+        ws_log("REGDBG api=RegEnumKeyExW pid=%lu hKey=%p ret=%ld", (unsigned long)GetCurrentProcessId(), (void *)hKey, (long)rc);
+SetLastError(ws_saved_last_error);
     return rc;
 }
 
@@ -1632,8 +2021,21 @@ static LONG ws_enum_key_ex_inner(HKEY hKey, DWORD dwIndex, LPWSTR lpName, LPDWOR
     wchar_t hive[64], canonical[WS_PATH_MAX];
     canonical[0] = 0;
     int isPseudo = 0, isBareRoot = 0;
-    if (!ws_reg_read_ctx(hKey, NULL, 0, hive, 64, canonical, WS_PATH_MAX, &isPseudo, &isBareRoot) ||
-        isBareRoot) {
+    /* task-17 扩展（与 ws_query_value_ex 同源）：伪句柄**绝不**直通 advapi32（＝ERROR_INVALID_HANDLE(6)）：
+     * 先用伪句柄表取回 ctx 交给覆盖层服务，取不回则 fail-closed。 */
+    int ctxOk = ws_reg_read_ctx(hKey, NULL, 0, hive, 64, canonical, WS_PATH_MAX, &isPseudo, &isBareRoot);
+    int canServe = ctxOk && !isBareRoot;
+    int pRecovered = 0;
+    if (!canServe && isPseudo &&
+        ws_pseudo_key_path(hKey, hive, 64, canonical, WS_PATH_MAX, &pRecovered) && pRecovered) {
+        canServe = 1;
+    }
+    if (!canServe) {
+        if (isPseudo) {
+            ws_log("REGDBG branch=fail-closed(enum/info) pid=%lu hKey=%p",
+                   (unsigned long)GetCurrentProcessId(), (void *)hKey);
+            return ERROR_FILE_NOT_FOUND;
+        }
         return g_orig.RegEnumKeyExW(hKey, dwIndex, lpName, lpcchName, lpReserved, lpClass, lpcchClass,
                                     lpftLastWriteTime);
     }
