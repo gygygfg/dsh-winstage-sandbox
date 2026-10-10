@@ -150,3 +150,22 @@ RESOLVE route=wrongmod result=NULL (real loader semantics)
 - **`D4S2` ③ = PASS**（预登记接受面 2/2 生效；护栏与负对照全绿；载体安全 PASS）。**无回归**：除两条应变路由与 `manual-w` 的**已解释**差异外，其余逐字与阶段 1 一致。
 - 建议 Lead 据此把 `D100-d4s2-ordinal-invented-export.patch`（`EF33451E…`）纳入 v2 候选的**验收结论**；`D4S2` 本身**不需要**任何补丁修改。
 - 建议把 §4 的两条结论记入台账：① "Win32 私有解析仍落回已钩 ntdll 层 ⇒ 覆盖层语义生效"；② "`staged=-1/mapped=<none>` 是 `D-FILE-7` 守卫在野外的形态"。
+
+### 7.1 **D99 的行为后果（正面，已随 v2 采纳；Lead 要求入台账）**
+
+`kernelbase!GetFileAttributesW` 处理**逻辑名**时，现在会经其内部的 `NtQueryAttributesFile`（本 shim 已挂钩）得到**覆盖层命中**属性：count15（pre-D99）= `attrs=0xFFFFFFFF err=3`；**v2 起 = `attrs=0x00000020 err=0`**。⇒ 这是"**同名 API 面一致性**"的延伸：**即使调用方绕开 `GetFileAttributesW` 的 IAT 站点**（自走导出表取真身），只要它经由 kernelbase 实现，覆盖层语义仍然生效。已在 `docs/round10/fileio/13d/更正-汇总-线程9.md` 记入一条。
+
+### 7.2 `count17-ctl` 收口轮 **无效（T1 回落）**；**盘上已有单变量证据，不必重跑**
+
+- `count17-ctl`（`lane-runner` 跑）：`tierEffective=T1` / `launchMode=restricted-token` / `fallbackReason=transparent shim unavailable (injector exit=111 …)`；其 `manual-w` 的 `0xFFFFFFFF/3` **不构成证据**（该 pid 无任何 `ATTRDBG` 行 ⇒ 未挂钩）。属注入器/通道问题，与 D4S2 无关；执行者按纪律停手，正确。
+- **替代证据（已在我方盘上，独立复算）** —— `nqaf-scan.mjs`（`D4S2-nqaf-scan.txt`）：
+
+| 日志 | 注入件 `self=` | `ATTRDBG-NQAF` | 带 `mapped=` |
+|---|---|---|---|
+| `d5\stage-d5-b15b` | count15 | 10,160 | **0（0.0%）** |
+| `d5\stage-d5-v2b` | **count17（v2，无 D4S2）** | 18,899 | **18,899（100%）** |
+| `d5\stage-d5-v2` | count17 | 18,784 | 100% |
+| `d4\stage-c15` | count15 | 10,458 | 0（0.0%） |
+| `d4\stage-count18-s2` | count18 | 18,178 | 100% |
+
+⇒ `count17`（**无 D4S2**）已 100% overlay 感知 ⇒ `manual-w` 差异归因 **D99/v2**；D4S2 排除。**建议直接收口，不重跑**（若要形式化 `count17-ctl2` 亦可，但非门禁）。

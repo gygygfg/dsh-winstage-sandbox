@@ -123,3 +123,21 @@ cmd /c "call .t\round10\shim\d4\D4S2-offline-gpa-count18.cmd"   （RC=0）
 **"0 行/阴性必附活性反证"已满足**：同 run 内 `static`/`gpa`/`ordinal`/`mixed` 四条路由**都拿到包装**且调用 `st=0x0`，另有 `resolver control` 行证明 `ws_GetProcAddress` 钩子确实安装 ⇒ 上表"未拦截/真身"是**有效阴性**，不是"没走到"。
 **与 `env-harness` 的差异清单**：其**判读表**我尚未收到（Lead 转述的 `ordinal-nq`/`wrongmod-nq` 三行与我的逐字一致）⇒ 就已公布的读数而言 **0 差异**；若其另发判读表，我按本表逐项 diff。
 **旁证**：`analyze-count18.mjs` 对**修前 count15** 自测 = `ASSERT-FAIL`（两条断言均 FAIL）⇒ 该断言集对修前件会失败、对 count18 成立（断言有判别力，不是恒真）。
+
+## 5c. 对 `env-harness` 交付件集的**逐件复核 + 差异清单**（我方自算哈希/行数，只信原始行）
+| 件 | 其声明 | 我方实测 | 判 |
+|---|---|---|---|
+| `…\d4\D4-rawlines-c15.txt`（修前基线） | `757682B9…` / 23,458 B / 120 行 | **同** | ✅ |
+| `…\d4\analysis-c15.txt` | `CBC56B27…` / 3,665 B / 43 行 | **同** | ✅ |
+| `…\stage-count18-s2\staged\evidence\d4-probe-raw.txt`（主件） | `AE18FB32…B78E9` / 9,591 B / 75 行 | **同** | ✅ |
+| `…\evidence\attrdbg-nqifbn.txt`（活性） | `548F50D0…` / 9,626 B / **15** 行 | **同** | ✅ |
+| `…\evidence\attrdbg-w.txt` | `A282490E…` / 350,668 B / 1,423 行 | **同** | ✅ |
+| `…\evidence\injection.txt` | `43601789…` / 3,542 B / 22 行 | **同** | ✅ |
+| `…\out-count18-s2\exec-stdout.json` | `7ACC29B3…` / 22,619 B / 254 行 | **同** | ✅ |
+| `…\stage-count18-s2\staged\shim.log` | `00BE9168…` / 13,375,564 B / 52,027 行 | **同** | ✅ |
+
+**修前 A/B（我自解析 `D4-rawlines-c15.txt`）**：`route=wrongmod … ptr=000000006FBF4CE0 owner=…out-13d-count15…`（**发明导出**）、`route=ordinal 495 raw=真身 gpa=00007FFB63745230 owner=ntdll.dll`（**未路由**）、`manual/rawgpa/rawldr=真身`；对照修后 count18：`wrongmod ptr=0x0`、`ordinal gpa=包装 0x6FBF5420` ⇒ **A/B 双向成立**。
+**活性正对照（我方自算分组）**：`attrdbg-nqifbn.txt` 共 **15 行** = pid **9732×3**（static-nq）+ **1644×3**（gpa-nq）+ **9460×3**（**ordinal-nq**）+ **9548×6**（mixed-nq），**status 全 `0x0`**。
+**差异清单（唯一一条，文档级、不影响结论）**：其报"另有 **6372×1**（canary）"⇒ 该文件**实际共 15 行**（3+3+3+6），**无 6372 行**（我按 `ATTRDBG-NQIFBN` + `pid=`/`status=` 全量分组，各组计数之和 = 文件行数）。**其结论不受影响**：活性由 9732/1644/9460/9548 四组承担；且 `manual/rawgpa/rawldr` 在该文件 **0 行**这一阴性另有互证（同一轮其 `RESOLVE` 指针 = 真身 ntdll 且调用 `st=0xC000003A`，而 `static/gpa/ordinal/mixed` 均被替换且 `st=0x0`）⇒ **有效阴性，非 inconclusive**。
+**判据口径一致性**：其口径（真身 = 手写 PE 导出目录解析、不经 `GetProcAddress`；包装 = 本进程 IAT 槽值；只判"指针 ∈ {真身,包装,NULL,其它}"、不用 `LastError`）**与我方一致**，可采用。
+**待其第二仪器交叉轮**（`d4-probe.exe` = `6DDC7152…`/154,624 B、`d4-driver.cmd` = `E55927F1…`、`stage-d4-x18`/`out-d4-x18`）：**若到手我按同表逐项 diff**；当前主结论不依赖它（已有我方 lane-free 自跑 + 车道内解析 + 修前 A/B 三条独立来源互证）。

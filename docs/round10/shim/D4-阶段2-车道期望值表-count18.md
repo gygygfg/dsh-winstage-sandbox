@@ -146,3 +146,31 @@ cmd /c "call run.cmd .t\round10\shim\d4\analyze-count18.mjs ^
 - **不得**写 `shim/src/**`、不得 apply/复原任何补丁（作者与执行者的分工见 Lead 2026-10-10 纪律）。
 - 跑前核对上表四件哈希；跑后**只逐字回报**（12 路由输出原文 + `RC_*` + 注入断言 + 档位/载体字段 + `shim.log` 指纹），**不下 PASS/FAIL**。
 - 发现任何树写入或通道异常 ⇒ 立即停下上报。
+
+---
+
+## 9. 跑后更正（2026-10-10，**冻结表 §3 原样保留，读表请连同本节**）
+
+### 更正 A：`manual-w` 的 `attrs` 期望 —— **基线错位（我错），非 D4S2 影响**
+- 冻结表第 4 条按 **count15（= D98/pre-D99 态）** 写死 `attrs=0xFFFFFFFF err=3`；count18-s2 实测 `attrs=0x00000020 err=0`（`lane-runner`、`pkgs` 与我都复算过）。
+- **机理**：`manual-w` 走**真身** `kernelbase!GetFileAttributesW`（`W=0`，没进我们的 W 包装），但 kernelbase 内部调用 `NtQueryAttributesFile`——**该 IAT 已被挂钩**。count15 的 NQAF 是 **pass-through**（日志无 `mapped=`）⇒ 查真实盘（无此件）⇒ `0xFFFFFFFF/3`；**v2 起 NQAF overlay 感知**（日志 100% 带 `mapped=`）⇒ 覆盖层命中 ⇒ `0x20/0`。
+- **该路由的正确判据**：`W=0` + `RESOLVE … owner=KERNELBASE.dll`（证明绕开 W 包装）。**`attrs` 自始不作为判据**。
+- **正确对照臂 = `count17`（v2，无 D4S2）**，见 §0.5；count15 只可作 **pre-D99** 对照。
+
+### 更正 B：NULL owner 的**标签 vs 指针**
+- 冻结表第 11 条写 `owner=<NULL>`（那是**离线**探针的输出）。**车道**探针 `d4-probe.c` 的 `owner_of()` 对 NULL 无特判 ⇒ 打 `owner=<not-in-any-module>`。
+- **正确判据**：`ptr=0000000000000000` **且** 有 `result=NULL (real loader semantics)` 行 **且** 无 CALLCALL。机算已改为**同时接受两种标签** ⇒ `count18` 档案在 count18-s2 数据上 `VERDICT ALL-MATCH`（`ASSERT wrongmod-nq … PASS`）。**不得**因标签把 (i) 读成"未达成"。
+
+### 更正 C：`count17-ctl` 收口轮 **T1 回落 ⇒ 无效**；本次**不需要**重跑即可收口
+- `count17-ctl`：`tierEffective=T1` / `launchMode=restricted-token` / `fallbackReason=transparent shim unavailable (injector exit=111 …)` ⇒ `manual-w` 的 `0xFFFFFFFF/3` **不是**证据（该 pid 无任何 `ATTRDBG` 行 = 未挂钩）。属于**注入器/通道**问题，与 D4S2 无关。
+- **盘上已有单变量证据**（`nqaf-scan.mjs` 独立复算，`D4S2-nqaf-scan.txt`）：
+
+| 日志 | 注入件（`self=`） | `ATTRDBG-NQAF` 行 | 带 `mapped=` |
+|---|---|---|---|
+| `d5\stage-d5-b15b`（基线） | **count15** | 10,160 | **0（0.0%）** |
+| `d5\stage-d5-v2b`（**v2 = count17，无 D4S2**） | **count17** | 18,899 | **18,899（100%）** |
+| `d5\stage-d5-v2`（count17） | count17 | 18,784 | 100% |
+| `d4\stage-c15`（基线） | count15 | 10,458 | 0（0.0%） |
+| `d4\stage-count18-s2`（v2+D4S2） | count18 | 18,178 | 100% |
+
+⇒ **`count17`（无 D4S2）已 100% overlay 感知** ⇒ `manual-w` 的性状变化归因 **D99/v2**，D4S2 被排除；**不必**再跑 `count17-ctl2`（若 Lead 仍要形式化 A/B，可跑，但不构成门禁）。
