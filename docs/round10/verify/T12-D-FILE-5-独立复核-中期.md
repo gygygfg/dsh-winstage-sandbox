@@ -157,6 +157,7 @@ DEMO_END
 ```
 车道事实（我自己解析）：`tierEffective=TS`（出现 1 次）、`launchMode=shim`（1 次）、**`C00000FD` = 0 次**、`execution.exitCode=0`、`exec.err` = 0 B、`cli.rc=0`。
 ⇒ **两条 `status=` 都有值且 `DEMO_END` 出现** = 守卫把"lockdown 名族触发的重入环"**就地终止**（同一演示件在无守卫的 D99/count16 上按作者设计会死于 `0xC00000FD`、打不出 `DEMO_END`）。**残留说明**：本轮由 `lane-runner` 执行、用其驱动；我方已冻结一份等价驱动 `.t\round10\verify\t12\d99-demo-driver.cmd`（`76B140A17021038B931A90C80CADA798443F321727D3B6CC5EC23539C979DFC2` / 660 B / 非 ASCII=0）备用，**本轮未使用**（避免无谓重复轮次）。
+> **调用形态更正（`lane-runner` 指出，我方记录）**：冻结的 `cli-run.cmd` **只取 5 个参数** `<dll> <stage> <ws> <out> <driver>`；我先前消息里多写的第 6 个 `<evdir>` **会被忽略**。我的驱动**不使用**该参数（其 `EV` 仅为占位、默认 `.`），故按 **5 参数形式**调用即可，无功能影响。**这一条已写入以备后人别再写错。**
 
 ## 5b. **污染事故的独立观察**（Lead 指派）+ 防复发护栏
 

@@ -821,18 +821,117 @@ int ws_hook_stats(int *iatSites, int *modules, int *delaySites)
 
 /* ------------------------------------------------------- control hooks */
 
-FARPROC WINAPI ws_GetProcAddress(HMODULE hModule, LPCSTR lpProcName)
+/* D-FILE-4 stage 2 (ii) -- ordinal route.
+ *
+ * An ordinal import carries no name, so the only sound way to decide whether the
+ * resolved function is one we cover is POINTER IDENTITY against real export
+ * addresses. Two sources feed that comparison and BOTH live inside this file:
+ *   1. g_targets[i].originalSlot -- the originals ws_hook_init() captured; a
+ *      NULL slot is skipped (never guessed);
+ *   2. g_d4OrdMap[] below -- the six targets whose originals live in ws_file.c's
+ *      own file-static variables (they are NOT read from g_orig there), so
+ *      ws_hook_init() cannot fill them and we must not touch that structure.
+ *      Their real addresses are resolved lazily with the REAL resolver
+ *      (g_orig.GetProcAddress); we never resolve through our own hook.
+ *
+ * No export-table walk, no name table, no new hook target, no change to
+ * winstage_internal.h or ws_file.c. Every failure mode keeps the real result. */
+typedef struct WsOrdEntry {
+    const char *name;
+    void *wrapper;
+    void *real; /* lazy: only touched on the rare ordinal route */
+} WsOrdEntry;
+
+static WsOrdEntry g_d4OrdMap[] = {
+    { "GetFileInformationByHandle", (void *)ws_GetFileInformationByHandle, 0 },
+    { "NtQueryInformationFile", (void *)ws_NtQueryInformationFile, 0 },
+    { "GetFileInformationByHandleEx", (void *)ws_GetFileInformationByHandleEx, 0 },
+    { "NtQueryAttributesFile", (void *)ws_NtQueryAttributesFile, 0 },
+    { "NtQueryFullAttributesFile", (void *)ws_NtQueryFullAttributesFile, 0 },
+    { "NtQueryInformationByName", (void *)ws_NtQueryInformationByName, 0 },
+};
+
+static void *ws_d4_ord_real(WsOrdEntry *e)
 {
-    if (lpProcName && (ULONG_PTR)lpProcName > 0xFFFF) {
-        void *rep = ws_hook_resolve(lpProcName);
-        if (rep) {
-            return (FARPROC)rep;
+    void *p = (void *)InterlockedCompareExchangePointer((void *volatile *)&e->real, NULL, NULL);
+    if (p) {
+        return p;
+    }
+    if (!e->name || !g_orig.GetProcAddress) {
+        return NULL; /* no real resolver => no substitution at all */
+    }
+    const HMODULE order[] = { g_orig.hKernelBase, g_orig.hKernel32, g_orig.hAdvapi32, g_orig.hNtdll };
+    for (size_t k = 0; k < sizeof(order) / sizeof(order[0]) && !p; k++) {
+        if (order[k]) {
+            p = (void *)g_orig.GetProcAddress(order[k], e->name);
         }
     }
+    if (p) {
+        void *prev = InterlockedCompareExchangePointer((void *volatile *)&e->real, p, NULL);
+        if (prev) {
+            p = prev; /* another thread won the race: use its pointer */
+        }
+    }
+    return p;
+}
+
+/* Map a REAL resolved address to the wrapper that covers it, or NULL. NULL means
+ * "not ours": the caller keeps the real result (never fail-closed). */
+static void *ws_wrapper_for_real(const void *addr)
+{
+    if (!addr) {
+        return NULL;
+    }
+    for (size_t i = 0; i < WS_TARGET_COUNT; i++) {
+        if (!g_targets[i].originalSlot || !*(g_targets[i].originalSlot)) {
+            continue; /* not captured: cannot vouch for identity */
+        }
+        if (*(g_targets[i].originalSlot) == addr && ws_family_enabled(g_targets[i].name)) {
+            return g_targets[i].replacement;
+        }
+    }
+    for (size_t i = 0; i < sizeof(g_d4OrdMap) / sizeof(g_d4OrdMap[0]); i++) {
+        if (!ws_family_enabled(g_d4OrdMap[i].name)) {
+            continue;
+        }
+        if (ws_d4_ord_real(&g_d4OrdMap[i]) == addr) {
+            return g_d4OrdMap[i].wrapper;
+        }
+    }
+    return NULL;
+}
+
+FARPROC WINAPI ws_GetProcAddress(HMODULE hModule, LPCSTR lpProcName)
+{
+    /* D-FILE-2 safety: with no captured real resolver we cannot answer at all.
+     * Returning NULL (what a loader with no such export answers) is the only
+     * fail-safe option; never fabricate a pointer, never fail-closed with a
+     * synthetic error. */
     if (!g_orig.GetProcAddress) {
         return NULL;
     }
-    return g_orig.GetProcAddress(hModule, lpProcName);
+    /* D-FILE-4 stage 2 (i) -- ask the REAL resolver FIRST. It is the only
+     * authority on whether (hModule, lpProcName) actually exists, so the hook
+     * can no longer "invent" an export: asking the wrong module for one of our
+     * covered names used to return our wrapper where the loader answers NULL,
+     * which is exactly what a tamper/feature probe can detect. The real result
+     * is also what the ordinal identity check below needs.
+     *
+     * Cost is bounded: for names we do NOT cover this is the same single real
+     * resolution the old code already performed; only for the ~60 covered names
+     * is one real resolution added (the old code short-circuited them). */
+    FARPROC real = g_orig.GetProcAddress(hModule, lpProcName);
+    if (!real || !lpProcName) {
+        return real;
+    }
+    if ((ULONG_PTR)lpProcName > 0xFFFF) {
+        void *rep = ws_hook_resolve(lpProcName);
+        return rep ? (FARPROC)rep : real;
+    }
+    /* D-FILE-4 stage 2 (ii): lpProcName is a small integer = an ordinal import.
+     * Substitute only on exact pointer identity with a real address we know. */
+    void *wrap = ws_wrapper_for_real((const void *)real);
+    return wrap ? (FARPROC)wrap : real;
 }
 
 HMODULE WINAPI ws_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags)
@@ -886,6 +985,14 @@ NTSTATUS NTAPI ws_LdrGetProcedureAddress(PVOID DllHandle, const void *ProcedureN
             if (rep) {
                 *ProcedureAddress = rep;
             }
+        }
+    } else if (st >= 0 && ProcedureNumber != 0 && ProcedureAddress && *ProcedureAddress) {
+        /* D-FILE-4 stage 2 (ii), ordinal form of the same primitive: the caller
+         * asked by ordinal, so there is no name to match. Same identity rule as
+         * ws_GetProcAddress; no match keeps the real address (never fail-closed). */
+        void *wrap = ws_wrapper_for_real(*ProcedureAddress);
+        if (wrap) {
+            *ProcedureAddress = wrap;
         }
     }
     return st;

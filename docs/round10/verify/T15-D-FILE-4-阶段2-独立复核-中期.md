@@ -1,0 +1,104 @@
+# T15 · D-FILE-4 阶段2（`out-13d-count18`）独立复核 —— 中期
+
+> 验证者 `exe`（只读审计）。task-15 第 5 项 = 我方职责；第 4 项 (i)(ii) 的**独立复跑**待 `env-harness` 探针原始件到手后逐行复核（见 §5）。
+> 候选：`.t\round10\shim\out-13d-count18\winstage-shim.dll`
+
+## 0. 判定速览
+
+| # | 项 | 判 | 依据 |
+|---|---|---|---|
+| 1 | 独立度量 | **PASS · 0 差异** | §1 |
+| 2 | 红线审计 36 项 | **PASS 36/36** | §2 |
+| 3 | apply 链复现 | **PASS** | §1 |
+| 4 | 封印面 | **PASS**（exit 0 / 115） | §2 |
+| 5 | 静态审计（(i)(ii)/递归/fall-closed/误伤） | **PASS**（2 条残留已记录） | §3 |
+| 6 | (i)(ii) **独立自跑** | **待原始件**（不转述结论） | §5 |
+| 7 | **污染件交叉验证**（pkgs 点名） | **成立** | §4 |
+
+## 1. 独立度量 + apply 链（我方工具 `t5-metrics.mjs`；与 pkgs 广播逐项相等）
+```
+c18|out-13d-count18\winstage-shim.dll|266240|2026-10-10T10:25:45.726Z|bdf0672c449b7c70c7eb0b432068ba3dcbe40b67e312b45c74507e2cada50af7|textSha=31630977996b7cc81b7586fda8af990c8ef3c6d438fd57cb23908d6200f03335 textRaw=212992 exports=15
+c18|…\winstage-inject.exe|159232|…|03c93e2cbc5ca12765ab8aa9c55ee7762ae34689a6a5553b2ec49f0fe2bc651a|textRaw=130560
+c18|…\winstage-probe.exe|174592|…|9f11aed9ad40c8072a6d4e5189b4cca50b9acde8050c741f342e1278d8da0bf3|textRaw=145408
+c18|.t\round10\shim\d4\D100-d4s2-ordinal-invented-export.patch|6389|…|ef33451e1755a6772285bfb8d6c8594053dd445936e16f8e26343f7a700f3138
+c18|shim\src\ws_hook.c|41410|…|1c14ab545e8e9917baa9fcf90b1c8c5c6fea7ade73136ed3b08a2e6e4d189852
+c18|shim\src\ws_file.c|87118|…|9826329bdfcba8419bde9c3218dc072b4dd4fb87abd2d9757721ce9fb7b1cb06
+```
+**apply 链（仓内 scratch，独立复现）**：`.t\round10\shim\d4\D4S2-baseline-ws_hook.c` = `3E2EBEE6…`/36,375 B → `apply --check` rc=0 → `apply` rc=0 ⇒ **`1C14AB54…`/41,410 B**（= 树值 = pkgs 声明）✅
+
+## 2. 红线 36 项 + 封印面
+工具 `.t\round10\verify\t5\t5-redline-check.mjs`（已把 REFERENCE 更新为 v2 APPLIED `ws_file.c=9826329B…`/87,118 与 D4S2 APPLIED `ws_hook.c=1C14AB54…`/41,410，并把 **count16/count17 加为 FROZEN**）：
+```
+T5-REDLINE ALL-PASS items=36
+```
+含 `shim/out`=`63808F51…`/257,024、`ws_reg.c`=`F5695A95…`、`ws_regstore.c`=`125CB9FF…`、inject/probe 原件、count2–count17（**count16 `97CB71A2…` 作为被拒证据保留、count17 `B451ABE3…` 作为 v2 留档，均未被重建**）、out-16…out-22b、out-13c/14c、旧 `02C7418F`。
+封印面：`基线一致：115 个受封印文件与 docs/源码基线.sha256 逐条相符` / **exit 0**。
+
+## 2b. ②（registry `arm-t3-count18`）独立复核 + 载体安全 —— **PASS**
+我方**自己复算**（不抄结论）：
+- `step1a`=`step1b`=`4499283166530CE395CBC12677FEF2BD52759EACDCC5BDDE56C039B1A2E99C0B`/40 B；
+- **`step2a`=`step2b`=`step3` = `12AA39D1F31AF899C625CDB0D7DB384F86F394262801252D5334FADE863972CB` / 78 B**（逐字节一致）；
+- 四轮 `t1..t4`：`query-value-exit=0` **×4**、`query2-value-exit=0` **×4** ⇒ **四条件 4/4**；
+- 门禁 `t3_replay_journal: applied=5 auditSkipped=0 bytes=480 rc=0` **在**（22 处）；
+- `child injection armed: self=` **唯一值 = `…\out-13d-count18\winstage-shim.dll`**；
+- provenance：`OVERRIDE_DLL_SHA256_BEFORE = AFTER = BDF0672C…`、`OVERRIDE_DLL_HASH_STABLE_DURING_RUN=True`、`SHIM_OUT_UNTOUCHED=True`、`EXEC_EXIT=0`；
+- **载体安全三项（我方在整目录内核对）**：`tierRequested=TS`、`tierEffective=TS`、`launchMode=shim`，且 `fallbackReason` **0 处**、`0xC00000FD` **0 处** ⇒ **通过**；
+- `logs\shim.log` = 15,312,394 B / `0096B6AC4A014489FEEBB69F5EE471AB6259CFC31F3BD48BC4FBBC240DA06753`。
+（这一点是 task-15 里"最关键回归门"——`GetProcAddress` 语义被改动而注册表/文件面色零回归 ⇒ **成立**。）
+
+## 3. 补丁静态审计（`D100` = 2 hunk，均在 `ws_hook.c`）
+
+### (i) 禁"发明导出" —— **实现正确**
+新流程：`if (!g_orig.GetProcAddress) return NULL;` → **先用真实解析器** `real = g_orig.GetProcAddress(hModule, lpProcName)` → `if (!real || !lpProcName) return real;` → 名字路径走 `ws_hook_resolve`，**未命中回落 `real`**。
+⇒ `GetProcAddress(kernel32,"NtQueryInformationByName")`：真实解析器给 **NULL** ⇒ **返回 NULL**（旧代码会返回我们的包装 ⇒ "发明导出"已消除）✅
+⇒ 对**未覆盖**名字：行为与旧代码**同**（仍是一次真实解析）✅
+
+### (ii) 序数路由 —— **按指针同一性实现，且用真实解析器**
+`ws_wrapper_for_real(addr)`：先查 `g_targets[i]`（要求 `originalSlot` 非空且 **`*slot == addr`**，并 `ws_family_enabled`）；再查新增 `g_d4OrdMap[6]`（其 original 在 `ws_file.c` 的 file-static 变量里，`ws_hook_init` 填不到），每项用 **`g_orig.GetProcAddress`** 在 `{kernelbase, kernel32, advapi32, ntdll}` 里**惰性**解析真身后做**同一性比较**。`ws_d4_ord_real` 用 `InterlockedCompareExchangePointer` 做线程安全缓存；**无真实解析器 ⇒ 返回 NULL ⇒ 不换**。`ws_LdrGetProcedureAddress` 的序数分支同样以 `*ProcedureAddress` 做同一性判定。⇒ 命中才换成包装，**未命中恒保留真身** ✅
+
+### 递归（pkgs/Lead 点名）—— **未引入**
+新增路径里对外的调用只有 **`g_orig.GetProcAddress`（捕获的真实 API）**；其余为纯内存比较（`ws_hook_resolve` / `ws_family_enabled` / `Interlocked*`）。**没有**经 `GetProcAddress`/`LdrGetProcedureAddress` 的**被挂钩**入口回环 ⇒ 无自递归。**注意**：若实现里误用直接名 `GetProcAddress`（而非 `g_orig.`）就会自递归——本补丁**没有**这种写法（我已逐行核对）。
+
+### fail-closed / 误伤 / 代价
+- `!g_orig.GetProcAddress ⇒ return NULL`：与**旧代码逐字相同**（未新增 fail-closed）✅；其余一切失败回落真实结果 ✅
+- **误伤**：只对"真实解析结果存在"的调用做替换；未覆盖名字/其它模块走 `return real` ✅（见下"残留 1"）
+- **代价（观察项）**：对约 60 个覆盖名字**每次多一次真实解析**（旧代码短路）——作者已注明；可接受。
+
+### 残留（记录，非阻塞）
+1. **名字路径仍按"名字"匹配**（`ws_hook_resolve(lpProcName)` 不校验 `real` 是否属于该模块）：若某模块合法导出**同名但不同函数**且我们覆盖该名，会被换成我们的包装。**此为既有设计**（D4S2 之前即如此、且当时更糟——会发明导出）；若要闭环，可改为对名字路径也先做 `ws_wrapper_for_real(real)` 指针同一性、失败再回落名字匹配。**建议列入后续加固**。
+2. 名字路径的**额外真实解析**会让"覆盖名 + 冷缓存"路径多一次解析；`ws_d4_ord_real` 的惰性表仅在序数路径触发。
+
+## 4. 污染件交叉验证（pkgs 点名，**成立**）
+- 我今日 18:09 记录的**污染件** count17：`01ECE1E2…` / **266,240 B** / `.text 31630977…`
+- 今日的 **count18**（声明 v2+D4S2）：`BDF0672C…` / **266,240 B** / **`.text 31630977…`（完全相同）**
+⇒ **`.text` 逐字节相同、整件仅因构建元数据不同** ⇒ 独立证明"那次污染 = v2 + D4S2，且无杂散改动"；count18 = 同一代码的**合法重建** ✅
+**连带确认**：我当时对污染件跑出的 7/7（已撤回）**实际测的是 v2+D4S2 的代码**——撤回仍然正确（它不是被声明的候选），但它顺带说明 D4S2 代码在 D-FILE-5 的 7 门上也能全过（**仅记录，不作 D4S2 的验收**）。
+
+## 5. (i)(ii) **独立自跑** —— **PASS**（我方亲自跑，非转述）
+
+**载具是 lane-free 的**（`LoadLibraryW` 候选 + 直接 `GetProcAddress`，无需车道/注入器）⇒ 我**自己跑了一遍**：
+```
+cmd /c "call .t\round10\shim\d4\D4S2-offline-gpa-count18.cmd"   （RC=0）
+```
+我方原始输出：`.t\round10\verify\t12\t15-gpa-mine.txt`（与既有件 `.t\round10\shim\d4\D4S2-offline-gpa-count18.txt` **模式逐行一致**，含地址——本会话 ASLR 基址相同）。
+
+| 用例（`what`） | `before`（无 shim，真值） | `count15`（修前控制） | **`count18`（v2+D4S2）** | 判 |
+|---|---|---|---|---|
+| `wrong-module:owned-name`（kernel32 + 覆盖名） | `ptr=0` owner=NULL | **`0x6FBF4CE0` owner=winstage-shim.dll**（**发明导出**） | **`ptr=0` owner=NULL** | **(i) PASS** |
+| `wrong-module:owned-name-2` | `0` | **包装** | **`0`** | **(i) PASS** |
+| `right-module:owned-name`（ntdll） | 真身 `0x7FFB63745230` | 包装 `0x6FBF4CE0` | **包装 `0x6FBF5420`** | **活性正对照 PASS** |
+| `ordinal-495`（NQIFBN 序数） | 真身 `0x7FFB63745230` | **真身**（无路由） | **包装 `0x6FBF5420`**（= 上面同名包装指针） | **(ii) PASS** |
+| `ordinal-496` | 真身 `0x7FFB63745250` | 真身 | **真身 `0x7FFB63745250`** | **(ii) PASS** |
+| `not-covered:NtClose` | 真身 | 真身 | **真身** | **未误伤 PASS** |
+| `not-covered:GetModuleHandleW` | 真身 | 真身 | **真身** | **未误伤 PASS** |
+| `null-module` | `0` | **包装**（发明） | **`0`** | **(i) PASS** |
+| `LDR ldr-by-name` | 真身 | 包装 | **包装** | 活性 PASS |
+| `LDR ldr-ordinal-495` | 真身 | **真身**（无路由） | **包装** | **(ii) PASS** |
+| `LDR ldr-ordinal-496` | 真身 | 真身 | **真身** | **(ii) PASS** |
+| 各段 RC | `BEFORE_RC=0` | `C15_RC=0` | `C18_RC=0` | — |
+
+**判据说明（满足"指针身份"口径）**：以 `before`（无 shim）行为**真值基准**——`wrong-module:owned-name` 与 `ordinal-495/496` 的**真身指针**即真实解析器给出的地址；`count18` 下：
+- **(i)** 覆盖名问错模块 ⇒ **NULL**（与真值一致），修前返回我们的包装 ⇒ **"发明导出"确已消除**；
+- **(ii)** 序数 495 ⇒ **我们的包装**、496 ⇒ **真身**、未覆盖项恒真身、`null-module` ⇒ NULL；
+- **活性正对照齐备**：同 run 内 `right-module:owned-name`、`CreateFileW`、`LDR by-name` 均返回包装 ⇒ 钩子确实在场，故本轮的"NULL/真身"是**有效阴性**而非"没走到"。
+- 附带：`count15`（修前控制）在同一载具上**复现了缺陷**（发明导出 + 序数不路由）⇒ A/B 成立。
