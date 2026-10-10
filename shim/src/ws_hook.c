@@ -901,6 +901,48 @@ static void *ws_wrapper_for_real(const void *addr)
     return NULL;
 }
 
+/* O1 (task-16) -- name-path identity.
+ *
+ * The name path must substitute only when `real` really IS the function we cover.
+ * Address identity against the single original captured at init is NOT enough on
+ * this host (measured, see .t/round10/shim/d4/D4O1-offline-*.txt):
+ *   kernelbase and kernel32 export the same Win32 names at DIFFERENT addresses
+ *   (GetFileAttributesW kb=60FBCCB0 vs k32=621573E0; likewise CreateFileW,
+ *   GetProcAddress, LoadLibraryW, GetFileInformationByHandle(Ex),
+ *   MoveFileWithProgressW; advapi32 differs again for the Reg* family:
+ *   RegCreateKeyExW kb=60F85C60 / k32=62146D50 / adv=62E30AF0).
+ * So identity means: "`real` equals this name's export in ANY of the four system
+ * modules we capture originals from". That keeps coverage for every system handle
+ * (kernel32 / advapi32 variants included) while a FOREIGN module's same-named
+ * export -- whose address equals none of them, because an address belongs to one
+ * module only -- falls back to its own real function (the defect O1 closes).
+ *
+ * Cost/recursion: gated by ws_hook_resolve(), so it never runs for uncovered
+ * names and never resolves anything when the name is not ours; at most four real
+ * resolutions (via the REAL resolver g_orig.GetProcAddress -- never our hook).
+ * Safety: no match returns NULL and the caller keeps `real`; never fail-closed,
+ * never invents a pointer. */
+static void *ws_name_identity(const char *name, const void *real)
+{
+    if (!name || !real || !g_orig.GetProcAddress) {
+        return NULL;
+    }
+    void *wrapper = ws_hook_resolve(name);
+    if (!wrapper) {
+        return NULL; /* not a name we cover: nothing to substitute */
+    }
+    const HMODULE order[] = { g_orig.hKernelBase, g_orig.hKernel32, g_orig.hAdvapi32, g_orig.hNtdll };
+    for (size_t k = 0; k < sizeof(order) / sizeof(order[0]); k++) {
+        if (!order[k]) {
+            continue;
+        }
+        if ((const void *)g_orig.GetProcAddress(order[k], name) == real) {
+            return wrapper;
+        }
+    }
+    return NULL;
+}
+
 FARPROC WINAPI ws_GetProcAddress(HMODULE hModule, LPCSTR lpProcName)
 {
     /* D-FILE-2 safety: with no captured real resolver we cannot answer at all.
@@ -925,7 +967,14 @@ FARPROC WINAPI ws_GetProcAddress(HMODULE hModule, LPCSTR lpProcName)
         return real;
     }
     if ((ULONG_PTR)lpProcName > 0xFFFF) {
-        void *rep = ws_hook_resolve(lpProcName);
+        /* O1: identity, not name matching. First the captured originals / ordinal
+         * table (no API calls), then the system-module export variants of a
+         * covered name. A miss keeps `real` -- so a foreign module's same-named
+         * export is returned as-is (fidelity), never replaced by our wrapper. */
+        void *rep = ws_wrapper_for_real((const void *)real);
+        if (!rep) {
+            rep = ws_name_identity(lpProcName, (const void *)real);
+        }
         return rep ? (FARPROC)rep : real;
     }
     /* D-FILE-4 stage 2 (ii): lpProcName is a small integer = an ordinal import.
@@ -980,8 +1029,18 @@ NTSTATUS NTAPI ws_LdrGetProcedureAddress(PVOID DllHandle, const void *ProcedureN
         const unsigned char *s = (const unsigned char *)ProcedureName; /* ANSI_STRING */
         unsigned short len = *(const unsigned short *)(s + 0);
         const char *buf = *(const char *const *)(s + 8);
-        if (buf && len) {
-            void *rep = ws_hook_resolve_n(buf, len);
+        if (buf && len && len < 128) {
+            /* O1b (task-16): the SAME identity rule as ws_GetProcAddress's name
+             * path (one helper, one set of evidence). The name here is a counted
+             * ANSI_STRING, so it is copied to a bounded, NUL-terminated buffer
+             * first; a length we would not vet is not substituted (no guessing).
+             * `*ProcedureAddress` is the real address the loader just resolved for
+             * the caller's module handle, i.e. exactly the `real` identity needs.
+             * Miss -> keep the real address (never fail-closed, never invent). */
+            char namez[128];
+            memcpy(namez, buf, len);
+            namez[len] = 0;
+            void *rep = ws_name_identity(namez, *ProcedureAddress);
             if (rep) {
                 *ProcedureAddress = rep;
             }
