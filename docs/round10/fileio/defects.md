@@ -212,19 +212,21 @@
 
 ---
 
-## D-FILE-4【设计边界 · 非回归 · 非 fail-open】IAT-interception coverage boundary（IAT 挂钩对动态解析调用不可见）
+## D-FILE-4【已实测更正 · 设计边界 · 用户态不可闭合】私有解析边界（绕过全部已挂钩解析入口才不可见）
 
 | 项 | 内容 |
 |---|---|
-| 一句话 | **仅经 `GetProcAddress` / 延迟导入使用的 API，IAT 挂钩点无法覆盖** ⇒ 隔离面在该类调用上存在**盲区**。 |
-| 判据（**双条件，缺一不可**） | ① **显式探针可命中**：`.t/round10/fileio/13d-count-probe/loadprobe/gfibhex-probe.exe`（`5620B04037C3FDA6F1D8608B046B634C088F67D840F855C38C153FE47F8A30DA`）显式导入并调用 ⇒ `shim.log` 出现 `ATTRDBG-GFIBHEX` **4 行** + `R11-D-13d hit GetFileInformationByHandleEx n=2`，全 `ok=1 err=0`；② **目标进程 0 行**：同候选 `out-13d-count9` 主探针 run 中该标记**全进程 0 行**、hit **0 条**（对照：`NtQueryInformationFile` 599 行/5 pid、`GetFileInformationByHandle` 91 行/3 pid）。 |
-| 归因 | 两条件同时成立 ⇒ 该进程集合中**没有任何模块按名导入**该 API ⇒ **无 IAT 站点可打**（与 `ws_hook.c` 安装期注释一致：hit=0 意味着没有模块导入它，只能经 `GetProcAddress` 到达）。 |
-| 含义 | 任何"**某 API 未被调用**"的否定结论，若该 API 可能被动态解析使用，**必须**附活性反证（显式探针）；**没有活性反证的 0 只能记 `inconclusive`**。本轮的 0 因此从"③"降级为"覆盖边界"。 |
-| **性质（务必分清）** | **不是回归**、**不是 fail-open**、**不是行为证据**。 |
+| 一句话 | **IAT 挂钩 + 两个解析器钩子（`GetProcAddress` / `LdrGetProcedureAddress`）已覆盖"按名动态解析"**；只有当调用方**绕过全部已挂钩解析入口**、自己取得函数指针时，包装才不可见。 |
+| **原主张（已作废）** | 旧文写"**仅经 `GetProcAddress` / 延迟导入使用的 API，IAT 挂钩点无法覆盖** ⇒ 隔离面存在盲区"。**实测证伪**：`GetProcAddress` **自身就是挂钩目标**（`ws_hook.c` 的 `ws_GetProcAddress`），命中名字即返回包装。旧文对的一半只是"IAT 挂钩点打不到无静态站点的 API"；错的一半是"因此动态解析看不见"。 |
+| **阶段 1 实测**（`docs/round10/shim/D4-阶段1-诊断与设计.md`） | 候选 `out-13d-count15`（`2240F2BB…`），免换件同层 override、`tierEffective=TS`；**同一 API / 同一路径**、一进程一路由：<br>**(a) 静态 IAT**：`GetFileAttributesW` **3/3 命中**、`NtQueryInformationByName`（`class=77`、合法 `OBJECT_ATTRIBUTES`）**3/3 命中**；<br>**(b) `GetProcAddress`**：两者各 **3/3 命中**，且返回指针与 IAT 槽值**逐位相同**（W `6FBF3890`、NQIFBN `6FBF4CE0`，`owner=…out-13d-count15\winstage-shim.dll`）；采纳件 `shim/out`（`63808F51…`）旁证同形（W 的 IAT 槽与 gpa 同为 `6FBF37E0`）⇒ **不是新候选的产物**；<br>**旁路（各 3/3 全 0 行）**：①自走导出表、②自解析真身解析器、③**按序数**（NQIFBN 序数 495）。<br>**活性正对照（同一 run）**：`[winstage-shim][6720][11] ATTRDBG-NQIFBN … staged=1 status=0x0 class=77 seq=6`、`[winstage-shim][1880][13] ATTRDBG-W rc=0 … staged=1 attrs=0x20 err=183`、12/12 探针 pid 均有 `child injection armed … ok=1`。 |
+| **边界形态（可判定）** | ① **自走导出表**（手工解析 `IMAGE_EXPORT_DIRECTORY`）；② **自解析出真身解析器**（先取得真 `kernelbase!GetProcAddress` / `ntdll!LdrGetProcedureAddress` 再用）；③ **按序数解析**。三条**均已实测**（各 3/3 未进包装）。<br>④（**未实测**，推理）注入前已缓存的函数指针；⑤（**未实测**，推理）ntdll/loader 内部解析（`LdrpGetProcedureAddress`/`LdrpLoadDll` 本机**未导出**）；⑥（**未实测**，推理）直接 `syscall` / 其它进程代办。 |
+| **用户态不可闭合（明确不做 F/G）** | ①②③ **无法**由任何用户态解析器钩子闭合（钩子只能盖住"解析入口"，盖不住"自己解析"）。唯一闭合手段是 **inline/入口点钩子**或**内核侧**（阶段 1 方案表 F/G）：需改 `ntdll/kernelbase .text`、自写 trampoline/指令长度解码，与 CFG / Defender / 完整性校验冲突且有并发窗口 ⇒ **风险收益不成立，明确不做**。 |
+| **已闭合的两个保真小项**（阶段 2，`ws_hook.c`，2026-10-10） | ① **禁止"发明导出"**：旧 `ws_GetProcAddress` 不看 `hModule`、按名直接返回包装 ⇒ `GetProcAddress(kernel32,"NtQueryInformationByName")` 返回**包装**（真值应 `NULL`；实测 3/3，连 `hModule=NULL` 也返回包装）⇒ 会骗过防篡改/特性探测。新写法**先调真实解析器**：真实结果为 `NULL` 一律返回 `NULL`；非 `NULL` 且名字命中才换包装。<br>② **序数路由**：旧写法 `(ULONG_PTR)lpProcName <= 0xFFFF` 直接透传。新写法用**真实解析器**解析序数，再与"已知真实地址"做**指针同一性**比较（`g_targets[]` 已捕获的 orig + `ws_hook.c` 内本地表 `g_d4OrdMap[]` 覆盖的 6 个由 `ws_file.c` 自持 orig 的目标），命中才换包装；未命中/未解析/异常 ⇒ **原样返回真实结果**。详见 `docs/round10/shim/D4-阶段2-补丁与双前置.md`。 |
+| **读法纪律（一等）** | ① **0/阴性结论必须附同 run 活性反证**（本条的 0 行正是靠 `static-*` 命中才立住）；② **`shim/out` 采纳件无任何 `ATTRDBG` 标记、且不含 `NQIFBN`/`GFIBHEX`/`NQAF`/`NQFAF` 目标名**（二进制串扫描）⇒ **它的 0 行不携带信息**，不得当阴性结论 —— 读旧日志尤其注意。 |
 | **与 `D-R8` 的区别** | `D-R8` 问"**拦截失败时平台是否裸跑**"（fail-open 判据，窗口 #8 仍**未被演示**）；本条问"**拦截面本身看不看得见**"（覆盖/可见性）。二者**不同层**。 |
-| 建议 | ① 凡"未调用"结论必须带活性反证；② 若需覆盖动态解析类调用，要**非 IAT 的拦截手段**（`GetProcAddress`/`LdrGetProcedureAddress` 钩子或内核侧），属另一立项；③ 文中凡引用"IAT 0 命中"处须同时标注本条边界。 |
-| 证据 | `docs/round10/fileio/13d/stage-gfibhex/①-活性正对照.md`（已置顶为一等结论）；`stage-gfibhex/结论.md`；`.t/round10/fileio/13d-count-probe/loadprobe/*` |
-| 状态 | **已知设计边界**（不修，属方法论）；已升为一等结论 |
+| **与 `D-FILE-5` / `D-FILE-6` 的区别** | `D-FILE-5` = 看得见但**语义不对**（`NQAF`/`NQFAF`，无已知调用方）；`D-FILE-6` = 语义不对且**已造成真实故障**（`NQIFBN`）；本条 = **看得见吗**。 |
+| 证据 | `docs/round10/shim/D4-阶段1-诊断与设计.md`（阶段 1 全量：方案取舍表 A–H、风险 R1–R8、限制项）；`docs/round10/shim/D4-阶段2-补丁与双前置.md`（阶段 2：双前置 + 离线 A/B）；原始件 `.t/round10/shim/d4/`（`METRICS.txt`、`D4-rawlines-c15.txt`、`copies/*`、`D4S2-*`）。 |
+| 状态 | **已实测更正**；①②③ 记为"用户态不可闭合"的已知边界（明确不做 F/G）；两个可闭合保真小项**已实现**（阶段 2），等车道验收。 |
 
 ---
 
@@ -235,7 +237,7 @@
 | 现象 | 线 A#2 主探针 run 中，唯一夹具绑定行来自**非探针进程**：`[4964][7659] ATTRDBG-NQFAF pid=4964 handle=0 path=\??\…\ws-stage16\probe\pa-fixture.txt status=0xc000003a` ⇒ 我们的 `NtQueryFullAttributesFile` 对**逻辑路径**原样返回 `STATUS_OBJECT_PATH_NOT_FOUND`，**未做 overlay 感知**（同族 `NtQueryAttributesFile` 亦同）。 |
 | 含义 | **将来任何调用方若用 `NQFAF`/`NQAF` 查询"已暂存/被覆盖层服务"的文件，我们会报"不存在"** ⇒ 对依赖这两个 API 做存在性判定的调用方属**隔离语义缺口**（真实存在性被漏报）。 |
 | 现状定性 | **不是** node 的失败路径（node 的 `stat`/`lstat` 根本不走这两个 API —— 线 A#1/A#2 已证 **③**）⇒ 属**同族入口的覆盖边界/语义缺口**，**未修**。 |
-| 与 `D-FILE-4` 的区别 | `D-FILE-4` 问"**看得见吗**"（IAT 对动态解析不可见）；`D-FILE-5` 是"**看得见但语义不对**"。 |
+| 与 `D-FILE-4` 的区别 | `D-FILE-4` 问"**看得见吗**"（**已实测更正**为"私有解析边界"：IAT + 两个解析器钩子已覆盖**按名动态解析**，只有自走导出表 / 自解析真身 / 按序数才不可见）；`D-FILE-5` 是"**看得见但语义不对**"。 |
 | 证据 | `docs/round10/fileio/13d/stage-nqfaf/evidence/shim.log`（`9681E4B6AAFC44D1D2752AA594904C65F9C46A4D907EAD389EE2D8235B45C6CF`，9,945,585 B，53,963 行）；`pkgs` 车道内活性样例（`status=0x0` 存在 / `0xC0000034` 名不存在 / `0xC000003A` 路径不存在）。 |
 | 建议修法（留待单独候选，先日志/先判据） | ① 在这两个包装内做 **overlay 感知的存在性判定**（命中覆盖层即按覆盖层回答）；或 ② **明确文档化"不感知 overlay"语义**并禁止其用于暂存路径判定。二者择一。 |
 | 状态 | **未修**；已随线 A#3 一并立案（Lead 要求） |
@@ -250,7 +252,28 @@
 | 现象（原始行） | `ATTRDBG-NQIFBN pid=3932 handle=0 path=\??\C:\…\ws-stage17\probe\pa-fixture.txt status=0xC000003A class=77`；`lstat`(8384) 与 `exists`(2528) **各同形 1 条**。 |
 | 判据 | 夹具绑定行**存在**且 `status=0xC000003A`（失败）⇒ 预登记表 **②**（"被调用但返回失败"）。活性反证：全局 `ATTRDBG-NQIFBN` **95 行**、`hit n=24/24/24/23` ⇒ **不是死钩子**。 |
 | 影响（高） | **真实用户可见**：node 的 `fs.statSync`/`fs.lstatSync`（以及 `existsSync` 的一次探测）对**沙箱内已暂存文件**报 `ENOENT`；与"`readFileSync` 成功"并存 ⇒ 同路径两套 API 结论矛盾。 |
-| 与同族条目的三条区分 | `D-FILE-4` = **看得见吗**（IAT/动态解析覆盖边界）；`D-FILE-5` = 看得见但**语义不对**（`NQAF`/`NQFAF`，暂无已知调用方）；**`D-FILE-6` = 语义不对且已造成真实故障**（`NQIFBN`）。 |
+| 与同族条目的三条区分 | `D-FILE-4` = **看得见吗**（**已实测更正**为"私有解析边界"：自走导出表 / 自解析真身 / 按序数，用户态不可闭合）；`D-FILE-5` = 看得见但**语义不对**（`NQAF`/`NQFAF`，暂无已知调用方）；**`D-FILE-6` = 语义不对且已造成真实故障**（`NQIFBN`）。 |
 | 证据 | `docs/round10/fileio/13d/stage-nqifbn/evidence/shim.log`（`00219500CB44B994C8722212709334ECFA30A815B910E4F61C4484C38093FBBE`，10,025,461 B，**54,104 行**）；`pa-actions.jsonl`（`C8984BCA3A4112DC7BBB73A23BDA0CE2B0FA5007148334E95F8716B2D9B55DF8`）。 |
 | 建议修法（下一个修复候选） | 在包装内**先按覆盖层解析逻辑名**（与读路径同源；命中即按覆盖层回答存在/属性），**未命中才回落真实 API**；**未解析/异常一律安全降级、绝不 fail-closed**；不动其它目标与 injection/路径逻辑。验收三层：① 离线 `dshregprobe2 ALL=True`；② 零语义复跑（`step2a`/`step2b` 逐字节 `12AA39D1…`、D-R1 四条件不回归）；③ **行为验收**：同车道免换件下 `statSync`/`lstatSync` 对已暂存文件**转成功**、`readFileSync` 不变、`existsSync` 现状不变（其异常属线 B），并附夹具绑定原始行。**任一回归即回滚停下上报。** |
 | 状态 | **未修**；已定为**下一个修复候选**（Lead 2026-10-10 裁定，定级高） |
+
+---
+
+## D-FILE-7【高 · 产品缺陷 · 未修 · 随"逐个同族 API 加 overlay 感知"路线出现】`NQAF`/`NQFAF` 的 **overlay 路径重入**（缺 `_Thread_local` 守卫）⇒ 无界递归
+
+> 条目文本由 `exe` 起草（Lead 2026-10-10 指派）、由 `line-d4` 并入本台账；**触发面已由 `exe` 自查更正**（原稿归因 lockdown 名族 = **错**，实测 0 命中）——**以本条为准**。
+> **来源**：`docs/round10/verify/T12-D-FILE-5-独立复核-中期.md` §6（重查）；量测工具：`exe` 的 `.t/round10/verify/t12/t12-reentry-scan.mjs`。
+> 行号为 **T12 当时的树**（D99 apply 后）；后续重定位请以**符号名**为准。
+
+| 项 | 内容 |
+|---|---|
+| 一句话 | 给 `NtQueryAttributesFile`/`NtQueryFullAttributesFile` 加 overlay 感知后，包装经 `ws_attrbyname_overlay` → `ws_stat_resolve` → provider / `ws_real_attrs_w` **派生并查询覆盖层候选路径**；真实 `kernelbase!GetFileAttributesW` 内部走 `NtQueryAttributesFile`（**其 IAT 站点已被本 shim 挂钩**）⇒ **以覆盖层路径重入我们自己的 NQAF 包装** ⇒ 无守卫则再派生 ⇒ **深度无界** ⇒ `STATUS_STACK_OVERFLOW (0xC00000FD)`。`t_wsFileBusy` 在该链上**只读不置位**，拦不住。 |
+| **触发面（更正后，务必按此）** | **任何会使 `ws_real_attrs_w` 以*覆盖层派生路径*落到 kernelbase 的调用** —— 与 lockdown 名族**无关**。实测：崩轮 NQAF 日志里 `__PSScriptPolicyTest`/`__PSAppLockerTest` 命中 **0 条**；而入参 `path=` **本身已是覆盖层路径**（`…\staged\wo\…` / `…\staged\fs\…`，只可能由 shim 自己派生）**占 89%**。 |
+| 机制链（源码符号） | 外部 `NtQueryAttributesFile(逻辑名)` → `ws_NtQueryAttributesFile` → `ws_attrbyname_overlay` → `ws_stat_resolve()` → provider / `ws_real_attrs_w()`（符号名 `ws_real_attrs_w`，= `g_orig.GetFileAttributesW(...)` = 真实 kernelbase）**派生并查询覆盖层候选路径** → kernelbase 内部 `NtQueryAttributesFile` ⇒ **重入我们的包装** → 无守卫则再派生。守卫现状：`t_wsFileBusy`（`_Thread_local int`）**只在** DeleteFileW / MoveFileExW / RemoveDirectoryW 等少数包装自增；NQAF/NQFAF/`ws_attrbyname_overlay`/`ws_stat_resolve` **都不置位**。 |
+| **实测（重查；原始行可复核）** | ① **量测键**：不能用"同路径连跑"（每层路径都被解析链派生）⇒ 用"**入参已是覆盖层路径**"：**B = 1,390/1,562、c16 = 1,433/1,601（≈89%）**，且这些行 **100% 继续解析（`staged=0`、`mapped≠<none>`）、被拒 = 0**；② **相邻 NQAF 的 `seq` 间隔 median = 1**（背靠背嵌套）；③ **单变量 A/B（三方独立一致）**：`dbg-guard`（**只加** `t_wsAttrBusy` 守卫、栈画像与 D99 相同）⇒ `tierEffective=TS`/`launchMode=shim`/无 `fallbackReason`、载体存活、其 7 门预登记仪器 **ALL-PASS 7/7**（含 G4 命中 33 行 `staged=1 status=0x0` + `nt=\??\`、G5 whiteout、G6 真实盘负对照、G7 严键）；`dbg-smallframe`（只把大缓冲移出栈、**无守卫**）⇒ `T1`/`restricted-token`/`carrierExits=[0xC00000FD ×3]`、仍崩、仪器 **FAIL 4/7**。⇒ **重入是成因；≈41–49 KB/调用是放大器，不是成因**；④ 守卫轮：同类行 15,663 中 **8,019（51%）在 helper 入口被拒**（`staged=-1`、`mapped=<none>`）⇒ **守卫在 helper 入口断环**。 |
+| 影响（高） | 一旦走到该环：每层递归再叠**单次 ≈41–49 KB 栈**（包装 3×`WS_PATH_MAX`=24,576 B + 共享 helper 2×`WS_PATH_MAX`=16,384 B）⇒ 数层内 `0xC00000FD`、载体进程死亡、TS 车道回落 T1（实测 `carrierExits=[0xC00000FD ×3]`）。 |
+| ★ **结构性推论（本条最该记住的）** | **`out-13d-count15`（NQIFBN v2）之所以"安全"，只是因为当时 `NQAF`/`NQFAF` 仍是 pass-through**：`kernelbase!GetFileAttributesW` **不会**回调 `NtQueryInformationByName`，故那个环不闭合。**D99 一旦让 `NQAF` overlay 感知，环就闭合了**（实测 `dbg-smallframe` 仍崩、`dbg-guard` 转绿）。更近一步：**已采纳的 `ws_GetFileAttributesW` 自身就调 `ws_real_attrs_w`**，距此环**只差一步**。⇒ 该路线上**每新增/每改动一个同族 API，都必须检查它是否出现在 `ws_real_attrs_w` 所触发的真实调用路径上**。 |
+| **与 `D-FILE-2` 的区别（勿合并）** | `D-FILE-2` = `g_orig` 未解析时**伪造失败**（**fail-closed**）⇒ 载体连崩 3 次；本条 = **无界重入**（覆盖层路径自派生）⇒ `0xC00000FD`。**不同成因、不同修法、不同证据**。 |
+| 证据 | 重查与量测：`docs/round10/verify/T12-D-FILE-5-独立复核-中期.md` §6（含**被证伪的原预测与更正**）；工具/输出：`.t/round10/verify/t12/t12-reentry-scan.mjs`（覆盖层入参计数、守卫轮拒绝计数、`seq` 间隔）。崩溃渠道证据：`docs/round10/registry/evidence/fix-r1/arm-t3-count16/BLOCKER-transparent-probe-c16.json`（`carrierAttempts=3/3 carrierExits=[0xC00000FD,…]`）、`.t/round10/fileio/d5/out-d5-c16/exec.json`（`tierEffective=T1`/`launchMode=restricted-token`）、`.t/round10/fileio/d5/stage-d5-c16/staged/evidence/log-nqaf.txt`（1,601 行）。单变量对照：同 runner 的 c15 件 `shim-inject-canary ok=true` / `injector exit=0`。 |
+| 建议修法 | ① **必须**：在 **`ws_attrbyname_overlay`（或两包装）入口**加 `_Thread_local` **计数守卫**（`++/--`、**逐出口复位**，含早期 return；命中即拒绝重入、按既有契约原样透传），**同一守卫同步加到 `ws_NtQueryInformationByName`**（同形，今日不闭合）；② **可选加固**：大缓冲移出栈（`dbg-smallframe` 已证**不能替代**守卫，只能放余量）；③ 保持"绝不 fail-closed、绝不就地改写、whiteout 按返回码"的既有契约。**验收**：既有三层 + **载体安全一等门禁**（`tierEffective=TS` 且 `fallbackReason` 空 且 `carrierExits` 无 `0xC00000FD`）+ **重入回归**：入参已是覆盖层路径的 NQAF/NQFAF 调用**必须在有限深度内返回**（用 `t12-reentry-scan.mjs` 同类键断言"被拒/未再派生"，不得再出现 100% 继续解析）。 |
+| 状态 | **未修**；Lead 2026-10-10 裁定为"必修项"；**本轮修复件 = 只加守卫**：`line-a-fix` 已出 `D99-v2-guard.patch`，`pkgs` 将建 `out-13d-count17`（旧 `out-13d-count16` 保留为**被拒证据**）。 |

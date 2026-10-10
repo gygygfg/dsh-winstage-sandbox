@@ -1346,6 +1346,122 @@ BOOL WINAPI ws_GetFileInformationByHandleEx(HANDLE hFile, int FileInformationCla
     return ok;
 }
 
+/* ---------------------------------------------------------------- R11-D-99-attrbyname
+ * D-FILE-5: overlay-aware name resolution shared by the two *attribute-by-name*
+ * wrappers (NtQueryAttributesFile / NtQueryFullAttributesFile). **Neither has an
+ * IoStatusBlock** -- the only outputs are the NTSTATUS and the caller's
+ * FileInformation buffer -- so a whiteout is answered by the RETURN CODE
+ * (0xC0000034) and, on an overlay hit, the real API fills FileInformation itself
+ * from the overlay copy (that is exactly the "answer from the overlay" contract).
+ *
+ * Returns:
+ *   -1  not attempted / untrustworthy name => caller passes the ORIGINAL through
+ *    0  resolve chain ran, no overlay copy  => caller passes the ORIGINAL through
+ *    1  overlay copy exists                 => caller calls the real API with `nt_out`
+ *    2  whiteout                            => caller returns 0xC0000034, NO real call
+ * Out params: `path_out` = logical name after the NT-prefix strip (for `path=`);
+ *             `win_out`  = Win32 path produced by the resolve chain (for `mapped=`);
+ *             `nt_out`   = NT object path for the real API (only meaningful when 1).
+ *
+ * The constraints are the measured D96/D98 ones, verbatim:
+ *   - ObjectName may be NOT NUL-terminated => copy by Length;
+ *   - GetFullPathNameW does NOT strip `\??\` -- it MANGLES it into `C:\??\C:\...`
+ *     (D96 probe) => strip the NT prefix FIRST, then absolute-ise with the CWD;
+ *   - the real API requires the NT form (`\??\C:\...` / `\??\UNC\...`); only three
+ *     shapes can be converted, anything else passes the original through (never guess);
+ *   - never fail-closed, never fabricate success, never touch the caller's structure. */
+/* R11-D-99-v2：**重入守卫**（= 诊断件 A 的守卫，逐字保留；A 已实测救活载体）。
+ * 病因已双向定案：A（仅守卫、栈不动）载体存活，B（仅缩栈、无守卫）仍 0xC00000FD
+ * ⇒ 本次崩溃由**重入（递归）**造成。环（`exe` 源码级定名）：
+ *   NQAF/NQFAF → ws_attrbyname_overlay → ws_stat_resolve →
+ *   （仅当 ws_is_lockdown_probe(path)）ws_real_attrs_w → g_orig.GetFileAttributesW →
+ *   kernelbase → NtQueryAttributesFile → **回到我们的 NQAF** ⇒ 无界递归。
+ * 触发名族（PowerShell 启动会碰）：`__PSScriptPolicyTest_*` / `__PSAppLockerTest__`。
+ * 同一 `_Thread_local` 标志也被 NQIFBN 包装检查/置位（同族环，见其 overlay 入口）。 */
+static _Thread_local int t_wsAttrBusy;
+
+static int ws_attrbyname_overlay(int have_orig, POBJECT_ATTRIBUTES ObjectAttributes,
+                                 wchar_t *path_out, wchar_t *win_out, wchar_t *nt_out)
+{
+    int ret = -1;
+    path_out[0] = 0;
+    win_out[0] = 0;
+    nt_out[0] = 0;
+    if (!have_orig || t_wsFileBusy || t_wsAttrBusy || !ObjectAttributes) {
+        return -1; /* original not resolved, busy, or re-entrant: pass the call through */
+    }
+    t_wsAttrBusy = 1; /* single entry; every exit goes through the clear below */
+    do {
+        const UNICODE_STRING *us = ObjectAttributes->ObjectName;
+        if (!us || !us->Buffer || us->Length == 0 ||
+            us->Length > (ULONG)((WS_PATH_MAX - 1) * sizeof(wchar_t)) ||
+            ObjectAttributes->RootDirectory != NULL) {
+            ret = -1; /* empty/oversized name, or a handle-relative name: never guess */
+            break;
+        }
+        wchar_t nz[WS_PATH_MAX];
+        wchar_t abs[WS_PATH_MAX];
+        size_t n = (size_t)(us->Length / sizeof(wchar_t));
+        memcpy(nz, us->Buffer, n * sizeof(wchar_t));
+        nz[n] = 0;
+        /* NT namespace -> Win32 (the `\\?\` strip still happens in ws_normalize_path below). */
+        if (ws_starts_with_ci_w(nz, L"\\??\\UNC\\")) {
+            size_t len = wcslen(nz + 8);
+            nz[0] = nz[1] = L'\\';
+            memmove(nz + 2, nz + 8, (len + 1) * sizeof(wchar_t));
+        } else if (ws_starts_with_ci_w(nz, L"\\??\\") &&
+                   ((nz[4] >= L'A' && nz[4] <= L'Z') || (nz[4] >= L'a' && nz[4] <= L'z')) &&
+                   nz[5] == L':' && (nz[6] == L'\\' || nz[6] == L'/' || nz[6] == 0)) {
+            size_t len = wcslen(nz + 4);
+            memmove(nz, nz + 4, (len + 1) * sizeof(wchar_t));
+        }
+        if (ws_starts_with_ci_w(nz, L"\\Device\\") || ws_starts_with_ci_w(nz, L"\\\\.\\") ||
+            ws_starts_with_ci_w(nz, L"\\??\\") || ws_starts_with_ci_w(nz, L"\\\\?\\GLOBALROOT")) {
+            ret = -1; /* still in the NT namespace: Win32 cannot express it -> pass through */
+            break;
+        }
+        ws_strlcpy_w(path_out, nz, WS_PATH_MAX);
+        DWORD err_save = GetLastError();
+        if (GetFullPathNameW(nz, WS_PATH_MAX, abs, NULL) == 0) {
+            ws_strlcpy_w(abs, nz, WS_PATH_MAX);
+        }
+        SetLastError(err_save);
+        int isStaged = 0;
+        if (ws_stat_resolve(abs, win_out, WS_PATH_MAX, &isStaged)) {
+            ret = 2; /* whiteout */
+            break;
+        }
+        if (!isStaged || ws_wcscmp_ci(win_out, abs) == 0) {
+            ret = 0; /* no overlay copy (or unchanged path): the original goes to the real API */
+            break;
+        }
+        size_t pos = 0;
+        int ok = 0;
+        if (ws_starts_with_ci_w(win_out, L"\\??\\") && win_out[4]) {
+            ok = ws_append_w(nt_out, WS_PATH_MAX, &pos, win_out); /* already NT: no double prefix */
+        } else if (win_out[0] == L'\\' && win_out[1] == L'\\' && win_out[2] &&
+                   win_out[2] != L'?' && win_out[2] != L'.') {
+            ok = ws_append_w(nt_out, WS_PATH_MAX, &pos, L"\\??\\UNC\\") &&
+                 ws_append_w(nt_out, WS_PATH_MAX, &pos, win_out + 2);
+        } else if (((win_out[0] >= L'A' && win_out[0] <= L'Z') ||
+                    (win_out[0] >= L'a' && win_out[0] <= L'z')) &&
+                   win_out[1] == L':' && win_out[2] == L'\\') {
+            ok = ws_append_w(nt_out, WS_PATH_MAX, &pos, L"\\??\\") &&
+                 ws_append_w(nt_out, WS_PATH_MAX, &pos, win_out);
+        }
+        if (!ok || pos == 0) {
+            nt_out[0] = 0;
+            /* overlay hit but no trustworthy NT form: `mapped` keeps the overlay Win32 path,
+             * `nt=<none>`, `staged=0` => the "middle state" the acceptance keys on. */
+            ret = 0;
+            break;
+        }
+        ret = 1;
+    } while (0);
+    t_wsAttrBusy = 0;
+    return ret;
+}
+
 /* ---------------------------------------------------------------- R11-D-13d-nqaf
  * 线A#1: ONE new ntdll target, NtQueryAttributesFile (count + per-call status).
  * Explicit ntdll resolution, lazy + CAS cached; unresolved => call the API
@@ -1366,6 +1482,35 @@ NTSTATUS NTAPI ws_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes, PVO
                 GetProcAddress(nt, "NtQueryAttributesFile");
         }
     }
+    /* ------------------------------------------------- R11-D-99-nqaf (D-FILE-5)
+     * overlay 感知：命中覆盖层就把**覆盖层的 NT 形态路径**交给真实 API（本 API 没有
+     * IoStatusBlock ⇒ whiteout 只能用返回码回答，真实 API 自己填 FileInformation）。
+     * 未命中 / 路径未变 / 名字不可信 / busy ⇒ 原样透传，绝不 fail-closed。 */
+    wchar_t ws_path[WS_PATH_MAX];
+    wchar_t ws_win[WS_PATH_MAX];
+    wchar_t ws_nt[WS_PATH_MAX];
+    int ws_r = ws_attrbyname_overlay(ws_nqaf_orig != 0, ObjectAttributes, ws_path, ws_win, ws_nt);
+    if (ws_r == 2) {
+        NTSTATUS ws_gone = (NTSTATUS)0xC0000034L; /* STATUS_OBJECT_NAME_NOT_FOUND */
+        ws_log("ATTRDBG-NQAF pid=%lu handle=%p path=%ls mapped=<whiteout> nt=<none> staged=0 status=0x%lx class=%lu seq=%ld",
+               (unsigned long)GetCurrentProcessId(), (void *)0, ws_path, (unsigned long)ws_gone,
+               (unsigned long)0, ws_seq());
+        return ws_gone;
+    }
+    if (ws_r == 1) {
+        OBJECT_ATTRIBUTES ws_oa = *ObjectAttributes;
+        UNICODE_STRING ws_un;
+        ws_un.Buffer = ws_nt;
+        ws_un.Length = (USHORT)(wcslen(ws_nt) * sizeof(wchar_t));
+        ws_un.MaximumLength = (USHORT)(ws_un.Length + sizeof(wchar_t));
+        ws_oa.ObjectName = &ws_un;
+        ws_oa.RootDirectory = NULL;
+        NTSTATUS ws_st = ws_nqaf_orig(&ws_oa, FileInformation);
+        ws_log("ATTRDBG-NQAF pid=%lu handle=%p path=%ls mapped=%ls nt=%ls staged=1 status=0x%lx class=%lu seq=%ld",
+               (unsigned long)GetCurrentProcessId(), (void *)0, ws_path, ws_win, ws_nt,
+               (unsigned long)ws_st, (unsigned long)0, ws_seq());
+        return ws_st;
+    }
     NTSTATUS st;
     if (ws_nqaf_orig) {
         st = ws_nqaf_orig(ObjectAttributes, FileInformation);
@@ -1373,13 +1518,15 @@ NTSTATUS NTAPI ws_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes, PVO
         st = NtQueryAttributesFile(ObjectAttributes, FileInformation);
     }
     const UNICODE_STRING *us = (ObjectAttributes ? ObjectAttributes->ObjectName : 0);
+    const wchar_t *ws_map_log = (ws_r == 0 && ws_win[0]) ? ws_win : L"<none>";
     if (us && us->Buffer) {
-        ws_log("ATTRDBG-NQAF pid=%lu handle=%p path=%.*ls status=0x%lx class=%lu seq=%ld",
+        ws_log("ATTRDBG-NQAF pid=%lu handle=%p path=%.*ls mapped=%ls nt=<none> staged=%d status=0x%lx class=%lu seq=%ld",
                (unsigned long)GetCurrentProcessId(), (void *)0, (int)(us->Length / sizeof(wchar_t)),
-               us->Buffer, (unsigned long)st, (unsigned long)0, ws_seq());
+               us->Buffer, ws_map_log, ws_r, (unsigned long)st, (unsigned long)0, ws_seq());
     } else {
-        ws_log("ATTRDBG-NQAF pid=%lu handle=%p path=<null> status=0x%lx class=%lu seq=%ld",
-               (unsigned long)GetCurrentProcessId(), (void *)0, (unsigned long)st, (unsigned long)0, ws_seq());
+        ws_log("ATTRDBG-NQAF pid=%lu handle=%p path=<null> mapped=%ls nt=<none> staged=%d status=0x%lx class=%lu seq=%ld",
+               (unsigned long)GetCurrentProcessId(), (void *)0, ws_map_log, ws_r, (unsigned long)st,
+               (unsigned long)0, ws_seq());
     }
     return st;
 }
@@ -1403,6 +1550,34 @@ NTSTATUS NTAPI ws_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
                 GetProcAddress(nt, "NtQueryFullAttributesFile");
         }
     }
+    /* ------------------------------------------------ R11-D-99-nqfaf (D-FILE-5)
+     * 与 NQAF 同口径（同一 helper）：命中覆盖层 ⇒ NT 形态换名；whiteout ⇒ 返回码答
+     * `0xC0000034`（本 API 同样没有 IoStatusBlock）；其余一律原样透传。 */
+    wchar_t ws_path[WS_PATH_MAX];
+    wchar_t ws_win[WS_PATH_MAX];
+    wchar_t ws_nt[WS_PATH_MAX];
+    int ws_r = ws_attrbyname_overlay(ws_nqfaf_orig != 0, ObjectAttributes, ws_path, ws_win, ws_nt);
+    if (ws_r == 2) {
+        NTSTATUS ws_gone = (NTSTATUS)0xC0000034L; /* STATUS_OBJECT_NAME_NOT_FOUND */
+        ws_log("ATTRDBG-NQFAF pid=%lu handle=%p path=%ls mapped=<whiteout> nt=<none> staged=0 status=0x%lx class=%lu seq=%ld",
+               (unsigned long)GetCurrentProcessId(), (void *)0, ws_path, (unsigned long)ws_gone,
+               (unsigned long)0, ws_seq());
+        return ws_gone;
+    }
+    if (ws_r == 1) {
+        OBJECT_ATTRIBUTES ws_oa = *ObjectAttributes;
+        UNICODE_STRING ws_un;
+        ws_un.Buffer = ws_nt;
+        ws_un.Length = (USHORT)(wcslen(ws_nt) * sizeof(wchar_t));
+        ws_un.MaximumLength = (USHORT)(ws_un.Length + sizeof(wchar_t));
+        ws_oa.ObjectName = &ws_un;
+        ws_oa.RootDirectory = NULL;
+        NTSTATUS ws_st = ws_nqfaf_orig(&ws_oa, FileInformation);
+        ws_log("ATTRDBG-NQFAF pid=%lu handle=%p path=%ls mapped=%ls nt=%ls staged=1 status=0x%lx class=%lu seq=%ld",
+               (unsigned long)GetCurrentProcessId(), (void *)0, ws_path, ws_win, ws_nt,
+               (unsigned long)ws_st, (unsigned long)0, ws_seq());
+        return ws_st;
+    }
     NTSTATUS st;
     if (ws_nqfaf_orig) {
         st = ws_nqfaf_orig(ObjectAttributes, FileInformation);
@@ -1410,13 +1585,15 @@ NTSTATUS NTAPI ws_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
         st = NtQueryFullAttributesFile(ObjectAttributes, FileInformation);
     }
     const UNICODE_STRING *us = (ObjectAttributes ? ObjectAttributes->ObjectName : 0);
+    const wchar_t *ws_map_log = (ws_r == 0 && ws_win[0]) ? ws_win : L"<none>";
     if (us && us->Buffer) {
-        ws_log("ATTRDBG-NQFAF pid=%lu handle=%p path=%.*ls status=0x%lx class=%lu seq=%ld",
+        ws_log("ATTRDBG-NQFAF pid=%lu handle=%p path=%.*ls mapped=%ls nt=<none> staged=%d status=0x%lx class=%lu seq=%ld",
                (unsigned long)GetCurrentProcessId(), (void *)0, (int)(us->Length / sizeof(wchar_t)),
-               us->Buffer, (unsigned long)st, (unsigned long)0, ws_seq());
+               us->Buffer, ws_map_log, ws_r, (unsigned long)st, (unsigned long)0, ws_seq());
     } else {
-        ws_log("ATTRDBG-NQFAF pid=%lu handle=%p path=<null> status=0x%lx class=%lu seq=%ld",
-               (unsigned long)GetCurrentProcessId(), (void *)0, (unsigned long)st, (unsigned long)0, ws_seq());
+        ws_log("ATTRDBG-NQFAF pid=%lu handle=%p path=<null> mapped=%ls nt=<none> staged=%d status=0x%lx class=%lu seq=%ld",
+               (unsigned long)GetCurrentProcessId(), (void *)0, ws_map_log, ws_r, (unsigned long)st,
+               (unsigned long)0, ws_seq());
     }
     return st;
 }
@@ -1461,7 +1638,7 @@ NTSTATUS NTAPI ws_NtQueryInformationByName(POBJECT_ATTRIBUTES ObjectAttributes, 
     ws_map[0] = 0;
     int ws_staged = -1; /* -1 = 没走到解析链；0 = 走到但无覆盖层副本；1 = 命中覆盖层 */
     const UNICODE_STRING *ws_us = (ObjectAttributes ? ObjectAttributes->ObjectName : 0);
-    if (!t_wsFileBusy && ws_nqifbn_orig && IoStatusBlock && ObjectAttributes && ws_us && ws_us->Buffer &&
+    if (!t_wsFileBusy && !t_wsAttrBusy && ws_nqifbn_orig && IoStatusBlock && ObjectAttributes && ws_us && ws_us->Buffer &&
         ws_us->Length > 0 && ws_us->Length <= (ULONG)((WS_PATH_MAX - 1) * sizeof(wchar_t)) &&
         ObjectAttributes->RootDirectory == NULL) {
         wchar_t ws_nz[WS_PATH_MAX]; /* 按 Length 取值、补 NUL 后的逻辑名 */
@@ -1492,7 +1669,13 @@ NTSTATUS NTAPI ws_NtQueryInformationByName(POBJECT_ATTRIBUTES ObjectAttributes, 
             }
             SetLastError(ws_err);
             int ws_isStaged = 0;
-            if (ws_stat_resolve(ws_abs, ws_map, WS_PATH_MAX, &ws_isStaged)) {
+            /* v2：同款重入守卫覆盖 NQIFBN 的**唯一**重入向量（就是这一次解析调用）——
+             * 它可能经 ws_is_lockdown_probe → ws_real_attrs_w → kernelbase 回到本族包装。
+             * 置位期间到达的嵌套调用在入口即 `!t_wsAttrBusy` 失败 ⇒ 原样透传，环可终止。 */
+            t_wsAttrBusy = 1;
+            int ws_wo = ws_stat_resolve(ws_abs, ws_map, WS_PATH_MAX, &ws_isStaged);
+            t_wsAttrBusy = 0;
+            if (ws_wo) {
                 /* whiteout：按契约直接答"不存在"，**不调真实 API**、不伪造成功。 */
                 NTSTATUS ws_gone = (NTSTATUS)0xC0000034L; /* STATUS_OBJECT_NAME_NOT_FOUND */
                 IoStatusBlock->Status = ws_gone;
