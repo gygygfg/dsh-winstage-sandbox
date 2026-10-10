@@ -12,8 +12,9 @@
 | 3 | apply 链复现 | **PASS** | §1 |
 | 4 | 封印面 | **PASS**（exit 0 / 115） | §2 |
 | 5 | 静态审计（(i)(ii)/递归/fall-closed/误伤） | **PASS**（2 条残留已记录） | §3 |
-| 6 | (i)(ii) **独立自跑** | **待原始件**（不转述结论） | §5 |
+| 6 | (i)(ii) **独立自跑 + 车道内自解析** | **PASS** | §5（lane-free 我方自跑）+ §5b（车道内逐行解析，含活性反证） |
 | 7 | **污染件交叉验证**（pkgs 点名） | **成立** | §4 |
+| 8 | ② `arm-t3-count18` + 载体安全 | **PASS** | §2b |
 
 ## 1. 独立度量 + apply 链（我方工具 `t5-metrics.mjs`；与 pkgs 广播逐项相等）
 ```
@@ -102,3 +103,23 @@ cmd /c "call .t\round10\shim\d4\D4S2-offline-gpa-count18.cmd"   （RC=0）
 - **(ii)** 序数 495 ⇒ **我们的包装**、496 ⇒ **真身**、未覆盖项恒真身、`null-module` ⇒ NULL；
 - **活性正对照齐备**：同 run 内 `right-module:owned-name`、`CreateFileW`、`LDR by-name` 均返回包装 ⇒ 钩子确实在场，故本轮的"NULL/真身"是**有效阴性**而非"没走到"。
 - 附带：`count15`（修前控制）在同一载具上**复现了缺陷**（发明导出 + 序数不路由）⇒ A/B 成立。
+
+## 5b. **车道内**路由原始件独立解析（`lane-runner` 的 `count18-s2`，我方自解析）
+原始件：`.t\round10\shim\d4\stage-count18-s2\staged\evidence\d4-probe-raw.txt`（9,591 B / `AE18FB32075C0E6534CD8D4ABCFA568DF0C4BED3B8AD0ED268E31E6F853B78E9`）；车道事实与日志指纹**我方自算**：
+`tierRequested=TS`、`tierEffective=TS`、`launchMode=shim`、`fallbackReason` **缺席**、`0xC00000FD` **缺席**、`exitCode=0`；`injection.txt` 唯一 `self=…\out-13d-count18\winstage-shim.dll ok=1`；`shim.log` = **13,375,564 B / 52,027 行 / `00BE91684AACA117DCF481B201DB7737756104326291613117F887182AA5CD3E`**。
+
+| 路由（我方逐行判） | count18 原始读数 | 判 |
+|---|---|---|
+| `ordinal-nq`（495） | `RESOLVE route=ordinal … ordinal=495 raw=00007FFB63745230 gpa=000000006FBF5420 owner=…out-13d-count18…`；三次 `CALLCALL … class=77 st=0x00000000 iosb=0x00000000` | **(ii) PASS**（真身 → 包装；且经包装的调用成功） |
+| `wrongmod-nq` | `hmodule=kernel32 ptr=0000000000000000 owner=<not-in-any-module>` + `result=NULL (real loader semantics)` | **(i) PASS** |
+| `static(iat-slot)` / `gpa`（NQIFBN） | 均 `ptr=000000006FBF5420 owner=…count18…`；`st=0x0` | **活性正对照 PASS** |
+| `resolver control`（`GetProcAddress` static） | `ptr=000000006FBF6BD0 owner=…count18…` | **GPA 钩子在场**（活性） |
+| `mixed-nq`（static+gpa） | 六次 `st=0x00000000` | **PASS** |
+| `manual-nq` | `ptr=ntdll 真身`；`st=0xC000003A` ×3 | **未拦截（已知私有解析边界，与阶段1结论一致）** |
+| `rawgpa-nq` | `resolver=kernelbase!GetProcAddress` → `NtQueryInformationByName` = **真身 ntdll**；`st=0xC000003A` ×3 | **未拦截** |
+| `rawldr-nq` | `resolver=ntdll!LdrGetProcedureAddress` → **真身**；`st=0xC000003A` ×3 | **未拦截** |
+| 未覆盖项 `496` / `NtClose` / `GetModuleHandleW` | **真身**（取自 §5 **我方自跑**的 lane-free 探针与既有件） | **未误伤 PASS** |
+
+**"0 行/阴性必附活性反证"已满足**：同 run 内 `static`/`gpa`/`ordinal`/`mixed` 四条路由**都拿到包装**且调用 `st=0x0`，另有 `resolver control` 行证明 `ws_GetProcAddress` 钩子确实安装 ⇒ 上表"未拦截/真身"是**有效阴性**，不是"没走到"。
+**与 `env-harness` 的差异清单**：其**判读表**我尚未收到（Lead 转述的 `ordinal-nq`/`wrongmod-nq` 三行与我的逐字一致）⇒ 就已公布的读数而言 **0 差异**；若其另发判读表，我按本表逐项 diff。
+**旁证**：`analyze-count18.mjs` 对**修前 count15** 自测 = `ASSERT-FAIL`（两条断言均 FAIL）⇒ 该断言集对修前件会失败、对 count18 成立（断言有判别力，不是恒真）。
