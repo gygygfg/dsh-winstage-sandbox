@@ -113,6 +113,8 @@ t9|D99-nqaf-nqfaf-overlay.patch|12231|…|29211b422934ab2680d7b1e5db2e2099e0ed18
 ### 6.4 结构性推论（保留，供缺陷记录）
 > **`out-13d-count15`（NQIFBN v2）之所以安全，只是因为当时 `NQAF`/`NQFAF` 仍是 pass-through**：`kernelbase!GetFileAttributesW` **不会**回调 `NtQueryInformationByName`，故那个环不闭合。**D99 一旦让 `NQAF` overlay 感知，环就闭合了**——**这是"给同族 API 逐个加 overlay 感知"路线的结构性约束**。**`ws_GetFileAttributesW`（已采纳路径）自身就调 `ws_real_attrs_w`（`:912`），距此环只差一步**。
 > **本次修正（我先前只说"lockdown 名族"）**：环**不限于** lockdown 名族——实测 K1 证明重入由**覆盖层路径**触发（provider/`ws_real_attrs_w` 对 overlay 候选路径的真实查询），与 `__PSScriptPolicyTest_*` **无关**（那些名字 0 命中）。⇒ 我已建议 `line-d4` 在 `D-FILE-7` 里把"触发面"从"lockdown 名族"改为"**任一使 `ws_real_attrs_w` 以覆盖层路径落到 kernelbase 的调用**"，守卫位置 = **helper/包装入口**（`_Thread_local` 计数）。
+> **（task-18 定稿，2026-10-10）**：`D-FILE-7` 已按上述更正**定稿**为 **已修复 / 已验证（v2，提交 `3144719`）** ⇒ 正文见 `docs/round10/fileio/defects.md` 的 `D-FILE-7` 段落（含机制行号 `shim/src/ws_stage.c:99-124/131-168/146/150`、量化 89%/8,019/median=1/≈49 KB 非因果、单变量 A/B、**在野外佐证**、与 `D-FILE-2` 的区分、证据清单）。
+> **在野外佐证（本条新增，我方实测）**：`count18`（含守卫）TS 车道轮 `ATTRDBG-NQAF` 中 `staged=-1`+`mapped=<none>` = **8,252** 条，逐行是**派生形态（`…\staged\wo\…` / `…\staged\fs\…`）被入口拒绝**、`status=0xc000003a`（= 透传给真实 API 的真实结果）⇒ 守卫在生产形态下的现场表现；对照 `count15`（NQAF 尚 pass-through）同规格日志该字段 **0 条**（**旧格式字段根本不存在**，而非"解析了却没拒绝"）⇒ 两者**不是同一量，勿误读**。原始件：`.t/round10/shim/d4/stage-count18-s2/staged/shim.log`（`00BE9168…`）、`.t/round10/fileio/d5/stage-d5-b15/staged/shim.log`（`A42F8516…`）。
 
 ## 7. 三条口径更新（Lead 2026-10-10 裁定，已登记备 v2 使用）
 1. **一等门禁「载体安全」**：`tierEffective=TS` **且** `fallbackReason` 为空 **且** `carrierExits` 无 `0xC00000FD` —— 与四条件/③ 门禁**并列**。
