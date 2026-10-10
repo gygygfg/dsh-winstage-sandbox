@@ -118,9 +118,10 @@ c14 L43424 [winstage-shim][3500][537] ATTRDBG-W rc=0 in=\\?\C:\Users\Administrat
 c15 L43235 [winstage-shim][7256][409] ATTRDBG-W rc=0 in=\\?\C:\Users\Administrator\Desktop\dsh-winstage-sandbox\.t\round10\fileio\13d-t4-ws\probe\pa-fixture.txt mapped=C:\Users\Administrator\Desktop\dsh-winstage-sandbox\.t\round10\fileio\13d-t4\stage-c15\staged\fs\C\Users\Administrator\Desktop\dsh-winstage-sandbox\.t\round10\fileio\13d-t4-ws\probe\pa-fixture.txt staged=1 attrs=0x20 err=203
 ```
 
-三行**除 `mapped=` 里的 stage 目录名（`stage-b13` / `stage-c14` / `stage-c15`，各轮**必然**不同）以外逐字相同**：
-`rc=0` / `staged=1` / `attrs=0x20`（ARCHIVE，属性正确） / `err=203`（陈旧残留） / `in=` 同值 ⇒
-**严格意义的"整行逐字相等"不成立**，但**全部判别字段同形**（`exe` 独立复核已按行号逐行比对确认这一点）。
+**术语定义（本节及全文）**：**「同形」= 判别字段逐字相同** —— 即 `rc` / `staged` / `attrs` / `err` / `in=`；
+**`mapped=` 不参与该判断**（它是"本轮映射到哪"，`stage-b13` / `stage-c14` / `stage-c15` **各轮必然不同**）。
+按此定义，三行**同形**：`rc=0` / `staged=1` / `attrs=0x20`（ARCHIVE，属性正确） / `err=203`（陈旧残留） / `in=` 同值；
+而**严格意义的"整行逐字相等"不成立**（`exe` 独立复核已按行号逐行比对确认；其复核文 §7 另有终态重验记录）。
 而 `exists` 在 `b13` = **false**、在 `c15` = **true** ⇒
 **决定 `exists` 的不是 W 的返回值**，而是同 pid 那条夹具 `NQIFBN` 的 status（`0xC0000034` vs `0x0`）。
 
