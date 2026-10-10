@@ -96,7 +96,8 @@ if (!t_wsFileBusy && ws_nqifbn_orig && us0 && us0->Buffer && us0->Length > 0 &&
 **纪律（硬性）**：
 - `pwsh` 备份：`.t\round10\shim\backup-v14-ws_file.c` **已存在**（= 当前树哈希 `60ACEC39…`）；再改前请先确认树未被他人在改。
 - **副本编译**：`node tools\build-shim.mjs --out-dir .t\round10\shim\out-13d-count14` ⇒ 期望 **exit 0 / 0 warning / 15 exports**（本仓库 `build-shim.mjs` 在 `tools\`）。
-- **双前置**：副本编译零告警 **且** `git apply --check`（或 `git diff` 可逆 + `git checkout -- shim/src/ws_file.c` 回滚）exit 0。
+- **双前置**：副本编译零告警 **且** `git apply --check` exit 0。
+  - ⚠ **回滚口径已更正（线程 #9 实测，2026-10-10）**：**禁止** `git checkout -- shim/src/ws_file.c`。本仓 `shim/src` 相对 HEAD **本就全脏**（`git show HEAD:shim/src/ws_file.c` = `7094669F7C7AE3A297467DC4E8331BD1EC5CADB2737033E55534A22ED598485B` / 59,568 B），该命令会**摧毁当前基线**。权威回滚二选一（均须复核回目标 hex）：① `cmd /c "copy /Y .t\round10\shim\backup-v14-ws_file.c shim\src\ws_file.c"`；② `cmd /c "git -c safe.directory=* -C . apply -R <补丁>"`。详见 `docs/round10/fileio/13d/更正-汇总-线程9.md` §1.1。
 - 交件给 `pkgs`：补丁路径 + **唯一锚点清单（代码调用点，不要注释文本）** + **三文件 apply 前后完整 64 位 hex** + 回滚命令。
 - **当前树基线（v13 态；Lead 只做了备份，未改任何源码）**：
   - `ws_file.c = 60ACEC390146DDA60970D1D28D576CF3C6EF14833C81943BD6883353FCBF8D39`（68,078 B）
@@ -108,7 +109,13 @@ if (!t_wsFileBusy && ws_nqifbn_orig && us0 && us0->Buffer && us0->Length > 0 &&
 1. 离线：`dshregprobe2 read` = **`ALL=True`**。
 2. **零语义复跑**：`step2a` 与 `step2b` **逐字节一致**、sha `12AA39D1F31AF899…`；**D-R1 四条件不回归**（① `query-value-exit=0` ② `query2-value-exit=0` ③ `step2a` 非空 ④ `replayedBytes>0`）。
 3. **行为验收**（同车道、免换件、**必须用合法 `OBJECT_ATTRIBUTES`**）：`statSync`/`lstatSync` 对**已暂存文件转为成功**、`readFileSync` 不变、`existsSync` 现状不变（其异常属**线 B**）；**必须附夹具绑定原始行**（`ATTRDBG-NQIFBN` 命中行 + 对应 `statSync` 返回值），否则无法区分"修好"与"没走到"。
-**任一不过 ⇒ 立即回滚（`git checkout -- shim/src/ws_file.c` 或恢复备份）+ 停手上报。**
+**任一不过 ⇒ 立即回滚（用上面的权威回滚：copy 备份 或 `git apply -R`；**禁用 `git checkout --`**）+ 停手上报。**
+
+> ### ★ 线程 #9 更正（2026-10-10）—— 本节以下口径已过时，以本文档为准
+> 1. **回滚**：见上，`git checkout -- shim/src/ws_file.c` **作废**。
+> 2. **树基线已前移**：v13 基线 `ws_file.c = 60ACEC39…`（68,078 B）已在**线 A v2** 被 D98 补丁推进到 **`4CF967E349091413F695A2DF7D403C6D5D51997CF6B34E395EECE3732A75E259`（76,609 B）**；`out-13d-count14` 是**已废弃的 v1 候选**（`108CFD37…`，③ FAIL·脆性绿），v2 候选是 `out-13d-count15`（`2240F2BB…`，三层验收 PASS）。**`count14`/`count15` 均不得重建**（留档 + 修前控制件）。
+> 3. **③ 的 existsSync 判据改判**：**必须为 `true`（正确值）**，不再是"现状不变"。理由：`existsSync` 与 `statSync` 落在**同一条 Windows 按名查询**（`NtQueryInformationByName`）上，修好该调用即两者同时转正；"`GetFileAttributesW` 成功却被 post-call 丢弃"这一归因已被实测**反证**（见 `docs/round10/fileio/13d/线B-结案.md`）。
+> 4. **规格 §3 骨架有缺陷**：`un.Buffer = mapped;` 少了 **NT 前缀**（`\??\C:\…`）⇒ v1 的覆盖层映射调用 67/67 全返回 `0xC000003B`；§7 对 `class=4` 探针 `0xC000000D` 的"裸路径串调用"归因**也是误归因**。详见 `docs/round10/fileio/13d/更正-汇总-线程9.md` §1.2–§1.4。
 
 ## 4. 必须遵守的纪律（血泪清单）
 

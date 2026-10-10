@@ -76,3 +76,31 @@
 ⇒ **§4 的 ③ 行为验收与 `D-FILE-4` 要求的活性正对照，都必须用合法的 `OBJECT_ATTRIBUTES`**（含**绝对** `ObjectName`、`OBJ_CASE_INSENSITIVE`、正确的 `Length`），
 否则**无法区分"修好了"与"根本没走到"**（后者会被误读成"0 行/失败"）。
 活性探针若沿用 `nqifbn-probe.c`，请把 `ObjectName` 设为**绝对 NT 路径**（`\??\C:\…`）并且**不要**传相对名。
+
+---
+
+# ★ 8. 更正（线程 #9 实测，2026-10-10）—— 以下三条**取代**前文对应文字
+
+> 本规格在实施中被实测推翻三处。**前文 §3 骨架、§6、§7 的对应文字均已被本节取代**；完整更正汇总见 `docs/round10/fileio/13d/更正-汇总-线程9.md`。
+
+## 8.1 §3 骨架 `un.Buffer = mapped;` **是缺陷**（导致 v1"脆性绿"）
+`ws_stat_resolve` 返回的 `mapped` 是 **Win32 形态**（`C:\…`，因为 `ws_GetFileAttributesW` 用它调 Win32 API），而 `NtQueryInformationByName` 的 `ObjectName` 必须是 **NT 对象路径**；`RootDirectory=NULL` 时裸 `C:\…` 被对象管理器当作根下的 `\C:\…`。
+
+- **无车道、无 shim 的直接实验**（`docs/round10/verify/evidence/t5/T5-4-rootcause-nt-form-proof.txt`）：
+  `\??\C:\Windows\System32\kernel32.dll` → **`0x0`**；`C:\Windows\System32\kernel32.dll` → **`0xC000003B`**（`STATUS_OBJECT_PATH_SYNTAX_BAD`）。
+- 后果：按 §3 骨架实现的 v1（`D96`）**覆盖层映射调用 67/67（T5 轮 87/87）全为 `0xC000003B`、成功 0 条**；端到端 `statSync` 变绿只是因为 **libuv 在 `STATUS_OBJECT_PATH_SYNTAX_BAD` 上回退 `CreateFileW`** ⇒ 记 **fragile-green（脆性绿）**，**不满足 §4 ③**。
+- **正确写法**（`D98`）：换名前构造 **NT 形态** —— 盘符绝对 ⇒ `\??\` + mapped；真 UNC `\\server\share\…` ⇒ `\??\UNC\server\share\…`；已是 `\??\` 不重复加；**其它一切形态（`\\?\…`、`\\.\…`、`\Device\…`、卷 GUID、相对名）⇒ 不换名、原样透传**（绝不猜）。`Length`/`MaximumLength` 按 **NT 串**重算。同文件先例：`ws_NtOpenFile`（`ws_file.c:1173`）—— `\??\` 只用于自己的判断，交回真实 API 时保持 NT 原名。
+
+## 8.2 §6 的顺序不完整：必须**先剥 NT 前缀、再绝对化**
+`GetFullPathNameW("\??\C:\x")` 实测 = **`C:\??\C:\x`**（它**不剥** `\??\`）⇒ 只照 §6"用 CWD 拼成绝对路径"对合法 NT 形态**仍是 no-op**。正确次序：**先**把 `\??\C:\…` / `\??\UNC\…` 剥成 Win32 形态，**再**用 CWD 绝对化，**再**交 `ws_stat_resolve`。
+
+## 8.3 §7 的归因是**误归因**：`class=4` 探针无区分力
+§7 把 `0xC000000D` 归因于"以**裸路径串**（`class=4`）调用"。**实测更正**：该探针的 `OBJECT_ATTRIBUTES` **是合法的**（`InitializeObjectAttributes` + `\??\` 绝对名 + 正确 `Length`）；`STATUS_INVALID_PARAMETER` 来自 **`FileInformationClass=4` 被该 API 拒绝**（无 shim 直调 `kernel32.dll` 同样 `0xC000000D`）。
+⇒ **该探针无区分力**（v1/v2/修前均同码）；**验收判据只能用 `class=77` 的真实调用行**。§7"必须用合法 `OBJECT_ATTRIBUTES`"这一**要求本身仍然正确**，被更正的只是**归因**。
+
+## 8.4 §4 ③ 的判据签名（实施后补全，供后轮复用）
+除"`statSync`/`lstatSync` 转成功"外，**必须**同时满足可机检的调用级门禁：
+- `ATTRDBG-NQIFBN … staged=1 status=0x0` **≥1 条**，且 `… staged=1 status=0x3b` **= 0 条**；
+- 成功行要与 `statSync`/`lstatSync` **同 pid 序列**对齐，且其后**无**该夹具的 `CreateFileW` 回退；
+- 日志需含 `nt=`（实际交给真实 API 的串）、`mapped=`、`staged=`（`-1` = 没走到解析链）；
+- `existsSync` 判据已改判为**必须为 `true`（正确值）**（详见 `更正-汇总-线程9.md` §1.5）。
