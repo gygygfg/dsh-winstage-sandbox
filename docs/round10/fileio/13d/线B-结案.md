@@ -18,7 +18,9 @@
 
 > **留痕**：本结案对 Lead 通报的两处更正（①Node `existsSync` 语义；②v1(c14) 的 `exists` 是**回退 credit**）
 > 已被 Lead **全部采纳并记入 `task-6` 描述 revision 5**（原表述作废）。
-> `exe` 的独立复核（`docs/round10/verify/线B-结案-独立复核.md`）结论同向（前提证伪成立、`err` 纪律仍成立），
+> `exe` 的独立复核（`docs/round10/verify/线B-结案-独立复核.md`，复审版）= **4/4 核心反证成立**
+> （(a) Node 语义 / (c) W 不是判别量 / (d) v1 有回退 & v2 无回退 / (4) 机检复跑），判定「前提证伪 + 回归项」**通过**；
+> `exe` 并在该文中**主动更正了自己此前的两处错误**（"`existsSync` 建在 `stat` 之上"、"v1 仍为 false"），
 > 两份文档的分歧只在**笔者原表述**，**结论无冲突**。
 
 ---
@@ -48,6 +50,17 @@ GATE label=c15 PASS=true
 
 `c14` 对照（同一脚本、同一判据）：`exists` 的 `result` 也是 `true`，但 `cfwFallback=yes`；
 **`stat`/`lstat` 被 gate 判 FAIL**，而它们的 `result` 却写着 `{size:12}` —— 这就是"脆性绿"的机检形态。
+
+**因果链（唯一同步变化量 = `NQIFBN` 的 status）**：
+
+```
+b13  NQIFBN 0xC0000034  →  exists=false（真失败）
+c14  NQIFBN 0xC000003B  →  libuv 回退 CreateFileW(overlay)  →  exists=true（脆性绿）
+c15  NQIFBN 0x0         →  直接 exists=true（无回退）
+```
+
+`exe` 独立复核另给了一个**第三方 c14 run**（其自己的 pid 7644）同样 `result:true`，与 `env-harness` 的 c14（pid 3500）一致
+⇒ `exists=false` **只**出现在修前控制 `b13`（及 D87 那轮 `pa-out3`），**不是 v1 的属性**。
 
 ---
 
@@ -113,7 +126,7 @@ c15 L43235 [winstage-shim][7256][409] ATTRDBG-W rc=0 in=\\?\C:\Users\Administrat
 
 > ⚠ **与 Lead 通报口径的差异（须知悉）**：Lead 通报"v1（`0xc000003b`）下 `exists=false`"。
 > 实测 `c14` 的 `exists` 动作 `result` = **true**（它被 libuv 的 `0xC000003B` 回退"救"成了绿）：
-> 同 pid 检出 `cfwFallback=yes`（`ATTRDBG-CFW desiredAccess=0x80` + `CFW-OVL valid=1`），
+> 同 pid 检出 `cfwFallback=yes`（`ATTRDBG-CFW … desiredAccess=0x80` + `ATTRDBG-CFW-OVL … valid=1`），
 > 且同轮 `stat`/`lstat` 在 gate 里判 **FAIL**（`result` 却是 `{size:12}`）。
 > `exists=false` 的读数在 **`b13`**（`0xC0000034`）与 **D87 当时那轮**（`pa-out3`，同为 `0xC0000034`）成立。
 > 该差异不削弱结论：反证的支点是 (c) 的"W 行同形而 exists 翻转"与 (d) 的"无回退"，两者都不依赖 v1 的 exists 取值。
@@ -141,7 +154,9 @@ c14 L44592 [winstage-shim][4252][541] ATTRDBG-CFW-OVL handle=00000000000002F4 va
 ```
 
 （三组 pid=3500 `exists` / pid=9856 `stat` / pid=4252 `lstat`，各自紧跟在自己那条 NQIFBN `0xc000003b` 之后；
-`desiredAccess=0x80` = `FILE_READ_ATTRIBUTES`，`CFW-OVL valid=1` = 经 overlay 打开成功 —— 这就是"脆性绿"的落点。）
+`desiredAccess=0x80` = `FILE_READ_ATTRIBUTES`，`ATTRDBG-CFW-OVL … valid=1` = 经 overlay 打开成功 —— 这就是"脆性绿"的落点。
+⚠ **判据串坑**（`exe` 独立复核时踩过、已提醒）：判"无回退"必须用 **`ATTRDBG-CFW-OVL`** 作为串；
+若写成 `CFW-OVL valid=1`，会因实际行中间隔着 `handle=… ` 而**数到 0 条**，从而得出**假的"无回退"**。）
 
 `c15` 的夹具 `CreateFileW` 只有两条、且都不是 stat 回退（`verify-v2` 对 exists/stat/lstat 三个 pid 全判 `cfwFallback=no`）：
 
@@ -205,6 +220,13 @@ AB label=v2-c15-final focus=C:\Users\Administrator\Desktop\dsh-winstage-sandbox\
 机检工具：`.t/round10/fileio/13d-t4/verify-v2.mjs`（exit 0 = PASS）。
 **反例登记（教条意义）**：`c14` 的 `gate=false` 而 `exists result=true` ⇒
 任何**只看动作 result** 的判据都是"脆性绿"，**不得**用作回归判据；必须看 NQIFBN 自身的 status + 无回退。
+
+**`exe` 独立复核建议的等价机械口径**（供终版直接采用；与上表同义，措辞更便于机器判读）：
+
+- **R-B1**：已暂存文件的 `existsSync` 必须 `true`，且**不依赖回退** ——
+  判法：同 pid 出现 `ATTRDBG-NQIFBN … staged=1 status=0x0`，且**其后该路径无 `ATTRDBG-CFW`**（判据串必须含 `ATTRDBG-CFW`/`ATTRDBG-CFW-OVL`，见 §2(d) 的串坑）。
+- **R-B2**：真实盘文件的 `existsSync`/`statSync`/`lstatSync` 按其**真实状态**回答（负对照三轮全绿）。
+- **R-B3**：**`err` 不得进入任何判据**（`D88` 回归；`err=203` 出现在**成功**的 W 上）。
 
 ---
 
