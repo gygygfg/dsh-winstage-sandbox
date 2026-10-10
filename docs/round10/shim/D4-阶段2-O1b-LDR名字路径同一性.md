@@ -112,3 +112,4 @@
 2. 序数分支（`ProcedureNumber != 0`）**未动**：对 `kernel32` 转发 stub 仍保持透传（D4S2 既有保守语义）。
 3. 本件与 `D101` 共用 `ws_name_identity`；若 `count19` 的任一门不过，按 Lead 在 `task-19` 预登记的二分法，先分别单独构建 `D101` 与 `D101b` 定位，**未定位前不得整体回退**。
 4. 车道验收（载体门槛 + ② + ③ + 独立复核）归 `pkgs`/`exe`；本文件只覆盖"出件 + 双前置 + 离线证据"。
+5. **仪器来源事故与本轮冻结**：为 O1 做证据时 `probe\build.cmd` 把 `d4-probe.exe`/`d4samename.dll` **同名原位重建**，导致冻结哈希漂移（`33454B38…`→`E2928BB3…`、`120CD9F5…`→`2C9324CE…`）。已把仪器**拷贝冻结到不可变目录** `.t/round10/shim/d4/frozen/r1/`（含 `.text` 键与同源证明），纪律与新冻结表见 `docs/round10/shim/D4-阶段2-仪器重冻结与来源纪律.md`；`count19-o1` 建议记 **`NOT-RUN (instrument provenance; 该驱动跑不到 O1b 的名字分支)`**。
