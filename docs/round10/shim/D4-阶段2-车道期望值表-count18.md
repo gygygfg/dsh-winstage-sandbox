@@ -6,6 +6,30 @@
 
 ---
 
+## 0.5 ★ 基线重锚（Lead 2026-10-10 裁定 · 跑后更正，**冻结表原样保留**）
+
+**正确对照臂 = `count17`（`out-13d-count17\winstage-shim.dll` = `B451ABE3445F71FD3D457CD0DAE9757F85F4378B315DB542B960894406FF5EC3` / 265,216 B = v2(D99+guard)、**无 D4S2**）。**
+`count15`（`2240F2BB…`）是 **pre-D99（D98）** 态，**只可用于 pre-D99 对照**；把 D4S2 的"必须不变"锚在 count15 会**误判**（本次实测踩到一次，见 §9 更正 A）。
+
+**12 路由在 `count17` 下的预登记（供 `count17-ctl` 收口轮）**：除下列两行外**与 count18 表相同**：
+
+| 路由 | count17（v2，无 D4S2）应有 | count18（v2+D4S2）应有 | 变化 |
+|---|---|---|---|
+| `ordinal-nq` | `NQ=0`；`RESOLVE … gpa=<ntdll 真身> owner=…ntdll.dll`；`st=0xC000003A` ×3 | `NQ=3` 全 `staged=1 status=0x0`；`gpa=<shim 包装>`；`st=0x0` ×3 | **0→3（D4S2 item ii）** |
+| `wrongmod-nq` | `NQ=3`；`RESOLVE … ptr=<shim 包装>`；`st=0x0` ×3 | `NQ=0`；`ptr=0000000000000000` + `result=NULL` 行；无 CALLCALL | **3→0（D4S2 item i）** |
+| `manual-w` | `W=0`；`RESOLVE owner=KERNELBASE.dll`；**`attrs=0x00000020 err=0`**（D99 起 NQAF overlay 感知 ⇒ 见 §9 更正 A） | 同 count17 | **不变** |
+| 其余 9 条 | 与 count18 表逐字相同 | 同 | **不变** |
+
+**收口轮接受陈述**：`count17-ctl` 与 `count18-s2` 必须**只**在 `ordinal-nq`、`wrongmod-nq` 两条上不同，其余**逐字相同**（`attrs`/`err` 残留与绝对指针除外）。若 `count17-ctl` 的 `manual-w` 出现 `0xFFFFFFFF/3` ⇒ **立即停手上报**（与 D99 存在性标记矛盾）。
+
+**机算**：`analyze-count18.mjs` 支持档案开关 ⇒ 第 3 个参数 `count17` 或 `count18`（默认 count18）：
+```
+call run.cmd .t\round10\shim\d4\analyze-count18.mjs <shim.log> <d4-probe-raw.txt> count17
+```
+自测：count17 档案跑 **count15 数据** ⇒ `VERDICT ALL-MATCH`（两份断言均 PASS，原始件 `D4S2-count17-profile-selftest-on-c15.txt`）；count18 档案跑 **count18-s2 数据** ⇒ `VERDICT ALL-MATCH`。
+
+---
+
 ## 1. 车道命令（复用阶段 1 冻结件，**不改参数、不写树**）
 
 ```
