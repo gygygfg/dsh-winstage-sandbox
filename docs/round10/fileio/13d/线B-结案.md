@@ -33,7 +33,7 @@
 | `c14` | v1 = D96 | `0xC000003B` | true（**回退credit**） | `{size:12}`（**回退**） | `{size:12}`（**回退**） | OK | `PASS=false` |
 | `c15` | v2 = D98 | **`0x0`** | **true（无回退）** | `{size:12}`（**viaNqifbn**） | `{size:12}`（**viaNqifbn**） | OK | **`PASS=true`** |
 
-`c15` 机检 gate 逐键（`verify-c15.txt`）：
+`c15` 机检 gate 逐键（`verify-c15-final.txt`，终态日志）：
 
 ```
 GATE label=c15 PASS=true
