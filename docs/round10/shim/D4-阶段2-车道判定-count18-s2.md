@@ -169,3 +169,11 @@ RESOLVE route=wrongmod result=NULL (real loader semantics)
 | `d4\stage-count18-s2` | count18 | 18,178 | 100% |
 
 ⇒ `count17`（**无 D4S2**）已 100% overlay 感知 ⇒ `manual-w` 差异归因 **D99/v2**；D4S2 排除。**建议直接收口，不重跑**（若要形式化 `count17-ctl2` 亦可，但非门禁）。
+
+### 7.3 **收口（2026-10-10，Lead 确认）**
+
+- **五方同判**：`line-d4`（本判定件）+ `lane-runner`（原始件与逐行基线对照）+ `pkgs`（构建/冻结与存在性标记）+ `exe`（逐件复算哈希/字节/行数、自解析，逐项与本文一致）+ `env-harness`（**手写 PE 导出目录解析**取真身、不经 `GetProcAddress`，给出同一判定）⇒ **(i)(ii) 生效 + 必须不变 + 未误伤 + 活性 + 载体安全 全 PASS**；`eddfb66` 的"待裁"**正式解除**。
+- **`manual-w` 归因**：**D99/v2**（kernelbase 内部 `NtQueryAttributesFile` 已被挂钩、v2 起 overlay 感知）；**非 D4S2**。期望表口径已重锚（期望表 §0.5）并更正（期望表 §9）。
+- **`count17-ctl`**：**环境性无效**（`injector exit=111` → T1 回落，非 `C00000FD` 型），不进判据；未重跑，收口依据为盘上 `count15↔count17` 的 NQAF 存在性标记（0% ↔ 100%）。
+- **`count18`（`BDF0672C…` = v2 + D4S2）**：**③ 验收闭环**；树与候选已由 `pkgs` 冻结（`ws_file.c 9826329B…` + `ws_hook.c 1C14AB54…`），作者与执行者**均不再动树**。
+- 本条为 `task-14` 的最终结论页；后续加固项（名字路径指针同一性、冷缓存解析、缩栈 B 类）由 Lead 另开任务，仍守"**只交补丁、不落树**"。
